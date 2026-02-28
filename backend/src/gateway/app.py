@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from src.config.app_config import get_app_config
 from src.gateway.config import get_gateway_config
 from src.gateway.routers import artifacts, mcp, memory, models, skills, uploads
+from fastapi.middleware.cors import CORSMiddleware
 
 # Configure logging
 logging.basicConfig(
@@ -108,6 +109,12 @@ This gateway provides custom endpoints for models, MCP configuration, skills, an
     )
 
     # CORS is handled by nginx - no need for FastAPI middleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:3000"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     # Include routers
     # Models API is mounted at /api/models
