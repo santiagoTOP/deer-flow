@@ -95,7 +95,7 @@ class DanglingToolCallMiddleware(AgentMiddleware[AgentState]):
     ) -> ModelCallResult:
         patched = self._build_patched_messages(request.messages)
         if patched is not None:
-            request = request.override(messages=patched)
+            request = request.override(messages=patched) # 替换请求中的messages为修复后的列表
         return handler(request)
 
     @override

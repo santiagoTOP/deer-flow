@@ -26,8 +26,8 @@ class LocalSandboxProvider(SandboxProvider):
             from src.config import get_app_config
 
             config = get_app_config()
-            skills_path = config.skills.get_skills_path()
-            container_path = config.skills.container_path
+            skills_path = config.skills.get_skills_path()  # 真实的skills路径
+            container_path = config.skills.container_path  # 容器中的skills路径
 
             # Only add mapping if skills directory exists
             if skills_path.exists():
