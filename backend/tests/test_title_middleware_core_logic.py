@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.constants import TAG_NOSTREAM
 
 from deerflow.agents.middlewares import title_middleware as title_middleware_module
 from deerflow.agents.middlewares.dynamic_context_middleware import _DYNAMIC_CONTEXT_REMINDER_KEY
@@ -109,12 +110,25 @@ class TestTitleMiddlewareCoreLogic:
         title = result["title"]
 
         assert title == "短标题"
-        title_middleware_module.create_chat_model.assert_called_once_with(thinking_enabled=False)
+        title_middleware_module.create_chat_model.assert_called_once_with(thinking_enabled=False, attach_tracing=False)
         model.ainvoke.assert_awaited_once()
         assert model.ainvoke.await_args.kwargs["config"] == {
             "run_name": "title_agent",
-            "tags": ["middleware:title"],
+            "tags": ["middleware:title", TAG_NOSTREAM],
         }
+
+    def test_title_model_config_preserves_parent_tags_and_adds_nostream(self, monkeypatch):
+        middleware = TitleMiddleware()
+        monkeypatch.setattr(
+            title_middleware_module,
+            "get_config",
+            MagicMock(return_value={"tags": ["parent"]}),
+        )
+
+        config = middleware._get_runnable_config()
+
+        assert config["run_name"] == "title_agent"
+        assert config["tags"] == ["parent", "middleware:title", TAG_NOSTREAM]
 
     def test_generate_title_uses_explicit_app_config_without_global_config(self, monkeypatch):
         title_config = TitleConfig(enabled=True, model_name="title-model", max_chars=20)
@@ -141,6 +155,7 @@ class TestTitleMiddlewareCoreLogic:
         title_middleware_module.create_chat_model.assert_called_once_with(
             name="title-model",
             thinking_enabled=False,
+            attach_tracing=False,
             app_config=app_config,
         )
 

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, NotRequired, override
 from langchain.agents import AgentState
 from langchain.agents.middleware import AgentMiddleware
 from langgraph.config import get_config
+from langgraph.constants import TAG_NOSTREAM
 from langgraph.runtime import Runtime
 
 from deerflow.agents.middlewares.dynamic_context_middleware import is_dynamic_context_reminder
@@ -140,7 +141,11 @@ class TitleMiddleware(AgentMiddleware[TitleMiddlewareState]):
             parent = {}
         config = {**parent}
         config["run_name"] = "title_agent"
-        config["tags"] = [*(config.get("tags") or []), "middleware:title"]
+        config["tags"] = [
+            *(config.get("tags") or []),
+            "middleware:title",
+            TAG_NOSTREAM,
+        ]
         return config
 
     def _generate_title_result(self, state: TitleMiddlewareState) -> dict | None:
@@ -160,7 +165,11 @@ class TitleMiddleware(AgentMiddleware[TitleMiddlewareState]):
         prompt, user_msg = self._build_title_prompt(state)
 
         try:
-            model_kwargs = {"thinking_enabled": False}
+            # attach_tracing=False because ``_get_runnable_config()`` inherits
+            # the graph-level RunnableConfig (set in ``_make_lead_agent``) whose
+            # callbacks already carry tracing handlers; binding them again at
+            # the model level would emit duplicate spans.
+            model_kwargs = {"thinking_enabled": False, "attach_tracing": False}
             if self._app_config is not None:
                 model_kwargs["app_config"] = self._app_config
             if config.model_name:
