@@ -865,6 +865,7 @@ async def sse_consumer(
         # worker holds no in-memory task/abort state for them, so run_mgr.cancel()
         # cannot stop the task (it would 409). Skip on_disconnect cancellation for
         # those and only act on runs this worker actually owns.
+        # store_only = True means this worker does not hold the task/abort state for the run.
         if not record.store_only and record.status in (RunStatus.pending, RunStatus.running):
             if record.on_disconnect == DisconnectMode.cancel:
                 await run_mgr.cancel(record.run_id)
