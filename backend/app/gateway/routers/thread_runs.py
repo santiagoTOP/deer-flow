@@ -1039,6 +1039,7 @@ async def stream_existing_run(
     ``POST`` to this endpoint.  When ``action=interrupt`` or ``action=rollback``
     is present the run is cancelled first; the response then streams any
     remaining buffered events so the client observes a clean shutdown.
+    thread_id：表示当前的会话 id，一个会话可能有多次交互，每个交互都有一个 run_id
     """
     require_cancel_permission_when_action(request, action)
 
