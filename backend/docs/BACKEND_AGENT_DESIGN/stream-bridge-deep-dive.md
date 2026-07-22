@@ -417,94 +417,167 @@ def _parse_event_seq(event_id: str) -> int | None:
 
 agent 正在跑，**多个客户端想同时看**：
 
-- 用户在标签页 A 发了消息，agent 开跑
+- 用户在浏览器标签页 A 发了消息，agent 开跑，A 在看流
 - 用户又开了标签页 B 看同一线程——B 要 join 已经在跑的 run
-- IM 通道（飞书）也触发了这个 run，飞书端也要看事件
-- 调度器 / 内部测试也想旁观
+- 一个流式 IM 通道（飞书 / Telegram / 企业微信）也触发了同一个 run，它也要看事件流
+- 客户端网络抖断，带 `Last-Event-ID` 重连——相当于"第二个订阅者"加入
 
-这些场景在 DeerFlow 里真实存在。看 `thread_runs.py:645-698` 的 `stream_existing_run` 端点（GET 和 POST 都注册）：
+这些场景在 DeerFlow 里真实存在。下面把"谁在订阅、在哪订阅、怎么订阅"一次讲清楚。
+
+#### 3.1 先看清全貌：一个 run 到底有几条订阅链路
+
+先记住一个关键事实：**所有 HTTP 订阅最终都汇聚到两个 helper 函数**，它们是 `bridge.subscribe(...)` 的唯二调用点（在 `backend/app/gateway/services.py`）：
 
 ```python
-@router.get("/{thread_id}/runs/{run_id}/stream", response_model=None)
-@router.post("/{thread_id}/runs/{run_id}/stream", response_model=None)
-@require_permission("runs", "read", owner_check=True)
-async def stream_existing_run(thread_id, run_id, request, ...):
+async def sse_consumer(bridge, record, request, run_mgr):   # services.py:828
     ...
-    return StreamingResponse(
-        sse_consumer(bridge, record, request, run_mgr),
-        ...
-    )
+    async for entry in bridge.subscribe(record.run_id, last_event_id=last_event_id):  # services.py:846
+        ...  # 把 entry 格式化成 SSE 文本 yield 出去
+
+async def wait_for_run_completion(bridge, record, request, run_mgr):   # services.py:874
+    ...
+    async for entry in bridge.subscribe(record.run_id, last_event_id=last_event_id):  # services.py:908
+        ...  # 不往 HTTP 吐 SSE，只是"阻塞到 run 结束"
 ```
 
-这个端点的作用是：**第二个、第三个客户端加入一个已经在跑的 run 的事件流**。它也调用 `sse_consumer`，也订阅 bridge。
+区别只有一点：
 
-#### 朴素写法为什么做不到
+- `sse_consumer`：**流式**——每来一个 entry 就 `yield` 一段 SSE 文本给浏览器（字一个一个蹦）。
+- `wait_for_run_completion`：**阻塞**——把流"喝干"直到 `END_SENTINEL`，用于 `/runs/wait` 这种"跑完一次性返回最终状态"的端点。它内部消费同一个 `subscribe`，但不往外吐事件。
 
-朴素 generator 是 **1:1 管道**：一个生产者（agent）配一个消费者（HTTP 响应）。第二个消费者来 join 时：
+所以"谁在订阅"这个问题，等价于"谁调用了这两个 helper"。下面把所有调用点列全。
 
-- generator 已经被第一个消费者迭代掉了——没法"再生成一遍"
-- 重跑 agent？同样不行（副作用、成本、不确定性）
+#### 3.2 所有订阅入口（端点）一张表
 
-#### Bridge 怎么解决的：Condition 广播
+`bridge.subscribe` 不直接暴露给外部，外部通过 HTTP 端点间接触发。每个端点进来 → 拿到 `bridge` → 调 `sse_consumer` 或 `wait_for_run_completion` → 内部 `bridge.subscribe`。下面是全部入口（`thread_runs.py` 和 `runs.py`）：
 
-看 publish 端（`memory.py:95-104`）：
+| 端点 | 文件:行 | 触发场景 | 调的 helper |
+|---|---|---|---|
+| `POST /{tid}/runs/stream` | `thread_runs.py:496` | **创建 run 并流式看**（浏览器发消息的主路径） | `sse_consumer` (:510) |
+| `POST /{tid}/runs/wait` | `thread_runs.py:524` | 创建 run，阻塞等它跑完，返回最终状态 | `wait_for_run_completion` (:534) |
+| `GET /{tid}/runs/{rid}/join` | `thread_runs.py:618` | **第二个标签页 join 一个已经在跑的 run** | `sse_consumer` (:631) |
+| `GET\|POST /{tid}/runs/{rid}/stream` | `thread_runs.py:645` | 重新挂回一个 run（重连 / SDK 的 stop 按钮） | `sse_consumer` (:691) |
+| `POST /runs/stream`（无状态） | `runs.py:44` | 无 thread 的单次流式 run | `sse_consumer` |
+| `POST /runs/wait`（无状态） | `runs.py:69` | 无 thread 的单次阻塞 run | `wait_for_run_completion` |
+
+注意一个关键点：**每个 HTTP 请求进来，都会新开一个 `bridge.subscribe(...)` 迭代器**。两个标签页看同一个 run = 两次 HTTP = 两个独立的 `subscribe` 迭代器，但它们读的是**同一个** `_RunStream`（memory）或**同一个 Redis key**（redis）。这就是 fan-out 的物理基础。
+
+举个最典型的 fan-out 场景，看 `join_run` 端点（`thread_runs.py:618-638`）：
 
 ```python
-async def publish(self, run_id, event, data) -> None:
-    stream = self._get_or_create_stream(run_id)
-    entry = StreamEvent(id=self._next_id(run_id), event=event, data=data)
-    async with stream.condition:
-        stream.events.append(entry)
-        if len(stream.events) > self._maxsize:
-            overflow = len(stream.events) - self._maxsize
-            del stream.events[:overflow]
-            stream.start_offset += overflow
-        stream.condition.notify_all()
+@router.get("/{thread_id}/runs/{run_id}/join")
+@require_permission("runs", "read", owner_check=True)
+async def join_run(thread_id, run_id, request):
+    run_mgr = get_run_manager(request)
+    record = await run_mgr.get(run_id)              # 找到那个正在跑的 run
+    if record is None or record.thread_id != thread_id:
+        raise HTTPException(status_code=404, ...)
+    bridge = get_stream_bridge(request)
+    if record.store_only and not bridge.supports_cross_process:   # 麻烦 4 会讲这个守卫
+        raise HTTPException(status_code=409, "Run ... is not active on this worker ...")
+
+    return StreamingResponse(
+        sse_consumer(bridge, record, request, run_mgr),   # 第 N 个订阅者，从这里加入
+        media_type="text/event-stream", ...)
 ```
 
 逐行：
 
-- `async def publish(self, run_id, event, data) -> None:`
-  生产者调用，往 run 的事件流里塞一条。
-- `stream = self._get_or_create_stream(run_id)`
-  根据 run_id 找到（或新建）对应的 `_RunStream` 对象。
-- `entry = StreamEvent(id=self._next_id(run_id), event=event, data=data)`
-  构造一个事件对象：id 用 `_next_id` 生成（麻烦 2 讲过），event 和 data 是调用者传进来的。
-- `async with stream.condition:`
-  **加锁**。`async with` 是异步上下文管理器，进入时自动 `acquire`（拿锁），退出时自动 `release`（放锁）。`Condition` 本身也是一把锁，所以这里相当于"获取 condition 锁"。这一段代码（到 `notify_all`）是临界区——同一时刻只有一个协程能执行。
-  为什么要锁？因为可能有多个协程同时往里塞事件（虽然实际 publish 一般是 agent worker 一个，但锁是健壮的写法），同时还有别的协程在 `wait`，必须保证数据一致。
-- `stream.events.append(entry)`
-  把事件加到列表末尾。
-- `if len(stream.events) > self._maxsize:` 滑动窗口判断（麻烦 6 细讲），列表超长就淘汰旧的。
-- `stream.condition.notify_all()`
-  **按铃**——叫醒所有在这个 condition 上 `wait` 的订阅者协程。这是 fan-out 的核心：一个 publish，所有订阅者都被通知。
+- `record = await run_mgr.get(run_id)`——根据 run_id 拿到这个 run 的记录。**注意它不需要 run 是"我创建的"**，任何知道 run_id 的合法请求都能 join。这就是"多订阅者"能成立的前提。
+- `if record.store_only and not bridge.supports_cross_process:`——跨进程守卫，麻烦 4 展开。这里先理解为"内存模式下，run 不在这个 worker 上就拒绝"。
+- `sse_consumer(bridge, record, request, run_mgr)`——开一个新的订阅。里面会调 `bridge.subscribe(record.run_id, ...)`，加入这个 run 的事件流。
 
-订阅端（`memory.py:112-150`）：
+#### 3.3 IM 通道是不是订阅者？（容易搞混的点）
+
+很多人（包括这篇文档的旧版）会以为"飞书触发的 run，飞书内部直接订阅 bridge"。**这是错的**，务必厘清：
+
+- IM 通道（`backend/app/channels/feishu.py` 等）**从不导入 `StreamBridge`，也从不调用 `bridge.subscribe`**。它们和 bridge 之间没有任何直接联系。
+- IM 通道走的是**普通 HTTP 路径**：通道管理器（`app/channels/manager.py:1081`）用 `langgraph_sdk` 的 HTTP 客户端，向 Gateway 自己的 `POST /api/threads/{tid}/runs/stream` 发请求。
+
+看飞书这类**流式通道**（`manager.py:1744`）：
+
+```python
+async for chunk in client.runs.stream(thread_id, assistant_id, **stream_kwargs):
+    ...
+```
+
+这一行 `client.runs.stream(...)` 本质就是一次 HTTP POST 到 `/runs/stream`。它在**服务端**会命中上面表里的第一个端点 → 调 `sse_consumer` → 调 `bridge.subscribe`。
+
+**所以 IM 通道是订阅者，但是"远程的、经 HTTP 进来的"订阅者**，和浏览器标签页没有本质区别。只有飞书 / Telegram / 企业微信 这三种流式通道会这么干（`manager.py:87-95` 的 `CHANNEL_CAPABILITIES` 里 `supports_streaming: True`）；Slack/Discord/钉钉 用 `runs.wait`（阻塞等结果），GitHub 用 `runs.create`（发完就走，根本不看流）。
+
+> ⚠️ 注意：通道里那些 `bus.subscribe_outbound(...)` 调用是**另一个东西**——`MessageBus`（进程内的消息总线），和 `StreamBridge` 完全不是一回事，别因为名字里有 subscribe 就搞混。
+
+#### 3.4 调度器（scheduler）是不是订阅者？
+
+**不是**。调度器（`backend/app/scheduler/service.py`）从不订阅 bridge 的事件流。它关心的是"run 跑完了没"，而这件事用的是**完成回调钩子**，不是订阅：
+
+- agent worker 跑完时（`worker.py:710-712` 的 `finally` 块）会调用 `ctx.on_run_completed(record)`。
+- 这个钩子在 Gateway 启动时被接到调度器的 `handle_run_completion` 上（`deps.py:423`）。
+- 调度器收到回调，更新任务表，**全程没碰 bridge**。
+
+所以 fan-out 的订阅者只有两类：**浏览器/客户端**（通过 `/runs/stream`、`/runs/{id}/join`、`/runs/{id}/stream`）和**流式 IM 通道**（本质上也是上一类的 HTTP 客户端）。
+
+#### 3.5 朴素写法为什么做不到
+
+朴素 generator 是 **1:1 管道**：一个生产者（`agent.astream()`）配一个消费者（HTTP 响应）。第二个消费者来 join 时：
+
+- generator 已经被第一个消费者迭代掉了——没法"再生成一遍"（generator 是一次性的）。
+- 重跑 agent？不行——LLM 调用要钱、有副作用、每次结果不一样（温度采样）。
+- 把 chunk 复制一份给第二个消费者？朴素写法里 agent 和 HTTP 响应是**同一条命**（见第 1 步），根本没有"中间层"可以做复制。
+
+#### 3.6 Bridge 怎么解决的：每个 run 一份共享事件日志 + Condition 广播
+
+核心思路：把"agent 产出事件"和"N 个客户端消费事件"中间塞一个**每个 run 一份的事件日志**（`_RunStream`）。agent 往里写一次，N 个订阅者各自从自己的进度读——读的是同一份数据，互不影响。
+
+**生产端**——`publish`（`memory.py:101-111`）：
+
+```python
+async def publish(self, run_id, event, data) -> None:
+    stream = self._get_or_create_stream(run_id)                 # 每个 run 一份
+    entry = StreamEvent(id=self._next_id(run_id), event=event, data=data)
+    async with stream.condition:                                # 加锁
+        stream.events.append(entry)                             # 写一次
+        if len(stream.events) > self._maxsize:                  # 滑动窗口（麻烦 6）
+            overflow = len(stream.events) - self._maxsize
+            del stream.events[:overflow]
+            stream.start_offset += overflow
+        stream.condition.notify_all()                           # ← fan-out 的核心：叫醒所有订阅者
+```
+
+逐行：
+
+- `stream = self._get_or_create_stream(run_id)`：按 run_id 拿到（或新建）那个 run 的 `_RunStream`。**同一个 run_id 永远拿到同一个 `_RunStream` 对象**——这是"共享"的物理基础。
+- `entry = StreamEvent(...)`：构造一条事件（id 由麻烦 2 讲的 `_next_id` 生成）。
+- `async with stream.condition:`：加锁。`Condition` 本身是一把锁，`async with` 进入时拿锁、退出时放锁。从这行到 `notify_all` 是临界区，同一时刻只有一个协程能进来。锁是为了保证"写 + 通知"是个原子动作，不会出现"事件写一半、订阅者读到半截"的情况。
+- `stream.events.append(entry)`：把事件追加到列表末尾。**只 append 一次**，不管有几个订阅者——事件在内存里只有一份。
+- `if len(stream.events) > self._maxsize:`：滑动窗口淘汰（麻烦 6 细讲）。
+- `stream.condition.notify_all()`：**按铃，叫醒所有在这个 condition 上 `wait` 的订阅者协程**。这是 fan-out 的扳机：一次 publish，所有订阅者全被唤醒。
+
+**消费端**——`subscribe`（`memory.py:120-161`）：
 
 ```python
 async def subscribe(self, run_id, *, last_event_id=None, heartbeat_interval=15.0):
-    stream = self._get_or_create_stream(run_id)
+    stream = self._get_or_create_stream(run_id)                 # 和 publish 读的是同一个对象
     async with stream.condition:
-        next_offset = self._resolve_start_offset(stream, last_event_id)
+        next_offset = self._resolve_start_offset(stream, last_event_id)  # 各算各的起点
 
     while True:
         async with stream.condition:
-            if next_offset < stream.start_offset:
+            if next_offset < stream.start_offset:               # 我落后太多，被淘汰了
                 next_offset = stream.start_offset
             local_index = next_offset - stream.start_offset
-            if 0 <= local_index < len(stream.events):
+            if 0 <= local_index < len(stream.events):           # 有新事件
                 entry = stream.events[local_index]
-                next_offset += 1
-            elif stream.ended:
+                next_offset += 1                                # 我自己往前走一格
+            elif stream.ended:                                  # 没新事件但 run 结束了
                 entry = END_SENTINEL
-            else:
+            else:                                               # 没新事件，等铃
                 try:
                     await asyncio.wait_for(stream.condition.wait(), timeout=heartbeat_interval)
                 except TimeoutError:
                     entry = HEARTBEAT_SENTINEL
                 else:
                     continue
-
         if entry is END_SENTINEL:
             yield END_SENTINEL
             return
@@ -513,28 +586,53 @@ async def subscribe(self, run_id, *, last_event_id=None, heartbeat_interval=15.0
 
 逐行讲关键的几个：
 
-- `async with stream.condition: next_offset = self._resolve_start_offset(stream, last_event_id)`
-  加锁，调用麻烦 2 里讲过的函数算出起始位置。锁是为了保证算 `start_offset` 时数据不被改。
-- `while True:` 死循环——持续订阅，直到 run 结束。
-- `async with stream.condition:` 每轮迭代加锁。
-- `local_index = next_offset - stream.start_offset`
-  把绝对偏移换算成列表下标。
-- `if 0 <= local_index < len(stream.events): entry = stream.events[local_index]; next_offset += 1`
-  如果列表里有下一条要给的事件，拿出来，下标前进。
-- `elif stream.ended: entry = END_SENTINEL`
-  列表里没有新事件，但 run 已经结束了——返回结束标记。
-- `else: try: await asyncio.wait_for(stream.condition.wait(), timeout=heartbeat_interval)`
-  没有新事件，run 也没结束——**等铃响**（publish 进来新事件会 notify_all），最多等 `heartbeat_interval` 秒。
-  - `stream.condition.wait()` 是"释放锁 + 暂停协程 + 等通知 + 被叫醒后重新拿锁"。
-  - `asyncio.wait_for(..., timeout=...)` 包一层超时——超过时间没被叫醒就抛 `TimeoutError`。这是心跳机制（麻烦 5）。
-- `except TimeoutError: entry = HEARTBEAT_SENTINEL`
-  超时了（没新事件），给个心跳标记。
-- `else: continue`
-  `try-except-else` 的 else 分支：正常被叫醒（没超时），说明可能有新事件了，**重新进入循环**检查（`continue`）。
+- `stream = self._get_or_create_stream(run_id)`：**和 publish 拿到的是同一个 `_RunStream` 对象**。这是"共享"的另一面——生产者和所有消费者都指向同一块数据。
+- `next_offset = self._resolve_start_offset(stream, last_event_id)`：每个订阅者**各自**算自己的起点（麻烦 2 讲过）。新来的从 0 开始，重连的从 `Last-Event-ID` 之后开始——**互不影响**。
+- `async with stream.condition:`（循环里）：每轮迭代加锁。注意锁是"进入临界区 → 读一个事件 → 退出临界区"，所以多个订阅者能**交错**进入（一个在 `wait` 时让出锁，另一个能进来读）。
+- `local_index = next_offset - stream.start_offset`：把"我自己的绝对进度"换算成"列表下标"。
+- `if 0 <= local_index < len(stream.events):`：有我还没读的事件，拿出来，`next_offset += 1`（**我的进度前进一格，不影响别的订阅者的 next_offset**）。
+- `elif stream.ended:`：列表里没新事件，但 run 已经结束 → 给结束标记。
+- `else: await asyncio.wait_for(stream.condition.wait(), ...)`：没新事件也没结束 → **等铃响**（`wait` 会释放锁、暂停自己；被 `notify_all` 叫醒后重新拿锁）。外面包一层超时就是心跳（麻烦 5）。
 
-**多订阅者是怎么工作的**：
+#### 3.7 fan-out 到底是怎么发生的（把流程走一遍）
 
-每个调用 `subscribe` 的客户端都在自己的 `while True` 循环里 `wait`。当 publish 来时，`notify_all()` 把它们**全部叫醒**，每个都重新检查 `events` 列表，各自从自己的 `next_offset` 往前读。所以一个事件能被多个订阅者各自读到一次——这就是 fan-out（扇出，一对多广播）。
+把上面拼起来，看两个订阅者同时看一个 run 时，一次 `publish` 的完整流程：
+
+```
+时刻 T0：run R 正在跑，订阅者 A 和 B 都在 subscribe 的 wait() 上睡着（各自持 next_offset=10）
+         events 列表长度 = 10（e0..e9）
+
+时刻 T1：agent worker 调 bridge.publish(R, "messages", {"content":"你"})
+   publish 内部：
+     1. async with condition:   拿到锁
+     2. events.append(e10)      列表变成 11 条
+     3. notify_all()            ← 按铃
+     4. 退出 async with         释放锁
+        此时 A 和 B 的 wait() 被同时唤醒（这就是"广播"）
+
+时刻 T2：A 被唤醒，重新拿锁
+     local_index = 10 - 0 = 10
+     0 <= 10 < 11 成立 → entry = events[10] = e10
+     next_offset = 11（A 的进度前进）
+     yield entry → sse_consumer 把它格式化成 SSE 发给浏览器 A
+
+时刻 T3：B 被唤醒，重新拿锁（A 已经放锁）
+     同样：local_index = 10 - 0 = 10，拿到 e10，next_offset = 11
+     yield entry → 发给浏览器 B
+
+结果：e10 这一条事件，被 A 和 B 各读了一次，但它在 events 列表里只存了一份。
+```
+
+**关键点**：
+
+- **事件只存一份**（`events.append` 一次），不管几个订阅者——内存不会因为订阅者变多而膨胀。
+- **每个订阅者有自己的 `next_offset`**（是 `subscribe` 函数的局部变量，每个调用一份）——所以 A 和 B 互不干扰，各自按自己的进度读。
+- **`notify_all` 是广播**——一次唤醒所有 `wait` 的订阅者，每个醒来后自己检查列表。
+- **迟到者也能补看**：订阅者 C 在 T5 才 join，它的 `next_offset` 从 `_resolve_start_offset` 算出来（比如从 0），会先把 e0..e10 这 11 条**历史事件**快速读出来（循环每轮读一条，不等 `wait`），追上进度后才进入 `wait`。这就是"迟到订阅者回放"。
+
+> 这也是为什么麻烦 2 的"事件日志 + ID"和麻烦 3 的"fan-out"是同一套机制的两面：因为有可重放的事件日志，才能让任意数量、任意时刻到来的订阅者各自回放/追赶。
+
+**朴素写法为什么做不到**：朴素 generator 没有"事件日志"这个中间层，`yield` 出去就没了；也没有"共享对象 + notify_all"这个广播机制。第二个订阅者要 join 时，generator 早被第一个迭代光了，无处可读。
 
 ---
 
@@ -545,95 +643,251 @@ async def subscribe(self, run_id, *, last_event_id=None, heartbeat_interval=15.0
 生产部署时，Gateway（API 服务）往往不止一个进程：
 
 - **横向扩展**：一台机器扛不住，跑 3 台机器，每台一个 Gateway 进程
-- **负载均衡**：nginx 把客户端请求分发到不同进程
+- **负载均衡**：nginx 把客户端请求分发到不同进程（轮询 / 最少连接）
 
-这时会出现一个问题：客户端的 SSE 连接落在进程 A，但 agent run 跑在进程 B（因为某些调度原因）。进程 A 要怎么把进程 B 里产生的事件流给客户端？
+这时会出现一个核心问题：**客户端的 SSE 连接落在进程 A，但 agent run 跑在进程 B**（因为 run 是进程 B 创建并启动的，它持有那个 agent task）。进程 A 要怎么把进程 B 里产生的事件流给客户端？
 
-#### 朴素写法为什么做不到
+麻烦 4 就是专门解决"事件流怎么跨越进程边界"这件事。下面把"为什么朴素写法做不到、两种 bridge 实现怎么对应两种部署、Redis 模式下具体的工作流水"一次讲透。
 
-朴素写法依赖**进程内的 async generator**。Python 进程之间内存是隔离的——进程 A 没法迭代进程 B 里的 generator 对象，那个对象在进程 B 的内存里。
+#### 4.1 先理解一个关键概念：`store_only` 记录
 
-代码里能直接看到这个真实约束，`thread_runs.py:667-668`：
+要讲清跨进程，先得理解 `record.store_only` 这个标志。它是"这个 worker 不拥有这个 run"的信号：
+
+- 每个 worker 进程内部有个**内存表** `_runs`（`RunManager` 维护），记录"本进程正在跑的 run"。只有创建并 `asyncio.create_task` 启动了 agent 的那个 worker，才把 run 放进自己的 `_runs`。
+- 除了内存表，run 的元信息（run_id、状态、thread_id 等）还会落到**共享存储**（数据库，`RunStore`），所有 worker 都能读。
+- 当一个 worker 查一个**不是自己启动的** run 时（`RunManager.get()`，`manager.py:527-557`），内存表里没有，就回退到从共享存储读，读出来的记录 `store_only=True`（`manager.py:399`）。
+
+`store_only` 的字面意思就是："我这个 worker 只从存储里读了这条记录，**没有**对应的活 agent task 在跑"。agent task 在**另一个** worker 手里。
+
+#### 4.2 朴素写法为什么做不到
+
+朴素写法依赖**进程内的 async generator**。Python 进程之间内存是隔离的——进程 A 没法迭代进程 B 里的 generator 对象，那个对象（连同 agent、连同产到一半的 chunk）全在进程 B 的内存里。
+
+代码里能直接看到这个真实约束。看 `join_run` 和 `stream_existing_run` 里这道守卫（`thread_runs.py:627` 和 `:667`）：
 
 ```python
-if record.store_only and action is None and not bridge.supports_cross_process:
+if record.store_only and not bridge.supports_cross_process:
     raise HTTPException(409, "Run ... is not active on this worker and cannot be streamed")
 ```
 
 逐行：
 
-- `if record.store_only and action is None and not bridge.supports_cross_process:`
-  三个条件全满足才报错：
-  - `record.store_only`：这个 run 记录是从存储里恢复出来的（不是这个 worker 正在跑的）。`store_only` 的含义是"这个 worker 只从数据库读了记录，没有实际的运行任务"。
-  - `action is None`：用户没有要取消（cancel 时走另一条路径）。
-  - `not bridge.supports_cross_process`：当前的 bridge 实现不支持跨进程。
-- `raise HTTPException(409, "Run ... is not active on this worker and cannot be streamed")`
-  返回 HTTP 409（Conflict）错误，意思是"这个 run 不在当前 worker 上跑，没法给你流"。
+- `if record.store_only and not bridge.supports_cross_process:`
+  两个条件**同时**满足才报错：
+  - `record.store_only`：这个 run 不在当前 worker 手里（agent task 在别的进程）。
+  - `not bridge.supports_cross_process`：当前的 bridge 实现不支持跨进程（内存模式就是如此）。
+- `raise HTTPException(409, ...)`
+  返回 HTTP 409（Conflict），意思是"这个 run 不在我手上，我又没法跨进程读它的事件，没法给你流"。
 
-#### Bridge 怎么解决的：抽象 + 两种实现
+（`stream_existing_run` 里多了个 `action is None` 条件，是因为带 `action` 时走的是"跨 worker 取消"的另一条路径，麻烦 4 末尾会讲。）
 
-`StreamBridge` 是个**抽象基类**（abstract base class）——只定义接口（有哪些方法），不规定具体实现。具体实现由子类提供。
+这道守卫就是朴素写法约束的**直接代码化**：内存模式下，跨 worker 的事件流根本拿不到，与其让客户端傻等，不如直接 409 告诉它"你得连到那个真正在跑的 worker"。
 
-抽象基类的代码（`backend/packages/harness/deerflow/runtime/stream_bridge/base.py:37-44`）：
+#### 4.3 Bridge 怎么解决的：抽象基类 + 两种实现，对应两种部署
+
+`StreamBridge` 是个**抽象基类**（abstract base class）——只定义接口（有哪些方法），不规定具体实现。具体实现由子类提供，不同的子类对应不同的部署规模。
+
+抽象基类（`backend/packages/harness/deerflow/runtime/stream_bridge/base.py:37-44`）：
 
 ```python
 class StreamBridge(abc.ABC):
-    supports_cross_process: bool = False
+    supports_cross_process: bool = False            # ← 关键开关：是否支持跨进程
 
     @abc.abstractmethod
-    async def publish(self, run_id, event, data) -> None:
-        ...
+    async def publish(self, run_id, event, data) -> None: ...
 
     @abc.abstractmethod
-    async def publish_end(self, run_id) -> None:
-        ...
+    async def publish_end(self, run_id) -> None: ...
+
+    @abc.abstractmethod
+    def subscribe(self, run_id, *, last_event_id=None, heartbeat_interval=15.0) -> AsyncIterator[StreamEvent]: ...
 ```
 
 逐行：
 
-- `class StreamBridge(abc.ABC):`
-  继承自 `abc.ABC`（Abstract Base Class），表示这是个抽象类，**不能直接实例化**（不能 `StreamBridge()`），必须由子类实现所有抽象方法。
-- `supports_cross_process: bool = False`
-  类属性，标记这个实现**是否支持跨进程**。默认 False，子类可以覆盖为 True。
-- `@abc.abstractmethod`
-  装饰器，标记下面的方法是抽象方法——子类必须实现，否则子类也不能实例化。
-- `async def publish(self, run_id, event, data) -> None: ...`
-  方法定义，`...`（Ellipsis）只是占位，表示"这里没有实现，由子类填"。
+- `class StreamBridge(abc.ABC):` 继承 `abc.ABC`，是抽象类，**不能直接实例化**，必须由子类实现所有抽象方法。
+- `supports_cross_process: bool = False` 类属性，标记这个实现**是否支持跨进程**。默认 False——这正是 4.2 那道守卫检查的字段。
+- `@abc.abstractmethod` 装饰器，标记下面的方法是抽象方法——子类必须实现。`publish` / `publish_end` / `subscribe` 的签名对所有实现都一样，所以**调用方（端点、worker）的代码不用改**，换 bridge 实现就行。
 
-两种实现：
+两种实现，对应两种部署：
 
-**`MemoryStreamBridge`**（`memory.py:25`）：进程内实现。事件存在 Python 进程的内存里（就是之前看的 `_RunStream.events` 列表）。`supports_cross_process` 不覆盖，保持默认的 `False`。
+| 实现 | 文件 | `supports_cross_process` | 事件存在哪 | 适用部署 |
+|---|---|---|---|---|
+| `MemoryStreamBridge` | `memory.py:27` | `False`（不覆盖） | 本进程内存（`_RunStream.events` 列表） | 单 worker |
+| `RedisStreamBridge` | `redis.py:51` | `True`（`redis.py:59`） | Redis 服务（Redis Stream 数据结构） | 多 worker |
 
-**`RedisStreamBridge`**（`redis.py`）：用 Redis（一个独立的内存数据库服务，进程之间通过它交换数据）。事件不存本地内存，而是塞进 Redis 的 stream 数据结构。任何进程都能 publish、任何进程都能 subscribe——通过 Redis 这个"中间人"交换。`supports_cross_process = True`。
+**`MemoryStreamBridge`**：麻烦 2、3 看的就是它。事件存在本进程内存里，`_RunStream.events` 是个 Python list。进程一死，列表就没了。所以它天然只能服务"在本进程创建的 run"，跨进程读不到——`supports_cross_process` 保持默认 `False`，于是 4.2 的守卫会对 `store_only` 记录报 409。
 
-怎么选？看配置 `config.yaml -> stream_bridge.type`：
+**`RedisStreamBridge`**：事件不存本地内存，而是塞进一个**独立的 Redis 服务**。所有 worker 进程都连同一个 Redis，都往同一个 key 读写。进程 A 和进程 B 通过 Redis 这个"中间人"交换事件——谁的内存里都没有事件，事件只在 Redis 里。`supports_cross_process = True`，于是守卫的 `not bridge.supports_cross_process` 为假，**409 不会触发**，任何 worker 都能服务任何 run 的流。
 
-- `type: memory`（默认）→ 单进程部署够用
-- `type: redis` → 多进程部署必需
+怎么选？看配置 `config.yaml -> stream_bridge.type`。工厂函数 `make_stream_bridge`（`async_provider.py:48-91`）根据它二选一：
 
-应用启动时，`backend/app/gateway/deps.py:261` 这一行根据配置选一个：
+```python
+@contextlib.asynccontextmanager
+async def make_stream_bridge(app_config=None) -> AsyncIterator[StreamBridge]:
+    config = _resolve_config(app_config)
+    if config is None or config.type == "memory":       # 默认 / memory
+        from deerflow.runtime.stream_bridge.memory import MemoryStreamBridge
+        bridge = MemoryStreamBridge(queue_maxsize=maxsize)
+        ...
+        yield bridge
+        return
+    if config.type == "redis":                          # 多 worker 必需
+        from deerflow.runtime.stream_bridge.redis import RedisStreamBridge
+        bridge = RedisStreamBridge(redis_url=..., queue_maxsize=..., ...)
+        ...
+        yield bridge
+        return
+    raise ValueError(f"Unknown stream bridge type: {config.type!r}")
+```
+
+注意两点：
+
+- `type: memory`（默认）→ 单进程够用；`type: redis` → 多进程必需。
+- `RedisStreamBridge` 是**懒导入**的（`import` 写在 `if config.type == "redis"` 分支里），因为 `redis` 是个可选依赖（optional extra）。如果选了 memory，没装 redis 包也不报错；只有选了 redis 才需要装（`uv sync --extra redis`）。
+
+应用启动时，`deps.py:261` 这一行根据配置选一个，挂到全局状态上：
 
 ```python
 app.state.stream_bridge = await stack.enter_async_context(make_stream_bridge(config))
 ```
 
-- `make_stream_bridge(config)` 根据 config 返回 Memory 或 Redis 实现
-- `stack.enter_async_context(...)` 把它注册到应用的"启动栈"里，应用关闭时自动清理
-- `app.state.stream_bridge = ...` 把它挂在 app 的全局状态上
+- `make_stream_bridge(config)` 根据 config 返回 Memory 或 Redis 实现。
+- `stack.enter_async_context(...)` 把它注册到应用的"启动栈"，应用关闭时自动 `close()`。
+- `app.state.stream_bridge = ...` 挂在 app 的全局状态上。**每个 worker 进程各自启动时各自建一个 bridge 实例**——Memory 模式下各进程的 bridge 互相独立（所以跨不了进程）；Redis 模式下各进程的 bridge 都连同一个 Redis（所以能跨进程）。
 
-之后路由里 `get_stream_bridge(request)` 就是从 `app.state.stream_bridge` 取出来。整个应用共用一个 bridge 实例。
+之后路由里 `get_stream_bridge(request)` 就是从 `app.state.stream_bridge` 取出来用。
 
-#### 配合"恢复"场景
+#### 4.4 Redis 模式下，具体的工作流水是怎么走的（重点）
 
-`deps.py:326` 还有一段：
+这是"跨进程具体怎么用"的核心。假设部署了两个 worker（W1、W2），都连同一个 Redis。用户在浏览器发消息，请求被 nginx 分到了 **W1**；但之前同一个 run 是 **W2** 创建的（agent task 在 W2 手里）。看事件怎么从 W2 流到 W1 再到浏览器。
+
+先看 Redis 这边用了什么数据结构。`RedisStreamBridge` 用的是 **Redis Stream**（不是 pub/sub，这是个关键区别）。每个 run 对应一个 Redis Stream，key 是 `deerflow:stream_bridge:{run_id}`（`redis.py:84-85`）：
+
+```python
+def _stream_key(self, run_id: str) -> str:
+    return f"{self._key_prefix}:{run_id}"      # 例如 "deerflow:stream_bridge:run-abc123"
+```
+
+为什么用 Stream 不用 pub/sub？因为 **pub/sub 是"发完就丢"**——后连上的订阅者收不到历史消息，重连也没法补。而 Stream 是**持久化的、可回放的事件日志**（和内存模式的 `events` 列表对应），正好支撑麻烦 2 的 `Last-Event-ID` 重连。
+
+**生产端**（agent task 所在的 W2）——`publish`（`redis.py:142-152`）：
+
+```python
+async def publish(self, run_id, event, data) -> None:
+    key = self._stream_key(run_id)
+    await self._xadd_retained(                          # 底层调 Redis 的 XADD
+        key,
+        {"kind": "event", "event": event, "data": self._encode_data(data)},
+        maxlen=self._maxsize,                           # 滑动窗口：最多留 256 条
+    )
+```
+
+`_xadd_retained`（`redis.py:87-105`）底层用的是 Redis 的 **`XADD`** 命令：
+
+```python
+await self._redis.xadd(key, fields, maxlen=maxlen, approximate=False)
+# 或者（设了 TTL 时）用 pipeline 事务：
+async with self._redis.pipeline(transaction=True) as pipe:
+    pipe.xadd(key, fields, maxlen=maxlen, approximate=False)
+    pipe.expire(key, self._stream_ttl_seconds)          # 默认 86400 秒后自动清理这个 key
+    await pipe.execute()
+```
+
+逐行：
+
+- `xadd(key, fields, maxlen=maxlen)`：往 Redis Stream 里追加一条。`maxlen` 保证 Stream 最多留 `maxsize`（默认 256）条——**这就是麻烦 6 的"有界滑动窗口"在 Redis 上的实现**，对应内存模式的 `del events[:overflow]`。
+- `pipe.expire(key, ttl)`：给这个 key 设个过期时间（默认 1 天），run 结束很久后 Redis 自动回收，不用人工清。
+
+`XADD` 的返回值是 Redis 自动生成的 stream entry id（形如 `1690000000123-0`），它就被直接拿来当 SSE 的 `id:` 字段——这就是麻烦 2 里 `Last-Event-ID` 重连在 Redis 模式下的依据。
+
+**消费端**（浏览器连着的 W1）——`subscribe`（`redis.py:181-235`）：
+
+```python
+async def subscribe(self, run_id, *, last_event_id=None, heartbeat_interval=15.0):
+    key = self._stream_key(run_id)
+    stream_id = await self._resolve_start_stream_id(key, last_event_id)   # 从哪条开始读
+    block_ms = max(1, int(heartbeat_interval * 1000))                     # 心跳毫秒数
+    while True:
+        response = await self._redis.xread({key: stream_id}, count=_XREAD_COUNT, block=block_ms)  # ← 核心一行
+        if not response:                          # block 超时还没数据
+            yield HEARTBEAT_SENTINEL              # → 心跳（麻烦 5）
+            continue
+        for _stream_name, entries in response:
+            for event_id, fields in entries:
+                stream_id = event_id             # 我的进度前进
+                entry = self._entry_from_redis(event_id, fields)
+                if entry is END_SENTINEL:
+                    yield END_SENTINEL
+                    return
+                yield entry
+```
+
+逐行讲关键的：
+
+- `stream_id = await self._resolve_start_stream_id(key, last_event_id)`：算出从哪条 entry 开始读。首次连接（`last_event_id is None`）从 `"0-0"`（Stream 开头）开始；重连就把客户端传来的 `Last-Event-ID` 直接当起点——**因为 Redis Stream 的 entry id 就是发布时返回的那个 id**，天然对得上。
+- `await self._redis.xread({key: stream_id}, count=_XREAD_COUNT, block=block_ms)`：**核心**。`XREAD` 是 Redis 的"读 Stream"命令，参数含义：
+  - `{key: stream_id}`：从 `key` 这个 Stream 的 `stream_id` **之后**开始读。
+  - `count=64`（`_XREAD_COUNT`）：最多读 64 条——把一次大批量回放压缩成少数几次往返。
+  - `block=block_ms`：**阻塞读**。如果当前没有新数据，Redis 不会立刻返回空，而是**最多阻塞 15 秒**（心跳间隔），期间一旦有新数据就立刻返回。这正好实现了"等新事件 + 超时发心跳"，和内存模式的 `asyncio.wait_for(condition.wait(), timeout=...)` 对应。
+- `if not response: yield HEARTBEAT_SENTINEL`：`block` 超时还没数据 → 产心跳哨兵。这就是麻烦 5 的心跳在 Redis 模式下的实现。
+- `stream_id = event_id`：读完一条，把进度推进到这条的 id。**这个 `stream_id` 是 `subscribe` 函数的局部变量，每个订阅者一份**——和内存模式的 `next_offset` 一样，多订阅者互不干扰。
+
+**注意**：Redis 模式下没有 `notify_all`。fan-out 是怎么实现的？答案是 **Redis Stream 天生支持多消费者各自 `XREAD` 同一个 key**——W1 和 W2 上的两个订阅者各自发 `XREAD`，各自从自己的 `stream_id` 往后读，互不影响。Redis 就是那个共享的"事件日志"，对应内存模式里的 `_RunStream.events` 列表。
+
+#### 4.5 把跨进程的完整工作流串一遍
+
+现在把 4.4 的零件拼起来，看一个完整的跨进程场景。部署：nginx → W1、W2 两个 worker，共用一个 Redis。
+
+```
+初始状态：
+  - W2 之前创建了 run R（agent task 在 W2 的事件循环里跑）
+  - W2 的 bridge 把 R 的事件 publish 到 Redis 的 key "deerflow:stream_bridge:R"
+  - W1 没有跑 R 的 agent task；它的 RunManager 内存表里没有 R
+
+步骤 1：浏览器想看 run R 的流，请求被 nginx 分到 W1
+   → W1 命中 GET /runs/R/join（或 /runs/R/stream）
+   → record = run_mgr.get(R)
+     W1 的内存表没有 R → 回退到共享存储读 → 得到 record，store_only=True
+   → 检查守卫：record.store_only and not bridge.supports_cross_process
+     Redis 模式下 supports_cross_process=True → 守卫不触发 ✅（内存模式下这里就 409 了）
+   → 进入 sse_consumer → bridge.subscribe(R, last_event_id=...)
+
+步骤 2：W1 的 subscribe 开始从 Redis 读
+   → _resolve_start_stream_id：浏览器带了 Last-Event-ID → 从那条之后开始
+   → xread(key, stream_id, count=64, block=15000)
+     Redis 把历史 entry（重连回放）立刻返回，W1 yield 出去 → SSE 发给浏览器
+   → 追上进度后，再次 xread 没有新数据 → block 阻塞等待
+
+步骤 3：与此同时，W2 上的 agent 产出新事件
+   → W2 的 worker.py 调 bridge.publish(R, "messages", {"content":"你"})
+   → publish → XADD 到 Redis 的 key
+   → Redis 的 key 多了一条 entry
+
+步骤 4：W1 上阻塞中的 xread 被唤醒（block 期间有新数据就立刻返回）
+   → 返回那条新 entry → W1 yield → SSE 发给浏览器
+   → stream_id 前进，继续 xread block 等下一条
+
+结果：agent 在 W2 跑、事件经 Redis 中转、SSE 从 W1 发出——三者解耦，浏览器毫不知情。
+```
+
+对比内存模式会发生什么：同样的场景（R 在 W2，请求到 W1），W1 会在步骤 1 的守卫处直接返回 **409**。客户端（浏览器或 SDK）拿到 409 后，要么重试到命中 W2，要么部署上用 **sticky session**（nginx 按 thread_id/run_id hash，保证同一 run 的请求总落同一个 worker）。这就是"内存模式只能单 worker，或必须粘性会话"的根因。
+
+#### 4.6 补充：跨进程时的"取消"和"孤儿 run 恢复"
+
+跨进程不只"读事件"一件事，还有两个相关问题，这里顺带说清（它们不是 bridge 的核心职责，但和 `supports_cross_process` 这套机制配套）：
+
+**跨 worker 取消**：如果浏览器在 W1 上对（W2 拥有的）run R 点了"停止"按钮，会带 `action=interrupt` 打到 `stream_existing_run`（`thread_runs.py:671-688`）。W1 调 `run_mgr.cancel(R, action=...)`——这走的是 **lease（租约）机制**，不是 bridge：每个 run 在共享存储里记了 `owner_worker_id` 和 `lease_expires_at`（`manager.py:493-507`）。W1 发现 R 的 lease 还在 W2 手里且没过期 → 返回 `lease_valid_elsewhere` → W1 回 409 + `Retry-After`；如果 W2 的 lease 已过期（W2 可能挂了）→ W1 能"接管"（take over）。这和 bridge 无关，是另一套所有权系统。
+
+**孤儿 run 恢复**：进程重启后，有些 run 在存储里还标着"running"，但实际 agent task 已经随进程死了——再也不会有 `publish`。如果客户端重连过来订阅，会**傻等 END_SENTINEL 永远等不到**。所以 Gateway 启动时会扫这些孤儿 run，主动补发结束信号（`deps.py:326`）：
 
 ```python
 await _publish_recovered_run_stream_end(app.state.stream_bridge, recovered_runs, cleanup_delay=cleanup_delay)
 ```
 
-进程重启后，有些 run 在数据库里标记为"还在跑"，但实际上 agent 已经不会产事件了（进程死了）。如果客户端重连过来订阅，会傻等。所以启动时**主动给这些"孤儿 run"补发 END_SENTINEL**，让客户端能正常收到"结束"。
+它对每个孤儿 run 调一次 `bridge.publish_end(run_id)`（`deps.py:131`），让订阅者能正常收到 `END_SENTINEL` 然后退出。这件事内存模式和 Redis 模式都得做——因为进程重启后内存表空了，原来的 `_RunStream` 也没了，得重建"已结束"的信号。
 
-朴素写法根本做不到——agent 都没了，谁去发结束事件？
+朴素写法根本做不到这两件事——agent 都没了，谁去发结束事件？谁去协调跨 worker 的所有权？bridge + lease 这套机制就是为了把这些"生命周期错位"的问题都接住。
 
 ---
 
