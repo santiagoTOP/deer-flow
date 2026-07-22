@@ -517,6 +517,365 @@ async for chunk in client.runs.stream(thread_id, assistant_id, **stream_kwargs):
 
 所以 fan-out 的订阅者只有两类：**浏览器/客户端**（通过 `/runs/stream`、`/runs/{id}/join`、`/runs/{id}/stream`）和**流式 IM 通道**（本质上也是上一类的 HTTP 客户端）。
 
+#### 3.4.1 补充：定时任务怎么把 run 派发给 agent 执行（完整链路逐行讲）
+
+既然 3.4 说了"调度器不订阅 bridge，只靠完成回调钩子关心 run 跑完了没"，那自然引出下一个问题：**那定时任务是怎么把一个 run 启起来、交给 agent 执行的？** 这一段把从"到期任务被认领"到"agent 真正开始跑"的整条派发链路一次讲透。它和 bridge 没有直接关系（调度器确实不碰 bridge），但和"run 的生命周期怎么被启动、怎么被回写"紧密相关，正好补全 3.4 的另一面。
+
+整条链路分 5 个阶段。
+
+##### 阶段 1：后台轮询认领（scheduler 进程内）
+
+入口在 `ScheduledTaskService._run_loop`（`backend/app/scheduler/service.py:332-346`）：
+
+```python
+async def _run_loop(self) -> None:
+    while not self._stop.is_set():
+        try:
+            await self.run_once(now=datetime.now(UTC))
+        except Exception:
+            logger.exception("Scheduled task poll failed; retrying next interval")
+        try:
+            await asyncio.wait_for(
+                self._stop.wait(),
+                timeout=self._poll_interval_seconds,
+            )
+        except TimeoutError:
+            continue
+```
+
+逐行：
+
+- `async def _run_loop(self) -> None:` 定义调度器的核心循环。这是个**协程**，会被 `asyncio.create_task` 放到事件循环里长期跑（见阶段 1 启动处的 `start` 方法）。
+- `while not self._stop.is_set():` 只要 `_stop` 这个 `asyncio.Event` 没被 set，就一直循环。`stop()` 方法会 `set()` 它，让循环退出——这是优雅停机的入口。
+- `try: await self.run_once(now=datetime.now(UTC))` 每个周期执行一次 `run_once`（下面讲），传当前 UTC 时间。**关键点**：包在 `try` 里是为了**容错**——一次轮询失败（比如数据库暂时锁了）不能把整个调度器协程杀掉，记个日志下一周期继续。
+- `except Exception: logger.exception(...)` 捕获所有异常，打日志，**不退出循环**。注释（`service.py:337-339`）特意说明：SQLite 的 "database is locked" 这种瞬时错误绝不能杀死 poller。
+- `await asyncio.wait_for(self._stop.wait(), timeout=self._poll_interval_seconds)` **这一行是"周期性睡眠"的优雅写法**。`self._stop.wait()` 会阻塞到有人 `set()` 这个 Event；`asyncio.wait_for` 给它套一个 `timeout`（轮询间隔，比如 30 秒）。两种情况会从这行返回：
+  - 有人调了 `stop()` → `wait()` 立刻返回 → `wait_for` 不超时 → 走 `else`（这里没写 else，直接落到循环条件检查，发现 `_stop.is_set()` 为真，退出）。
+  - 超时到了还没人 stop → 抛 `TimeoutError` → 走下面的 `except`。
+- `except TimeoutError: continue` 超时了就进入下一轮循环。**这就是"每 N 秒轮一次"的实现**——不是 `time.sleep`（那是同步阻塞，会卡住整个事件循环），而是 `wait_for` + `Event`（异步等待，期间让出 CPU）。
+
+`run_once` 本体（`service.py:39-54`）：
+
+```python
+async def run_once(self, *, now: datetime) -> None:
+    active = await self._task_run_repo.count_active_runs()
+    budget = self._max_concurrent_runs - active
+    if budget <= 0:
+        return
+    claimed = await self._task_repo.claim_due_tasks(
+        now=now,
+        lease_owner=self._lease_owner,
+        lease_seconds=self._lease_seconds,
+        limit=budget,
+    )
+    for task in claimed:
+        await self.dispatch_task(task, now=now, trigger="scheduled")
+```
+
+逐行：
+
+- `active = await self._task_run_repo.count_active_runs()` 查 `scheduled_task_runs` 表里状态为 `queued` 或 `running` 的行数（见 `scheduled_task_runs/sql.py:68-73` 的 `ACTIVE_RUN_STATUSES = ("queued", "running")`）。这是"当前有多少个定时任务正在跑"的全局计数。
+- `budget = self._max_concurrent_runs - active` 算出这一轮**还能再启动多少个**。`_max_concurrent_runs` 是配置项（`scheduler.max_concurrent_runs`）。注释（`service.py:40-42`）特意强调：这是个**全局上限**，不是"每次轮询最多认领多少"——因为长 run 会跨多个轮询周期累积，所以每轮都要重新算剩余预算。
+- `if budget <= 0: return` 没预算了就直接返回，这一轮什么都不认领。这保证定时任务不会把 agent runtime 挤爆。
+- `claimed = await self._task_repo.claim_due_tasks(...)` **这是分布式安全的核心**。`claim_due_tasks` 是个原子操作（在数据库层用 `UPDATE ... WHERE lease_expires_at < now RETURNING ...` 或等价手段实现），把到期的、且没被别人认领的任务"租"给当前调度器。参数：
+  - `now=now`：当前时间，用来判断哪些任务到期（`next_run_at <= now`）且租约过期（`lease_expires_at < now`）。
+  - `lease_owner=self._lease_owner`：租约持有者标识。`_lease_owner` 在构造函数里生成（`service.py:35`）：`f"{socket.gethostname()}:{uuid.uuid4().hex}"`——主机名加一个随机 uuid，保证同一台机器上即使重启也会换新 owner（防止旧实例的幽灵租约干扰新实例）。
+  - `lease_seconds=self._lease_seconds`：租约时长。认领后这一行会写上 `lease_expires_at = now + lease_seconds`，期间别的调度器实例不会动它。
+  - `limit=budget`：最多认领这么多，正好填满剩余并发预算。
+- `for task in claimed: await self.dispatch_task(task, now=now, trigger="scheduled")` 对每个认领到的任务，调用 `dispatch_task` 派发。`trigger="scheduled"` 标记这是定时触发（区别于 `manual` 手动触发，影响失败时的状态流转，见 `_task_status_for_failure`）。
+
+> **为什么用租约而不是直接 `SELECT ... UPDATE`？** 因为调度器可能部署多实例（高可用）。如果两个实例同时 `SELECT` 到同一个到期任务，然后各自 `UPDATE` 并派发，同一个任务会被执行两次。租约机制让"认领"变成原子的：第一个 `UPDATE` 成功的实例拿到 lease，第二个 `UPDATE` 的 `WHERE lease_expires_at < now` 条件就不成立了（lease 被刷新过了），所以拿不到。这和 0.9 讲的 run lease 是同一套思想。
+
+##### 阶段 2：派发准备（`dispatch_task` 的前半段）
+
+`dispatch_task` 是整个派发逻辑的核心（`service.py:81-210`），这里先讲它"启动 run 之前"的准备部分：
+
+```python
+async def dispatch_task(self, task, *, now, trigger):
+    execution_thread_id = task.get("thread_id")
+    if task.get("context_mode") == "fresh_thread_per_run" or not execution_thread_id:
+        execution_thread_id = str(uuid.uuid4())
+    skip_error: str | None = None
+    if task.get("overlap_policy", "skip") == "skip" and await self._task_run_repo.has_active_runs(task["id"]):
+        if trigger == "manual":
+            return {"outcome": "conflict", ...}
+        skip_error = "skipped: a previous run of this task is still active"
+    task_run_id = f"task-run-{uuid.uuid4().hex}"
+    await self._task_run_repo.create(
+        run_record_id=task_run_id,
+        task_id=task["id"],
+        thread_id=execution_thread_id,
+        scheduled_for=now,
+        trigger=trigger,
+        status="queued",
+    )
+    if skip_error is not None:
+        return await self._finalize_skip(...)
+```
+
+逐行：
+
+- `execution_thread_id = task.get("thread_id")` 先取任务配置的默认 thread。
+- `if task.get("context_mode") == "fresh_thread_per_run" or not execution_thread_id:` **两种情况要换新 thread**：①任务配置了"每次跑都开新会话"（`fresh_thread_per_run`）；②任务压根没配 thread。`context_mode` 的默认值在模型里（`scheduled_tasks/model.py:17`）就是 `"fresh_thread_per_run"`，所以**定时任务默认每次都在全新会话里跑**——上一轮的对话上下文不会污染这一轮。
+- `execution_thread_id = str(uuid.uuid4())` 生成一个新 thread id。这个 thread 在 agent runtime 那边会被自动创建（`start_run` 路径负责）。
+- `skip_error: str | None = None` 初始化"跳过原因"。如果这一轮因为重叠策略被跳过，这里会被填上。
+- `if task.get("overlap_policy", "skip") == "skip" and await self._task_run_repo.has_active_runs(task["id"]):` **重叠检查**。`overlap_policy` 默认 `"skip"`（`scheduled_tasks/model.py:25`），意思是"如果上一次还没跑完，就跳过这一次"。`has_active_runs` 查 `scheduled_task_runs` 表里这个 task 还有没有 `queued`/`running` 的行（`sql.py:109-120`）。
+- `if trigger == "manual": return {"outcome": "conflict", ...}` 手动触发遇到重叠，直接返回 conflict——因为手动触发一般是 API 请求，得立刻给调用方一个明确答复（HTTP 层面会映射成 409）。
+- `skip_error = "skipped: ..."` 定时触发遇到重叠，**不立刻返回**，而是先记下跳过原因，下面照常创建一行 task_run（状态会是 `skipped`）。这样历史记录里能看到"这次本来该跑，但被跳过了"。
+- `task_run_id = f"task-run-{uuid.uuid4().hex}"` 生成这次执行的唯一 id。`uuid4().hex` 是 32 位无连字符的十六进制。
+- `await self._task_run_repo.create(...)` 在 `scheduled_task_runs` 表插一行，状态 `queued`。**注意时机**：这一行在"真正启动 run 之前"就插了，所以 `count_active_runs` 会立刻把它算进去——即使 run 启动失败，这行记录也在，能追溯到"这次认领过但没启动成功"。
+- `if skip_error is not None: return await self._finalize_skip(...)` 如果是重叠跳过，走 `_finalize_skip` 把这行更新成 `skipped` 并算下一次 `next_run_at`，然后返回。
+
+> **为什么"先查重叠、再插 task_run 行"这个顺序很关键？** 注释（`service.py:91-96`）特意说明：必须在**插自己这行之前**查 `has_active_runs`，否则这行 `queued` 会把自己算成"活跃 run"，导致永远查到有活跃 run、永远跳过。这是经典的"自指陷阱"。
+
+##### 阶段 3：桥接进入 agent runtime（关键转折）
+
+这是整条链路最关键的一段：调度器怎么从一个"数据库里的任务定义"变成一个"真正在跑的 agent run"。入口是 `dispatch_task` 里的这一行（`service.py:120-130`）：
+
+```python
+result = await self._launch_run(
+    thread_id=execution_thread_id,
+    assistant_id=task.get("assistant_id"),
+    prompt=task["prompt"],
+    owner_user_id=task.get("user_id"),
+    metadata={
+        "scheduled_task_id": task["id"],
+        "scheduled_task_run_id": task_run_id,
+        "scheduled_trigger": trigger,
+    },
+)
+```
+
+逐行：
+
+- `result = await self._launch_run(...)` `self._launch_run` 是构造函数里注入的回调（`service.py:24, 31`）。调度器**不知道**它具体是什么——它只规定了一个接口："给我 thread_id、assistant_id、prompt，你给我启动一个 run，返回 `{"run_id": ..., "thread_id": ...}`"。这种依赖注入让调度器逻辑和具体的 run 启动实现解耦，测试时可以塞个假函数。
+- `thread_id=execution_thread_id` 传阶段 2 决定好的 thread。
+- `assistant_id=task.get("assistant_id")` 用任务配置的 assistant（决定用哪个 agent、哪些工具）。可能为 None，走默认。
+- `prompt=task["prompt"]` 把任务的 prompt 当作用户输入。
+- `owner_user_id=task.get("user_id")` **多租户的关键**。定时任务是某个用户创建的，run 必须归属到这个用户，否则后续的权限检查、工具访问、记忆隔离全会错乱。
+- `metadata={...}` **这是反向回写的钥匙**。把 `scheduled_task_id` 和 `scheduled_task_run_id` 塞进 run 的 metadata，run 跑完时 `handle_run_completion` 能从 `record.metadata` 把它们读出来，反向定位到是哪个定时任务的哪一次执行。没有这两个字段，run 跑完了调度器也无从得知。
+
+那 `_launch_run` 具体是什么？看 Gateway 启动时的接线（`backend/app/gateway/app.py:261-267`）：
+
+```python
+scheduled_task_service = ScheduledTaskService(
+    task_repo=app.state.scheduled_task_repo,
+    task_run_repo=app.state.scheduled_task_run_repo,
+    launch_run=lambda **kwargs: launch_scheduled_thread_run(app=app, **kwargs),
+    poll_interval_seconds=startup_config.scheduler.poll_interval_seconds,
+    lease_seconds=startup_config.scheduler.lease_seconds,
+    max_concurrent_runs=startup_config.scheduler.max_concurrent_runs,
+)
+```
+
+逐行：
+
+- `scheduled_task_service = ScheduledTaskService(...)` 在 Gateway 应用启动时构造调度器服务。
+- `task_repo=app.state.scheduled_task_repo` / `task_run_repo=...` 注入两个仓储（操作 `scheduled_tasks` 和 `scheduled_task_runs` 表）。
+- `launch_run=lambda **kwargs: launch_scheduled_thread_run(app=app, **kwargs)` **关键接线**：把 `launch_scheduled_thread_run` 这个函数包成 lambda 塞进去。lambda 在这里的作用是**柯里化/绑定**——把 `app` 参数预先绑死，剩下的 `thread_id`/`prompt` 等由调度器在调用时传。这样调度器调 `self._launch_run(thread_id=..., prompt=...)` 时，实际执行的是 `launch_scheduled_thread_run(app=app, thread_id=..., prompt=...)`。
+- `poll_interval_seconds=...` / `lease_seconds=...` / `max_concurrent_runs=...` 三个调度参数，都来自 `config.yaml -> scheduler` 配置。
+
+##### 阶段 4：伪装成 HTTP 请求，复用 run 启动管道
+
+这是最巧妙的设计。`launch_scheduled_thread_run`（`backend/app/gateway/services.py:773-825`）没有重新实现一套"调度专用的 run 启动逻辑"，而是**把定时任务伪装成一个 HTTP 请求**，塞进正常的 `start_run` 路径：
+
+```python
+async def launch_scheduled_thread_run(
+    *,
+    thread_id: str,
+    assistant_id: str | None,
+    prompt: str,
+    request: Request | None = None,
+    app: Any | None = None,
+    owner_user_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if request is None:
+        if app is None:
+            raise ValueError("launch_scheduled_thread_run requires request or app")
+        request = SimpleNamespace(
+            app=app,
+            headers=({INTERNAL_OWNER_USER_ID_HEADER_NAME: owner_user_id} if owner_user_id else {}),
+            state=SimpleNamespace(
+                user=get_internal_user(),
+                auth_source=AUTH_SOURCE_INTERNAL,
+            ),
+            cookies={},
+        )
+    body = SimpleNamespace(
+        assistant_id=assistant_id,
+        input={"messages": [{"role": "user", "content": prompt}]},
+        command=None,
+        metadata=metadata or {},
+        config=None,
+        context=({"non_interactive": True, "user_id": owner_user_id} if owner_user_id else {"non_interactive": True}),
+        webhook=None,
+        checkpoint_id=None,
+        checkpoint=None,
+        interrupt_before=None,
+        interrupt_after=None,
+        stream_mode=None,
+        stream_subgraphs=False,
+        stream_resumable=None,
+        on_disconnect="continue",
+        on_completion="keep",
+        multitask_strategy="reject",
+        after_seconds=None,
+        if_not_exists="reject",
+        feedback_keys=None,
+    )
+    record = await start_run(body, thread_id, request)
+    return {"run_id": record.run_id, "thread_id": record.thread_id}
+```
+
+逐行讲关键的几段：
+
+**构造伪 Request**（`services.py:783-794`）：
+
+- `if request is None:` 调度器路径不会传 `request`（它没有 HTTP 请求），只传 `app`。所以走这个分支。
+- `request = SimpleNamespace(...)` **`SimpleNamespace` 是个万能的"假对象"**——它把任意属性挂在一个对象上。这里用它来伪造一个"长得像 FastAPI Request"的对象，骗过下游代码里所有 `request.app` / `request.headers` / `request.state` 的访问。
+- `app=app` 把 Gateway 应用实例挂上，下游能拿到 `app.state` 里的各种仓储、bridge、配置。
+- `headers={INTERNAL_OWNER_USER_ID_HEADER_NAME: owner_user_id}` **伪造内部鉴权头**。这个 header 是 Gateway 内部用来传递"谁拥有这次 run"的（见 `deps.py` 的鉴权链路）。定时任务没有外部 token，但必须标明归属用户，所以直接塞这个内部头。
+- `state=SimpleNamespace(user=get_internal_user(), auth_source=AUTH_SOURCE_INTERNAL)` 伪造请求状态。`get_internal_user()` 返回一个代表"系统内部"的特殊用户；`AUTH_SOURCE_INTERNAL` 标记认证来源是内部的（不是 OAuth/SSO）。下游所有依赖 `request.state.user` 的代码（权限检查、日志、审计）都能正常工作。
+- `cookies={}` 空字典占位。
+
+注释（`services.py:795-797`）特意说明：这个 `SimpleNamespace` 模拟的是 Pydantic run-request body。如果 `start_run` 新增了对 `body.*` 某个字段的直接读取，这里得同步加上，否则调度器路径会坏。
+
+**构造伪 body**（`services.py:798-823`）：
+
+这是另一个 `SimpleNamespace`，模拟 HTTP 路径里 Pydantic 解析出来的请求体。每一行都值得说一下：
+
+- `assistant_id=assistant_id` 用任务配置的 assistant。
+- `input={"messages": [{"role": "user", "content": prompt}]}` **这是把 prompt 包装成标准消息格式**。agent runtime 期望的输入是 `{"messages": [...]}`，和浏览器发消息的格式完全一样。定时任务的 `prompt` 字符串被包成一条 `user` 角色的消息——对 agent 来说，和用户在聊天框打字没有任何区别。
+- `command=None` 没有特殊命令（比如 `/reset` 之类）。
+- `metadata=metadata or {}` 把阶段 3 传进来的 `scheduled_task_id` / `scheduled_task_run_id` 原样透传——这就是反向回写的钥匙。
+- `config=None` 没有 LangGraph 运行时配置覆盖。
+- `context={"non_interactive": True, "user_id": owner_user_id}` **这一行是最关键的差异点**，下面专门讲。
+- `webhook=None` 没有 webhook 回调。
+- `checkpoint_id=None` / `checkpoint=None` 不从历史 checkpoint 恢复，从头开始。
+- `interrupt_before=None` / `interrupt_after=None` 没有人机协作的打断点。
+- `stream_mode=None` / `stream_subgraphs=False` / `stream_resumable=None` 流式相关，定时任务不关心（它根本不订阅流）。
+- `on_disconnect="continue"` **关键**：断线策略设为"继续跑"。定时任务没有客户端连接，所以"断线"对它没有意义——但 run 启动时会读这个字段决定行为，设成 `continue` 保证 run 不会因为"没人订阅"就被取消。对比聊天场景的默认值，这里是特意配的。
+- `on_completion="keep"` run 结束后保留记录（不自动删除），方便事后查历史。
+- `multitask_strategy="reject"` 同一 thread 已有 run 时拒绝（返回 409）。这和阶段 2 的重叠检查是两层防护。
+- `after_seconds=None` 没有超时限制（定时任务可能跑很久）。
+- `if_not_exists="reject"` thread 不存在时拒绝（而不是自动创建）——因为这里已经传了明确的 `thread_id`。
+- `feedback_keys=None` 没有反馈路由配置。
+
+**`non_interactive: True` 是什么意思**（对应 `services.py:808` 和 AGENTS.md 的说明）：
+
+定时任务执行时，agent 的工具集会**排除 `ask_clarification`**——也就是 agent 不能反过来问用户问题。因为定时任务没有客户端在线回答，如果 agent 卡在"请问您是要 A 还是 B？"这种澄清问题上，run 会永远卡死。所以调度路径在 `context` 里塞 `non_interactive: True`，agent 框架读到这个标记后会从 lead-agent 的工具集里拿掉 `ask_clarification`。
+
+但这里有个**安全要点**（AGENTS.md 明确强调）：客户端**伪造**的 `context.non_interactive` 会被丢弃——只有内部认证来源（`AUTH_SOURCE_INTERNAL`）的调用才允许设这个标记。这就是为什么上面伪 Request 里要特意把 `auth_source` 设成 `AUTH_SOURCE_INTERNAL`：它是 `non_interactive` 生效的前提。调度器是内部可信调用方，所以可以设；外部用户就算在请求里塞了 `non_interactive: True` 也会被框架忽略。
+
+**进入 `start_run`**（`services.py:824-825`）：
+
+- `record = await start_run(body, thread_id, request)` **这是统一入口**。`start_run`（`services.py:608`）是所有 run 的启动函数——无论来自浏览器 HTTP、IM 通道 HTTP、还是调度器内部调用，最终都汇聚到这里。它做的事：创建 `RunRecord`、在后台 `asyncio.create_task` 启动 agent worker（LangGraph 执行图）、返回 record。
+- `return {"run_id": record.run_id, "thread_id": record.thread_id}` 把 run_id 和 thread_id 返给调度器。调度器拿到后会写进 `scheduled_task_runs` 表的对应行（阶段 5）。
+
+> **为什么要伪装成 HTTP 请求而不是直接调 agent？** 因为 HTTP 路径上有大量横切逻辑：鉴权、context 注入、权限检查、审计、run 状态机管理。重新实现一套调度专用的就会和 HTTP 路径分叉，维护成本翻倍。用 `SimpleNamespace` 伪装请求，**复用全部 HTTP 路径代码**，保证行为一致性——定时任务和用户在聊天框发消息走的是完全相同的 agent 执行管道。
+
+##### 阶段 5：启动后回写 + 终态回调
+
+`dispatch_task` 启动 run 之后，还有两段回写（`service.py:131-175` 和 `service.py:252-301`）：
+
+**启动成功后的即时回写**（`service.py:147-168`）：
+
+```python
+await self._task_run_repo.update_status(
+    task_run_id,
+    status="running",
+    run_id=result["run_id"],
+    started_at=now,
+    protect_terminal=True,
+)
+await self._task_repo.update_after_launch(
+    task["id"],
+    status=task_status,
+    next_run_at=next_at,
+    last_run_at=now,
+    last_run_id=result["run_id"],
+    last_thread_id=result["thread_id"],
+    last_error=None,
+    increment_run_count=True,
+    protect_terminal=True,
+)
+```
+
+逐行：
+
+- `update_status(task_run_id, status="running", run_id=..., started_at=now, protect_terminal=True)` 把阶段 2 插的 `queued` 行更新成 `running`，记下真正的 `run_id` 和开始时间。
+- `protect_terminal=True` **这个参数非常关键**。注释（`service.py:152-154`）解释：一个快速失败的 run 可能在 `update_status` 这行代码**还没执行**的时候，就已经跑完并触发了 `handle_run_completion`（见下面），把状态写成了 `failed`。如果这行不带 `protect_terminal`，就会把 `failed` **覆盖**回 `running`——状态永久错乱。仓储层（`scheduled_task_runs/sql.py:90-99`）看到 `protect_terminal=True` 且当前状态是终态（`success`/`failed`/`skipped`/`interrupted`），就**只补全 bookkeeping 字段**（run_id、started_at），不覆盖 status 和 error。
+- `update_after_launch(...)` 更新 `scheduled_tasks` 表（任务定义表）的"最近一次执行"摘要：`last_run_at`、`last_run_id`、`last_thread_id`、`next_run_at`（下一次到期时间）、`run_count += 1`。这就是"任务列表"页面上显示的那些字段。
+- `task_status` 的取值（`service.py:137-146`）有讲究：
+  - `once` 类型任务：启动后设成 `"running"`，**不立刻设成 completed**。注释（`service.py:137-142`）说明：要等到 `handle_run_completion` 看到真正的终态才落定。如果启动时就写 completed，万一 run 失败或进程崩了，任务会永远卡在 completed。
+  - 周期任务：设成 `"enabled"`（继续按计划跑）。
+  - 手动触发的暂停任务：设回 `"paused"`（手动跑一次不影响暂停状态）。
+
+**run 结束时的终态回调**（`handle_run_completion`，`service.py:252-301`）：
+
+这就是 3.4 开头提到的"完成回调钩子"。当 agent worker 的 `finally` 块（`worker.py:710-712`）调用 `ctx.on_run_completed(record)` 时，这个钩子被触发（接线在 `deps.py:423`）：
+
+```python
+async def handle_run_completion(self, record: RunRecord) -> None:
+    metadata = record.metadata or {}
+    task_id = metadata.get("scheduled_task_id")
+    task_run_id = metadata.get("scheduled_task_run_id")
+    user_id = record.user_id
+    if not isinstance(task_id, str) or not isinstance(task_run_id, str) or not user_id:
+        return
+    ...
+```
+
+逐行：
+
+- `metadata = record.metadata or {}` 取 run 的 metadata。这就是阶段 3 `dispatch_task` 塞进去的那个字典（`scheduled_task_id` / `scheduled_task_run_id`）。
+- `task_id = metadata.get("scheduled_task_id")` / `task_run_id = metadata.get("scheduled_task_run_id")` 把钥匙读出来。
+- `user_id = record.user_id` run 的归属用户。
+- `if not isinstance(task_id, str) or ... or not user_id: return` **过滤非定时任务的 run**。如果这个 run 不是定时任务触发的（比如是用户在聊天框发的消息），metadata 里就没有这两个字段，直接 return——钩子是全局接的，但只对定时任务的 run 起作用。
+
+之后（`service.py:260-301`）根据 `record.status` 把 run 的终态映射成 task_run 的终态：
+
+- `record.status.value == "success"` → task_run 状态 `success`
+- `record.status.value == "interrupted"` → task_run 状态 `interrupted`（用户取消或同 thread 被新 run 抢占，**区别于 failed**，不带 error）
+- `record.status.value in {"error", "timeout"}` → task_run 状态 `failed`，记 error
+
+然后更新 `scheduled_task_runs` 行（`service.py:278-284`）和 `scheduled_tasks` 行（`service.py:286-301`）。对于 `once` 类型任务，终态会落到 `completed` / `cancelled` / `failed`——一次性任务的"一生"在这里结束。
+
+##### 整条链路的全景图
+
+把 5 个阶段拼起来：
+
+```
+[后台轮询 _run_loop]                         ← 阶段 1：每 N 秒一次
+    ↓
+[run_once: 算预算 + claim_due_tasks]        ← 阶段 1：原子认领到期任务（租约）
+    ↓
+[dispatch_task: 决定 thread / 查重叠]        ← 阶段 2：派发准备
+    ↓
+[插 scheduled_task_runs 行 (queued)]         ← 阶段 2：记账
+    ↓
+[_launch_run → launch_scheduled_thread_run]  ← 阶段 3：桥接（依赖注入）
+    ↓
+[构造伪 Request + 伪 body (non_interactive)] ← 阶段 4：伪装 HTTP 请求
+    ↓
+[start_run → RunRecord + asyncio.create_task]← 阶段 4：进入统一 run 启动入口
+    ↓
+[agent worker 跑 LangGraph 图]               ← 和聊天消息走完全相同的执行路径
+    ↓ (run 结束)
+[worker finally: on_run_completed(record)]   ← 阶段 5：触发回调钩子
+    ↓
+[handle_run_completion: 读 metadata 回写]    ← 阶段 5：终态落库
+```
+
+**三个核心设计点回顾**：
+
+1. **依赖注入解耦**：调度器只定义 `_launch_run` 接口，具体实现在 Gateway 启动时注入。这让调度器逻辑可独立测试（塞假函数），也让它不绑死在 Gateway 上。
+2. **伪装复用**：用 `SimpleNamespace` 伪造 HTTP 请求，复用 `start_run` 全部代码（鉴权、context、状态机）。定时任务和聊天消息走同一条 agent 执行管道，保证行为一致。
+3. **metadata 双向绑定**：启动时塞 `scheduled_task_id` / `scheduled_task_run_id` 进 run metadata，结束时 `handle_run_completion` 读出来反向回写。这是"调度账本"和"agent run"之间唯一的粘合点——**调度器全程不碰 bridge**（呼应 3.4 的结论）。
+
+> ⚠️ 注意：定时任务的 agent 输出（消息、工具调用、流式 token）**不存在 `scheduled_task_runs` 表里**。那张表只存调度元数据（状态、时间、错误、run_id 外键）。真正的 agent 输出走的是 DeerFlow 正常的 run/thread 持久化（thread store），靠 `scheduled_task_runs.run_id` 和 `.thread_id` 关联——要看某次执行的对话内容，拿这两个 id 去 thread store 取消息。
+
 #### 3.5 朴素写法为什么做不到
 
 朴素 generator 是 **1:1 管道**：一个生产者（`agent.astream()`）配一个消费者（HTTP 响应）。第二个消费者来 join 时：
