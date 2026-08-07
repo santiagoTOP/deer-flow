@@ -52,6 +52,23 @@ record = {
 
 ### 0.2 StreamBridge vs RunEventStore——"活流"和"死档"的分界线
 
+```text
+一次 run 的生命周期:
+  ├─ 产生一串 event(tool.call / 模型回复 / tool.result / run.end ...)
+  │
+  ├─ StreamBridge 推给前端(实时):
+  │     - tool.call 等离散事件 → 整条推
+  │     - 模型回复 → 按 token 拆成多段推(字一个一个蹦)
+  │
+  └─ RunEventStore 存历史(查询用):
+        - 离散事件 → 一条
+        - 模型回复 → ★ 拼回整条,只存一条
+        - 按 category 分类(message/trace/lifecycle)
+        - 按 thread 内 seq 单调排序
+```
+
+
+
 ※ 这个小节是本篇最重要的一节，必须和姊妹篇 `stream-bridge-deep-dive.md` 对照着读。
 
 同一批 event，DeerFlow 用**两个完全独立的机制**来服务两种访问模式：
@@ -91,6 +108,25 @@ event 上面有个 `category` 字段，把所有事件分成两大类（数据�
 打个比方：这就像订单记录单上，给客人看的"菜品进度"和给厨师长看的"操作细节"**用不同颜色的笔写**——翻"客人看的"那页只看菜品进度（message），翻"操作细节"那页能看到全部（all events）。同一张单子，两种翻法。
 
 ### 0.4 seq——这个 thread 内的全局单调序号
+
+```text
+thread_id = T1（这一整段对话）
+┌─────────────────────────────────────────────────────┐
+│ run_id=R1（第 1 轮："帮我排序"）                      │
+│   事件: human_message     seq=1                       │
+│   事件: tool.call         seq=2                       │
+│   事件: llm.ai.response   seq=3  (agent 的回复)       │
+├─────────────────────────────────────────────────────┤
+│ run_id=R2（第 2 轮："改成降序"）                      │
+│   事件: human_message     seq=4   ← ★ 接着数,不是 1  │
+│   事件: llm.ai.response   seq=5                       │
+├─────────────────────────────────────────────────────┤
+│ run_id=R3（第 3 轮："加个测试"）                      │
+│   事件: human_message     seq=6                       │
+│   事件: tool.call         seq=7                       │
+│   事件: llm.ai.response   seq=8                       │
+└─────────────────────────────────────────────────────┘
+```
 
 这是本篇**最核心**的一个概念。每条 event 都带一个 `seq`（sequence number），它是个整数。关键约定（接口契约第 2 条，`base.py:24`）：
 
@@ -223,6 +259,34 @@ async def list_messages(thread_id: str):
 - 想做分页（"看更早的消息"）→ 没有 seq 这种全局单调的游标，没法分。
 - 多用户 → 没法按 user_id 隔离，A 能看到 B 的消息。
 - 进程重启 → 历史全丢。
+
+```text
+┌──────────────────────────────────────┐
+│  [我]  帮我写个排序算法                │ ← 更早的消息(第 2 页)
+│  [AI]  def sort(arr): ...             │
+│  [我]  改成降序                        │
+│  [AI]  def sort_desc(arr): ...        │
+├──────────────────────────────────────┤
+│  ↑↑↑ 加载更多更早的消息 ↑↑↑           │ ← 分页边界(用户往上滚)
+├──────────────────────────────────────┤
+│  [我]  加个测试                        │ ← 最新的消息(第 1 页,默认显示)
+│  [AI]  def test_sort(): ...           │
+└──────────────────────────────────────┘
+```
+
+```python
+@router.get("/{thread_id}/messages")
+async def list_thread_messages(
+    thread_id, request,
+    limit=50,              # 每页多少条
+    before_seq=None,       # ★ 游标:"比这个 seq 早的消息"
+    after_seq=None,        # 反向游标:"比这个 seq 晚的"
+):
+    event_store = get_run_event_store(request)
+    rows = await event_store.list_messages(
+        thread_id, limit=limit, before_seq=before_seq, after_seq=after_seq)
+    return rows
+```
 
 下面 6 个麻烦，全都是从"event 没有一个像样的历史存储"这一个病根派生的。`get_run_event_store(request)` + `RunEventStore` 抽象 + 三个后端 + 启动时建一次，就是来拔这个病根的。
 
@@ -502,6 +566,33 @@ class DbRunEventStore(RunEventStore):
 为什么需要进程内这层锁？注释继续解释："this guards the common single-process case where two coroutines interleave between the max(seq) read and the INSERT and would otherwise collide on seq." —— 同一个进程里两个协程，一个读完 max(seq)=10 让出 CPU，另一个进来也读到 max(seq)=10，两个都算出 seq=11。**单进程多协程的交错，是 asyncio.Lock 的主场。**
 
 #### 跨进程那层——为什么用 advisory lock 而不是 FOR UPDATE
+
+```text
+
+memory 的 _next_seq:
+  读 ──→ 算 ──→ 写          (三步之间没有任何 await)
+  ↑━━━━━━━━━━━━━━━━━━━━↑
+  这整段不可抢占,别的协程插不进来 → 侥幸安全
+
+db 的读 max(seq):
+  await 发SQL ──→ [等数据库响应,让出CPU] ──→ 拿到结果 ──→ 算 ──→ 写
+                  ↑
+              ★ 这里协程被挂起,别的协程被调度进来!
+
+协程 A: max_seq = await ... → 发了 SQL,【让出 CPU,等数据库】
+                                                            ↓
+协程 B: 被调度进来,max_seq = await ... → 也发了 SQL,【也拿到 max=10】
+        seq = 10 + 1 = 11,写入 seq=11
+协程 A: 【数据库响应回来】拿到 max=10(它发 SQL 时 B 还没写)
+        seq = 10 + 1 = 11,写入 seq=11   ← 撞号!
+
+
+协程 A: 拿 asyncio.Lock → await 读 max → 算 → 写 → 释放锁
+协程 B: 拿 asyncio.Lock(阻塞,A 持着)
+          ↑ B 在这里 await 等,根本进不到"读 max"那步
+协程 B: (A 释放后)拿到锁 → 读 max(此时已经是 A 写过的新值)→ 算 → 写
+→ seq 正确递增,不撞号
+```
 
 进程内锁堵不住跨进程——W1 和 W2 是两个进程，各自的 asyncio.Lock 互不可见。跨进程得靠**数据库**这个共享裁判。看 `_max_seq_for_thread`（`db.py:107-127`）：
 
@@ -881,6 +972,22 @@ def get_run_context(request: Request) -> RunContext:
 
 这个"哪些字段 live、哪些字段冻结"的边界，在 `reload_boundary.py:48` 有正式记录：
 
+```text
+                     config.yaml 编辑
+                          │
+              ┌───────────┴───────────┐
+              ▼                       ▼
+      热重载字段(每次请求读)      启动冻结字段(登记在 reload_boundary.py)
+              │                       │
+   - model 配置              - database(连接池)
+   - system_prompt           - checkpointer
+   - tools 开关              - run_events ← 第48行
+   - agent 行为参数          - sandbox(单例)
+                            - log_level
+                            - channels(IM 客户端)
+                            ...
+```
+
 > *`run_events`: `make_run_event_store()` picks the memory- vs SQL-backed implementation at startup and is frozen onto `app.state.run_events_config` to stay paired with the underlying event store.*
 
 翻译：`run_events` 字段——`make_run_event_store()` 在启动时选定 memory 或 SQL 后端实现，并冻结到 `app.state.run_events_config` 上，以保持和底层 event store 配对。属于"改了要重启"的字段。
@@ -999,6 +1106,28 @@ get_run_event_store: Callable[[Request], RunEventStore] = _require("run_event_st
 四个紧挨着写在 `deps.py:364-367`，是因为它们是同一类东西：**"启动时建一次、放进 `app.state`、每个请求取一次、取不到就 503"的进程级运行时单例**。理解了其中一个，另几个就是同一套机制的换皮——但每一个都解决了一类独特的、不可替代的生命周期问题。
 
 特别要记住 `get_stream_bridge` 和 `get_run_event_store` 这一对的区分（最容易搞混）：
+
+```text
+                    agent.astream(...)
+                          │
+            ┌─────────────┴────────────────┐
+            │ (LangGraph 执行图,内部触发)  │
+            │                              │
+   ┌────────▼─────────┐         ┌──────────▼───────────┐
+   │ 流式 chunk 输出   │         │ LangChain callbacks  │
+   │ (stream_mode)    │         │ (on_llm_end 等)      │
+   └────────┬─────────┘         └──────────┬───────────┘
+            │                              │
+            ▼                              ▼
+   bridge.publish(run_id,            RunJournal._put(...)
+     sse_event, serialize(chunk))      → 攒进 _buffer
+            │                              │
+            ▼                              ▼
+   StreamBridge 内存通道            event_store.put_batch(...)
+            │                       (memory / db / jsonl)
+            ▼                              ▼
+   前端 SSE 实时订阅                 持久化(历史/审计/统计)
+```
 
 - **两者存的是同一批 event 的两份副本**——写入时 RunJournal 同时往两边送。
 - **StreamBridge 服务"实时访问"**——事件还在跑时怎么被多方订阅（push，活流，不持久）。
