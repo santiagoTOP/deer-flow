@@ -1,0 +1,1199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DeerFlow 后端运行时架构 · 九篇源码深潜的深度融合解读</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface-2: #1c2129;
+    --border: #30363d;
+    --border-soft: #262c36;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --dim: #6e7681;
+
+    --c-orchestration: #f0883e;
+    --c-execution: #bc8cff;
+    --c-stream: #58a6ff;
+    --c-state: #3fb950;
+    --c-checkpoint: #d29922;
+    --c-history: #39c5cf;
+    --c-assembly: #f778ba;
+    --c-optional: #a5a9b4;
+    --c-bad: #f85149;
+    --c-good: #3fb950;
+
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    line-height: 1.75; font-size: 16px;
+  }
+
+  #progress { position: fixed; top: 0; left: 0; height: 3px; width: 0;
+    background: linear-gradient(90deg, var(--c-stream), var(--c-execution), var(--c-orchestration));
+    z-index: 100; transition: width .1s linear; }
+
+  nav {
+    position: sticky; top: 0; z-index: 90;
+    background: rgba(13,17,23,.85); backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border); padding: 0 24px;
+    display: flex; align-items: center; gap: 2px; overflow-x: auto; white-space: nowrap;
+  }
+  nav .brand { font-weight: 700; letter-spacing: .5px; margin-right: 16px; color: #fff; font-size: 14px; }
+  nav .brand span { color: var(--muted); font-weight: 400; }
+  nav a { color: var(--muted); text-decoration: none; font-size: 13px; padding: 12px 9px; border-bottom: 2px solid transparent; }
+  nav a:hover { color: var(--text); }
+
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 28px 140px; }
+
+  header.hero { padding: 70px 0 36px; }
+  .kicker { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; letter-spacing: 1.5px;
+    text-transform: uppercase; color: var(--c-stream); border: 1px solid var(--border);
+    padding: 5px 12px; border-radius: 999px; margin-bottom: 24px; }
+  .kicker::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--c-stream); }
+  h1 { font-size: clamp(30px, 5vw, 46px); line-height: 1.18; margin: 0 0 18px; font-weight: 800; letter-spacing: -1px; color: #fff; }
+  h1 .grad { background: linear-gradient(90deg, var(--c-stream), var(--c-execution), var(--c-orchestration));
+    -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .lede { font-size: 18px; color: var(--muted); max-width: 840px; margin: 0 0 26px; }
+  .proposition { background: linear-gradient(180deg, var(--surface-2), var(--surface));
+    border: 1px solid var(--border); border-left: 3px solid var(--c-execution); border-radius: 10px;
+    padding: 20px 24px; font-size: 16.5px; }
+  .proposition strong { color: #fff; }
+
+  section { margin-top: 72px; }
+  h2 { font-size: 27px; font-weight: 800; letter-spacing: -.5px; color: #fff; margin: 0 0 8px;
+    display: flex; align-items: center; gap: 12px; }
+  h2 .no { font-family: var(--mono); font-size: 15px; font-weight: 700; color: var(--bg);
+    background: var(--c-stream); border-radius: 7px; padding: 3px 9px; line-height: 1.3; }
+  .sub { color: var(--muted); margin: 0 0 24px; font-size: 15px; }
+  h3 { font-size: 20px; color: #fff; margin: 34px 0 10px; font-weight: 700; padding-bottom: 6px; border-bottom: 1px solid var(--border-soft); }
+  h4 { font-size: 15.5px; color: var(--text); margin: 22px 0 8px; font-weight: 650; }
+
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0; padding-left: 24px; }
+  li { margin: 6px 0; }
+  li::marker { color: var(--dim); }
+  strong { color: #fff; font-weight: 650; }
+  code { font-family: var(--mono); font-size: .87em; background: var(--surface-2);
+    border: 1px solid var(--border-soft); padding: 1.5px 6px; border-radius: 5px; color: var(--c-stream); }
+  .path { color: var(--c-checkpoint); }
+
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px 22px; margin: 16px 0; }
+
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; font-size: 14px; }
+  th, td { text-align: left; padding: 10px 12px; border: 1px solid var(--border); vertical-align: top; }
+  th { background: var(--surface-2); color: #fff; font-weight: 650; white-space: nowrap; }
+  tr:nth-child(even) td { background: rgba(255,255,255,.015); }
+
+  pre { background: #0a0d12; border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px;
+    overflow-x: auto; font-family: var(--mono); font-size: 13px; line-height: 1.65; margin: 14px 0; color: #c9d1d9; }
+  pre code { background: none; border: none; padding: 0; color: inherit; font-size: inherit; }
+  .cm { color: #6e7681; }
+
+  .trouble { border: 1px solid var(--border); border-radius: 11px; margin: 14px 0; background: var(--surface); overflow: hidden; }
+  .trouble-head { display: flex; align-items: center; gap: 10px; padding: 11px 16px; font-weight: 700; font-size: 14.5px; color: #fff;
+    border-bottom: 1px solid var(--border-soft); background: rgba(255,255,255,.02); flex-wrap: wrap; }
+  .trouble-head .tno { font-family: var(--mono); font-size: 11.5px; font-weight: 700; color: var(--bg); padding: 2px 8px; border-radius: 5px; line-height: 1.4; flex-shrink: 0; }
+  .trouble-body { padding: 13px 16px; font-size: 14px; }
+  .trouble-body .t-scene { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+  .trouble-body .t-scene b { color: var(--text); }
+  .pill { display: inline-block; font-size: 11px; font-weight: 700; padding: 1px 8px; border-radius: 999px; margin-left: 6px; vertical-align: 1px; }
+  .pill.bad { background: rgba(248,81,73,.15); color: var(--c-bad); }
+  .pill.good { background: rgba(63,185,80,.15); color: var(--c-good); }
+
+  .concept-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; margin: 16px 0; }
+  .concept { border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; background: var(--surface); }
+  .concept .c-name { font-family: var(--mono); font-weight: 700; color: #fff; font-size: 14px; margin-bottom: 4px; }
+  .concept .c-desc { font-size: 13px; color: var(--muted); }
+
+  .code-compare { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 14px 0; }
+  @media (max-width: 800px) { .code-compare { grid-template-columns: 1fr; } }
+  .code-pane { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .code-pane .pane-title { font-size: 12px; font-weight: 700; padding: 7px 14px; letter-spacing: .5px; }
+  .code-pane.bad .pane-title { background: rgba(248,81,73,.12); color: var(--c-bad); }
+  .code-pane.good .pane-title { background: rgba(63,185,80,.12); color: var(--c-good); }
+  .code-pane pre { margin: 0; border: none; border-radius: 0; border-top: 1px solid var(--border-soft); }
+
+  .layer { border: 1px solid var(--border); border-radius: 12px; margin: 12px 0; overflow: hidden; }
+  .layer-head { padding: 10px 16px; font-weight: 700; font-size: 14px; color: #fff; display: flex; align-items: center; gap: 10px; }
+  .layer-head .tag { font-family: var(--mono); font-size: 11px; font-weight: 500; opacity: .85; }
+  .layer-body { display: flex; flex-wrap: wrap; gap: 10px; padding: 14px 16px; background: rgba(255,255,255,.01); }
+  .node { flex: 1 1 180px; border: 1px solid var(--border); border-radius: 9px; padding: 12px 14px; background: var(--surface); }
+  .node .n-title { font-weight: 700; font-size: 14.5px; margin-bottom: 3px; }
+  .node .n-path { font-family: var(--mono); font-size: 11px; color: var(--dim); margin-bottom: 7px; }
+  .node .n-desc { font-size: 12.5px; color: var(--muted); line-height: 1.5; }
+  .flow-down { text-align: center; color: var(--dim); font-size: 17px; margin: -2px 0; line-height: 1.2; }
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 16px 0 4px; font-size: 12.5px; color: var(--muted); }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+
+  .step { display: flex; gap: 16px; padding: 0 0 22px 0; }
+  .step:last-child { padding-bottom: 0; }
+  .step .rail { display: flex; flex-direction: column; align-items: center; width: 34px; flex-shrink: 0; }
+  .step .dot { width: 15px; height: 15px; border-radius: 50%; flex-shrink: 0; border: 3px solid var(--bg); box-shadow: 0 0 0 2px var(--border); margin-top: 4px; }
+  .step .line { flex: 1; width: 2px; background: var(--border); margin: 2px 0; }
+  .step:last-child .line { display: none; }
+  .step .body { flex: 1; padding-bottom: 4px; }
+  .step .t-title { font-weight: 700; color: #fff; font-size: 15px; }
+  .step .t-actor { font-size: 12px; color: var(--dim); font-family: var(--mono); margin-left: 8px; }
+  .step .t-desc { font-size: 13.5px; color: var(--muted); margin-top: 3px; }
+
+  .principle { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 22px 24px; margin: 16px 0; }
+  .principle .p-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 10px; }
+  .principle .p-num { font-family: var(--mono); font-size: 13px; font-weight: 700; color: var(--bg); padding: 2px 9px; border-radius: 6px; line-height: 1.4; flex-shrink: 0; }
+  .principle .p-title { font-size: 18px; font-weight: 750; color: #fff; }
+  .principle .p-what { color: var(--muted); margin-bottom: 8px; font-size: 14.5px; }
+  .principle .p-how { font-size: 14px; }
+
+  #top { position: fixed; right: 22px; bottom: 22px; width: 42px; height: 42px; border-radius: 50%;
+    border: 1px solid var(--border); background: var(--surface); color: var(--text); font-size: 18px;
+    cursor: pointer; opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 95; }
+  #top.show { opacity: 1; pointer-events: auto; }
+
+  .callout { border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px; margin: 14px 0; font-size: 14px; background: rgba(88,166,255,.06); }
+  .callout b { color: #fff; }
+  .toc { column-count: 2; column-gap: 32px; font-size: 14px; }
+  @media (max-width: 700px) { .toc { column-count: 1; } .wrap { padding: 0 16px 90px; } nav { padding: 0 12px; } .layer-body { flex-direction: column; } .node { flex: 1 1 auto; } }
+</style>
+</head>
+<body>
+
+<div id="progress"></div>
+
+<nav>
+  <div class="brand">DeerFlow 运行时 <span>· 九篇深潜深度融合</span></div>
+  <a href="#proposition">命题</a>
+  <a href="#toc">目录</a>
+  <a href="#map">全景</a>
+  <a href="#concepts">概念词典</a>
+  <a href="#journey">请求旅程</a>
+  <a href="#layers">九篇详解</a>
+  <a href="#cooperation">如何配合</a>
+  <a href="#principles">设计启示</a>
+  <a href="#appendix">附录</a>
+</nav>
+
+<div class="wrap">
+
+<!-- HERO -->
+<header class="hero">
+  <div class="kicker">Architecture Deep-Dive · 9 Articles · 深度融合</div>
+  <h1>一次 Agent Run 的生命周期，<br>如何从一次 HTTP 请求里<span class="grad">彻底解放出来</span></h1>
+  <p class="lede">
+    这份文档深度融合 <code>backend/docs/BACKEND_AGENT_DESIGN/</code> 下的九篇源码级深潜，
+    把每个组件的「6 个麻烦」、关键机制、代码位置、踩坑点全部展开，再拼回一张完整的协作图——
+    揭示它们<strong>为什么存在、彼此如何咬合</strong>，并提炼出一套可迁移到任何 Agent 系统的设计思路。
+  </p>
+
+  <div class="proposition" id="proposition">
+    <strong>九篇文档回答的是同一个问题：</strong><br>
+    用户在一个 HTTP 请求里按下了「发送」。这个请求几百毫秒内就会返回，而它启动的那个 Agent 却要跑几十秒甚至更久，
+    还要被刷新页面、断线重连、多标签页、另一个 worker 进程、崩溃重启之后的人反复观察与操控。<br><br>
+    核心命题：<strong>「一次 HTTP 请求里启动的 Agent Run，凭什么能活得比这次请求久？」</strong><br>
+    九篇文档，每一篇都从「朴素写法在这里翻车」出发，为这个命题的一个侧面给出了工程答案——
+    而它们合起来，就是一套完整的、可复用的「Agent 服务运行时」设计。
+  </div>
+</header>
+
+<!-- 目录 -->
+<section id="toc">
+  <h2><span class="no">·</span>目录</h2>
+  <div class="toc">
+    <ol>
+      <li>全景地图：九篇如何分层</li>
+      <li>概念词典：贯穿九篇的核心术语</li>
+      <li>一次请求的完整旅程（21 步时序）</li>
+      <li>九篇详解：每篇的 6 个麻烦
+        <ul>
+          <li>4.1 start_run · 安全启动阀门</li>
+          <li>4.2 run_agent · 驱动引擎</li>
+          <li>4.3 StreamBridge · 事件流（活流）</li>
+          <li>4.4 RunManager · 执行+状态</li>
+          <li>4.5 checkpointer · 存档</li>
+          <li>4.6 run-event-store · 事件历史（死档）</li>
+          <li>4.7 lifespan + langgraph-runtime · 装配双闸</li>
+          <li>4.8 feedback-repo · 轻资源对照</li>
+        </ul>
+      </li>
+      <li>它们如何配合：八个交汇点 + 协作矩阵</li>
+      <li>设计启示：十条可迁移原则</li>
+      <li>附录：九篇速查</li>
+    </ol>
+  </div>
+</section>
+
+<!-- 1. 全景地图 -->
+<section id="map">
+  <h2><span class="no">01</span>全景地图：九篇如何分层</h2>
+  <p class="sub">九篇不是九个孤立主题，而是「请求 → 执行 → 收尾」链路上的九个节点，按职责分成五层。</p>
+
+  <div class="layer">
+    <div class="layer-head" style="background: rgba(240,136,62,.12);">
+      <span style="color:var(--c-orchestration);">●</span> 编排层 · 启动一个 Run
+      <span class="tag">「把请求变成 run 的唯一闸门」</span>
+    </div>
+    <div class="layer-body">
+      <div class="node">
+        <div class="n-title" style="color:var(--c-orchestration);">start-run</div>
+        <div class="n-path">services.py:608-770</div>
+        <div class="n-desc">6 件横切关注点：鉴权 · 模型白名单 · 并发控制 · thread 元信息 · config 加固 · task 注册</div>
+      </div>
+    </div>
+  </div>
+  <div class="flow-down">▼ &nbsp; create_task() 派发后台任务</div>
+
+  <div class="layer">
+    <div class="layer-head" style="background: rgba(188,140,255,.12);">
+      <span style="color:var(--c-execution);">●</span> 执行层 · 驱动 Run
+      <span class="tag">「真正驱动 agent graph 的函数」</span>
+    </div>
+    <div class="layer-body">
+      <div class="node">
+        <div class="n-title" style="color:var(--c-execution);">run-agent</div>
+        <div class="n-path">worker.py:246-719</div>
+        <div class="n-desc">驱动 LangGraph、拍快照、goal 续跑、协作式取消、LLM 故障识别、finally 收尾</div>
+      </div>
+    </div>
+  </div>
+  <div class="flow-down">▼ &nbsp; 执行过程中，run_agent 同时依赖三个「生命周期面」</div>
+
+  <div class="layer">
+    <div class="layer-head" style="background: rgba(88,166,255,.08);">
+      <span style="color:var(--c-stream);">●</span> 三大生命周期面（核心三部曲）
+      <span class="tag">「run 凭什么活过请求的三个面」</span>
+    </div>
+    <div class="layer-body">
+      <div class="node">
+        <div class="n-title" style="color:var(--c-stream);">StreamBridge · 事件流</div>
+        <div class="n-path">deps.py:364</div>
+        <div class="n-desc">「活流」：token 被任意数量、任意时刻、跨进程的订阅者消费（断线重连 / fan-out / 心跳 / 背压）</div>
+      </div>
+      <div class="node">
+        <div class="n-title" style="color:var(--c-state);">RunManager · 状态</div>
+        <div class="n-path">deps.py:365</div>
+        <div class="n-desc">「执行 + 状态」：注册表 / 双层存储 / 并发守卫 / lease 心跳 / 孤儿对账 / 有界 drain</div>
+      </div>
+      <div class="node">
+        <div class="n-title" style="color:var(--c-checkpoint);">checkpointer · 存档</div>
+        <div class="n-path">deps.py:366</div>
+        <div class="n-desc">「持久化」：checkpoint 存哪儿、谁来开连接、进程死了存档留不留得住</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="layer">
+    <div class="layer-head" style="background: rgba(57,197,207,.08);">
+      <span style="color:var(--c-history);">●</span> 配套面 · 事件历史
+      <span class="tag">「与活流互补的死档」</span>
+    </div>
+    <div class="layer-body">
+      <div class="node">
+        <div class="n-title" style="color:var(--c-history);">run-event-store</div>
+        <div class="n-path">deps.py:367</div>
+        <div class="n-desc">「死档」：事件的可持久化、按 thread 全局单调排序、可分页、可多租户隔离的历史存储</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="flow-down">▼ &nbsp; 支撑这一切「单例从何而来、如何正确生灭」</div>
+
+  <div class="layer">
+    <div class="layer-head" style="background: rgba(247,120,186,.10);">
+      <span style="color:var(--c-assembly);">●</span> 装配层 · 单例的「建与还」
+      <span class="tag">「所有 getter 的上游」</span>
+    </div>
+    <div class="layer-body">
+      <div class="node">
+        <div class="n-title" style="color:var(--c-assembly);">lifespan</div>
+        <div class="n-path">app.py:170-341</div>
+        <div class="n-desc">外总闸：把「持资源对象」从「import / 进程退出」解耦到「startup 建、shutdown 按 LIFO 有界关」</div>
+      </div>
+      <div class="node">
+        <div class="n-title" style="color:var(--c-assembly);">langgraph-runtime</div>
+        <div class="n-path">deps.py:222-343</div>
+        <div class="n-desc">内总闸：运行时单例的「造 → 挂 app.state → 关机有序回收」，含孤儿对账 + 多 worker 闸</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="layer">
+    <div class="layer-head" style="background: rgba(165,169,180,.08);">
+      <span style="color:var(--c-optional);">●</span> 对照案例 · 可选功能
+      <span class="tag">「轻资源的反面对照」</span>
+    </div>
+    <div class="layer-body">
+      <div class="node">
+        <div class="n-title" style="color:var(--c-optional);">feedback-repo</div>
+        <div class="n-path">deps.py:368</div>
+        <div class="n-desc">唯一不进 AsyncExitStack 的「轻资源」：麻烦全在可选性 / 隔离 / 幂等 / 读侧防 N+1</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span><i style="background:var(--c-orchestration);"></i>编排层</span>
+    <span><i style="background:var(--c-execution);"></i>执行层</span>
+    <span><i style="background:var(--c-stream);"></i>事件流</span>
+    <span><i style="background:var(--c-state);"></i>状态</span>
+    <span><i style="background:var(--c-checkpoint);"></i>存档</span>
+    <span><i style="background:var(--c-history);"></i>事件历史</span>
+    <span><i style="background:var(--c-assembly);"></i>装配</span>
+    <span><i style="background:var(--c-optional);"></i>可选功能</span>
+  </div>
+</section>
+
+<!-- 2. 概念词典 -->
+<section id="concepts">
+  <h2><span class="no">02</span>概念词典：贯穿九篇的核心术语</h2>
+  <p class="sub">这些概念在九篇里反复出现、互相引用，是理解「如何配合」的公共语言。</p>
+
+  <div class="concept-grid">
+    <div class="concept">
+      <div class="c-name">run / thread / checkpoint</div>
+      <div class="c-desc">run = 一次 agent 执行（有 run_id、状态机）；thread = 一段对话（同一时刻最多一条活动 run）；checkpoint = graph 某刻的完整状态快照，agent 每走一步写一份，是 rollback / goal 续跑 / 崩溃恢复的基础。</div>
+    </div>
+    <div class="concept">
+      <div class="c-name">活流 vs 死档</div>
+      <div class="c-desc">StreamBridge（活流）= 订阅/push/不持久，管「现在正在发生什么」；RunEventStore（死档）= 查询/pull/持久，管「曾经发生过什么」。同一批 event 两份副本，由 RunJournal 同时送两边。</div>
+    </div>
+    <div class="concept">
+      <div class="c-name">app.state（进程级工具箱）</div>
+      <div class="c-desc">FastAPI 应用对象上的进程级存储。启动时塞单例，请求时取单例。多 worker 每进程一份，必须连同一外部 DB 才能跨进程看到一致数据。</div>
+    </div>
+    <div class="concept">
+      <div class="c-name">_require 工厂 + 503</div>
+      <div class="c-desc">高阶函数：吃 (属性名, 标签) 产出「取依赖函数」；取到 None 就抛 503「X not available」。错误信号「又早又准」——在取依赖一步就失败，而非深层 NoneType 崩 500。</div>
+    </div>
+    <div class="concept">
+      <div class="c-name">AsyncExitStack + LIFO</div>
+      <div class="c-desc">标准库异步资源回收器：登记的资源退出时按反序（后进先出）关。谁进栈（有连接要关）、谁手动关（engine）、谁不用关（纯数据）要分清楚。</div>
+    </div>
+    <div class="concept">
+      <div class="c-name">import-time vs startup-time</div>
+      <div class="c-desc">import 时无事件循环、config/DB 未就绪；startup（lifespan）时三者都就绪。所有异步构造、副作用必须放 startup，否则「Future attached to a different loop」。</div>
+    </div>
+    <div class="concept">
+      <div class="c-name">lease / heartbeat / grace_seconds</div>
+      <div class="c-desc">多 worker 所有权：run 记录 owner_worker_id + lease_expires_at；心跳每 lease/3 秒续租；判定过期要再宽限 grace_seconds（给时钟误差留预算）。NULL lease = 已过期。</div>
+    </div>
+    <div class="concept">
+      <div class="c-name">store_only</div>
+      <div class="c-desc">「这条 record 只是从数据库反序列化出来的，本进程没有活 agent task」。有 record ≠ 有活 task：store_only 的 run 不能取消、内存 bridge 下也 stream 不到事件。</div>
+    </div>
+    <div class="concept">
+      <div class="c-name">条件 UPDATE（原子检查+更新）</div>
+      <div class="c-desc">「先读后写」是竞态温床；换成带 WHERE 的 UPDATE，把「检查 + 更新」压成数据库一个原子操作，关闭 T1-T3 竞态窗口（续租、接管、终态守护都用它）。</div>
+    </div>
+    <div class="concept">
+      <div class="c-name">部分唯一索引</div>
+      <div class="c-desc">唯一约束只对 WHERE 子集生效：<code>uq_runs_thread_active</code> 保证「pending/running 的行里 thread_id 唯一」，历史 run 随便存。数据库是跨进程并发守卫的真相之源。</div>
+    </div>
+    <div class="concept">
+      <div class="c-name">AUTO 哨兵三态</div>
+      <div class="c-desc">resolve_user_id 的 user_id 三态：AUTO（哨兵，从 contextvar 推断，读不到抛错）/ 显式 str（覆盖）/ 显式 None（管理通道，不过滤）。用专属类型当默认值，区分「没指定」和「指定了不过滤」。</div>
+    </div>
+    <div class="concept">
+      <div class="c-name">finalizing / stop_reason</div>
+      <div class="c-desc">finalizing = 「旧 run 正在做取消后清理」，新 run 开跑前要等它清完；stop_reason = 守卫型 middleware 硬停 run 时盖的章（loop_capped 等），「success」≠ agent 跑到底。</div>
+    </div>
+  </div>
+</section>
+
+<!-- 3. 一次请求的旅程 -->
+<section id="journey">
+  <h2><span class="no">03</span>一次请求的完整旅程（21 步）</h2>
+  <p class="sub">把九篇放进同一条时间线，就能看到它们不是「各管一摊」，而是「一个 run 的生命周期流水线」。颜色对应所属组件。</p>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-assembly);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">进程启动<span class="t-actor">lifespan + langgraph-runtime</span></div>
+    <div class="t-desc">uvicorn 起服务 → lifespan（外总闸）→ <code>async with langgraph_runtime(...)</code>（内总闸）：先 <code>_enforce_postgres_for_multi_worker</code>（多 worker 闸，不达标 SystemExit）→ <code>AsyncExitStack</code> → <code>init_engine_from_config</code>（engine 必须先于 checkpointer，含 auto-create-db）→ 依次建 stream_bridge / checkpointer / store / run_manager → 孤儿对账 + 发 END + 起心跳 → 挂到 <code>app.state</code>。</div></div></div>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-orchestration);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">鉴权与归属<span class="t-actor">start_run · services.py:648-670</span></div>
+    <div class="t-desc">HTTP 请求到达 → <code>check_access(thread_id, user.id)</code>；越权返回 <strong>404 而非 403</strong>（防枚举）。内部调用者（IM/调度器）再按 owner 头二次鉴权。鉴权必须在创建 run 之前。</div></div></div>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-orchestration);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">模型白名单<span class="t-actor">start_run · services.py:631-646</span></div>
+    <div class="t-desc">类型规整（str()）→ <code>get_model_config(model_name)</code> 不在白名单 → 400。校验与使用同一变量（防 A/B 漏洞）。</div></div></div>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-orchestration);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">并发控制：双层锁创建 run<span class="t-actor">start_run · services.py:674-693</span></div>
+    <div class="t-desc"><code>async with goal_thread_lock(thread_id)</code>（外层，串行化跨 store 读改写）→ <code>run_mgr.create_or_reject(...)</code>（内层，本地检查 + 持锁写库 + 库成功后登记本地；部分唯一索引兜底跨进程）。<code>ConflictError → 409</code>。</div></div></div>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-orchestration);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">thread_meta 尽力 upsert<span class="t-actor">start_run · services.py:695-715</span></div>
+    <div class="t-desc">认领无主 thread → 过户 → 新建/标 running；任何异常吞掉只 warn（non-fatal），不拖垮主流程。</div></div></div>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-orchestration);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">config 六层加固<span class="t-actor">start_run · services.py:717-744</span></div>
+    <div class="t-desc">normalize_input → build_run_config（剥 <code>__</code> 前缀）→ apply_checkpoint → merge（RUNTIME_ONLY 只进 context）→ strip_internal → inject（先清后写身份）。防伪造、防 token 进 checkpoint。</div></div></div>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-orchestration);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">派发后台 task<span class="t-actor">start_run · services.py:744-761</span></div>
+    <div class="t-desc"><code>task = asyncio.create_task(run_agent(bridge, run_mgr, record, ...))</code> + <code>record.task = task</code>（三级钉住）。路由立即返回 record，agent 已在后台跑起来——这是「run 活得比请求久」的物理起点。</div></div></div>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-execution);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">等旧 run 收尾<span class="t-actor">run_agent · worker.py:298</span></div>
+    <div class="t-desc">新 run 开跑第一件事：<code>wait_for_prior_finalizing(thread_id, run_id)</code>——等同 thread 更早的 run 清完 finalizing（rollback 写 checkpoint 可能要几百毫秒，收尾不是一瞬间）。</div></div></div>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-execution);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">跑前拍两份快照<span class="t-actor">run_agent · worker.py:320-347</span></div>
+    <div class="t-desc">checkpoint 快照（<code>aget_tuple</code> 读最新 + <code>copy.deepcopy</code> checkpoint/metadata/pending_writes，rollback 命根）+ workspace 快照（对比算工作区变更）。失败只设标志不打断。</div></div></div>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-stream);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">发 metadata 事件<span class="t-actor">run_agent · worker.py:350-357</span></div>
+    <div class="t-desc"><code>bridge.publish(run_id, "metadata", {run_id, thread_id})</code> 宣告 run 开张，前端 useStream 靠这俩字段绑定 UI。</div></div></div>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-execution);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">驱动 graph 流式产出<span class="t-actor">run_agent · worker.py:490-525</span></div>
+    <div class="t-desc"><code>_stream_once</code>：<code>async for chunk in agent.astream(...)</code>，每迭代先查 <code>abort_event.is_set()</code>（主动取消）→ 扫 fallback marker → <code>bridge.publish(run_id, sse_event, serialize(chunk))</code>。</div></div></div>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-stream);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">事件分发（fan-out）<span class="t-actor">StreamBridge</span></div>
+    <div class="t-desc">publish 写事件日志 + <code>notify_all()</code>；每个订阅者持独立 <code>next_offset</code> 按自己进度读。断线靠 <code>Last-Event-ID</code> O(1) 重连，静默靠 15s 心跳，内存靠 256 条滑动窗口。</div></div></div>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-history);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">事件落档（死档）<span class="t-actor">RunEventStore</span></div>
+    <div class="t-desc">同一批事件经 RunJournal <strong>同时</strong>写进 RunEventStore——按 thread 全局单调 seq 排序（db 后端 asyncio.Lock + <code>pg_advisory_xact_lock</code> 双层锁）。</div></div></div>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-state);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">状态演进（双写）<span class="t-actor">RunManager</span></div>
+    <div class="t-desc">每次状态变化双写：内存注册表 <code>_runs</code> + 数据库 <code>runs</code> 表（<code>update_status</code> 的 WHERE 守卫「终态不可变」）。多 worker 下 lease + heartbeat 表达「谁拥有、还活着吗」。</div></div></div>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-checkpoint);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">存档<span class="t-actor">checkpointer</span></div>
+    <div class="t-desc">每走一步图节点，checkpointer <code>aput</code> 写 checkpoint。langgraph 内部 <code>_checkpointer_put_after_previous</code> 在独立后台 task 里写——这是 #3373 的伏笔。</div></div></div>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-execution);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">goal 续跑循环<span class="t-actor">run_agent · worker.py:527-550</span></div>
+    <div class="t-desc">可见轮跑完 → <code>_prepare_goal_continuation_input</code> 评估目标 → 没满足就合成隐藏续跑轮（续跑 config 清 <code>checkpoint_ns</code>、删 <code>checkpoint_id</code>）。三个退出条件：用户喊停 / LLM 挂 / 目标完成。</div></div></div>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-execution);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">判定最终状态<span class="t-actor">run_agent · worker.py:552-594</span></div>
+    <div class="t-desc">优先级：被取消 > LLM 挂 > 正常成功。LLM 挂靠扫 <code>deerflow_error_fallback</code> marker + <code>pre_existing_message_ids</code> 历史去重识别；读 <code>stop_reason</code> 章识别被 middleware 掐。</div></div></div>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-execution);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">90 行 finally 收尾<span class="t-actor">run_agent · worker.py:630-719</span></div>
+    <div class="t-desc">flush 子 agent 事件 → 记工作区变更 → 落 token 用量 → 回写标题/时长 → 更新 thread 状态 → 清 finalizing → <strong><code>bridge.publish_end(run_id)</code></strong>（命门）→ <code>cleanup(delay=60)</code>。</div></div></div>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-state);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">订阅者收到 END<span class="t-actor">StreamBridge</span></div>
+    <div class="t-desc">所有 <code>subscribe(run_id)</code> 等着的订阅者收到 <code>END_SENTINEL</code>，正常退出。孤儿 run（worker 崩了）由 Gateway 启动时 <code>_publish_recovered_run_stream_end</code> 补发。</div></div></div>
+
+  <div class="step"><div class="rail"><div class="dot" style="background:var(--c-assembly);"></div><div class="line"></div></div>
+    <div class="body"><div class="t-title">进程关闭<span class="t-actor">lifespan finally</span></div>
+    <div class="t-desc">停 channel/scheduler（不再产生新 run）→ flush memory → <code>finally</code> 里先 <code>drain run</code>（shield 防信号风暴）→ <code>close_engine</code> → 出 AsyncExitStack LIFO 关池（修 #3373）。</div></div></div>
+
+  <div class="callout">
+    <b>关键洞察：</b>这条 21 步流水线里没有一个组件是「多余的一层」。每一个都对应朴素写法 <code>create_task(agent.astream(...))</code> 在真实世界里必然翻车的一个点——正因为翻车是必然的，这些「配合」才是必然的。
+  </div>
+</section>
+
+<!-- 4. 九篇详解 -->
+<section id="layers">
+  <h2><span class="no">04</span>九篇详解：每篇的 6 个麻烦</h2>
+  <p class="sub">每篇文档都遵循同一套方法论：<em>朴素写法（反面教材）→ 派生出 6 个「麻烦」→ 每个麻烦给一个机制</em>。下面把每篇的 6 个麻烦完整展开，含场景、机制、关键代码与踩坑点。</p>
+
+  <!-- 4.1 -->
+  <h3 id="l-start" style="color:var(--c-orchestration);">4.1 start_run · 安全启动的阀门</h3>
+  <p>朴素写法 <code>record.task = asyncio.create_task(agent.astream(...))</code> 看起来能用，但它对 6 件「与派协程无关、却绝不能省」的横切关注点一件都没做。start_run 把它们集中到一个 ~160 行的编排函数里，让 6 个 call site（3 个 thread 路由 + 2 个 stateless 路由 + 调度器）复用同一行 <code>record = await start_run(body, thread_id, request)</code>。</p>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-orchestration);">麻烦 1</span>鉴权与归属<span class="pill bad">朴素写法：谁都能在别人 thread 上开 run</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>用户 A 在归属 B 的 thread 上开 run，后端必须拦下。</div>
+      <p><code>owner_user_id = get_trusted_internal_owner_user_id(request)</code>（外部调用者返回 None）；<code>check_access(thread_id, user.id)</code>：thread 归属本人 / 共享 / 无主（NULL owner）都可访问，只有归属另一 user 才拒绝。内部调用者（合成身份名下没有 thread）再按 owner 头二次鉴权。</p>
+      <p><strong>关键细节：</strong>越权返回 <strong>404 而非 403</strong>——防枚举（403 等于告诉攻击者「thread 存在但不是你的」）。且鉴权必须在创建 run 之前（先确认有权，不能建完再发现无权）。装饰器 <code>require_permission</code> 与 <code>check_access</code> 是两道闸：装饰器够不着 body 里的 thread_id（stateless 路由），必须靠 check_access 兜底。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-orchestration);">麻烦 2</span>模型白名单<span class="pill bad">朴素写法：用户指定任意模型绕过计费/审核</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>管理员在 config.yaml 配白名单，用户在 <code>body.context.model_name</code> 指定模型，不在白名单 → 400。</div>
+      <p>类型规整 <code>if not isinstance(model_name, str): model_name = str(model_name)</code>（客户端可能传数字/布尔）→ <code>get_model_config(model_name)</code> 返回 None 就 400。</p>
+      <p><strong>关键细节：</strong>「校验与使用同一变量」——<code>create_or_reject(..., model_name=model_name)</code>，防止「校验的是 A、用的是 B」的漏洞。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-orchestration);">麻烦 3</span>多任务策略下的并发创建<span class="pill bad">朴素写法：两请求同时建 run 撞车</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>三种 multitask_strategy：reject（默认 409）/ interrupt（打断旧 run 保留 checkpoint）/ rollback（回滚旧 run 撤销 checkpoint）。</div>
+      <pre><code><span class="cm"># services.py:674 —— 双层锁，粒度不同</span>
+async with goal_thread_lock(thread_id):          <span class="cm"># ① 外层：串行化「建 run + upsert thread_meta」跨 store 读改写</span>
+    record = await run_mgr.create_or_reject(...)  <span class="cm"># ② 内层：组件内部「检查 inflight + 落库 + 登记内存」原子</span>
+except ConflictError:        raise HTTPException(409)
+except UnsupportedStrategyError: raise HTTPException(501)</code></pre>
+      <p><strong>关键细节：</strong><code>goal_thread_lock</code> 按 event loop 隔离（<code>asyncio.Lock</code> 不能跨 loop）；它是单进程锁，跨进程靠 RunManager + 数据库唯一索引。<code>except</code> 必须放在 <code>async with</code> 外面——异常抛出时锁已释放。传给 <code>create_or_reject</code> 的 kwargs 是 <code>redact_config_secrets(body.config)</code> 的脱敏副本（run API 会 echo 回客户端）。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-orchestration);">麻烦 4</span>thread_meta 尽力而为 upsert<span class="pill bad">朴素写法：thread 在列表里查不到</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>用户从没显式创建过的 thread 上开 run（stateless 路由自动生成 thread_id），thread_meta 表无记录 → /threads/search 查不到 → 对话「凭空消失」。</div>
+      <p>逻辑：<code>existing = get(thread_id)</code> → 若 None 且 owner_user_id 存在，认领历史遗留无主 thread（<code>get(user_id=None)</code> 再查 + 过户）→ 真没有就 <code>create</code>，有就 <code>update_status("running")</code>。</p>
+      <p><strong>关键细节：</strong>整段 <code>except Exception: logger.warning("... (non-fatal)")</code> 吞掉——thread_meta 是辅助副作用，数据库抖动不能拖垮能跑的 run。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-orchestration);">麻烦 5</span>config 六层加固<span class="pill bad">朴素写法：外部伪造内部状态、token 泄漏</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>config 会进 <code>agent.astream(config=...)</code>、被工具读、被中间件读、还会被写进 checkpoint——是高价值攻击面。</div>
+      <table>
+        <tr><th>层</th><th>防什么</th></tr>
+        <tr><td>② normalize_input</td><td>外部带 server-owned 字段（original_user_content）</td></tr>
+        <tr><td>③ build_run_config 剥 <code>__</code> 前缀</td><td>伪造 harness 私有通道（#3938：<code>__slash_skill_secret_source</code> 绕过 skill 闸门）</td></tr>
+        <tr><td>⑤ merge（RUNTIME_ONLY 只进 context）</td><td>一次性 token（github_token）进 configurable = 进 checkpoint 永久泄漏</td></tr>
+        <tr><td>⑥ strip_internal_context_keys</td><td>外部带内部专属 key（只在外部调用者做）</td></tr>
+        <tr><td>⑦ inject（先清后写）</td><td>伪造 user_id / 鉴权字段（先清 <code>_SERVER_OWNED_AUTHZ_CONTEXT_KEYS</code> 再写权威值）</td></tr>
+      </table>
+      <p><strong>关键细节：</strong>LangGraph ≥0.6 硬约束 <code>configurable</code> 和 <code>context</code> 不能同时传；工具执行可能在 handler 返回之后才发生，所以身份必须写进 config 而非只靠 contextvar。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-orchestration);">麻烦 6</span>record.task 延迟绑定 + contextvar 还原<span class="pill bad">朴素写法：野任务 + 用户串号</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>task 若是野任务（无人引用）无法观察/取消；contextvar 不还原，下一个请求继承上一个请求的 owner。</div>
+      <p><strong>先注册后绑 task：</strong>record 在 <code>create_or_reject</code> 返回时已注册进 <code>_runs</code>（task=None），task 后来才绑——保证「record 存在就必在注册表里」，不留「task 已在跑但查不到」的窗口。</p>
+      <pre><code><span class="cm"># services.py:672 —— set 必有 reset，异常路径也 reset</span>
+owner_context_token = set_current_user(SimpleNamespace(id=owner_user_id)) if owner_user_id else None
+try:
+    ...
+    return record
+finally:
+    if owner_context_token is not None:
+        reset_current_user(owner_context_token)</code></pre>
+      <p><strong>关键细节：</strong>FastAPI worker 长跑复用协程上下文，忘了 reset 就是「请求 1（A）set 了 A，请求 2（B）在以为自己是 A 的环境里跑」——串号，且时有时无极难排查。</p>
+    </div>
+  </div>
+
+  <!-- 4.2 -->
+  <h3 id="l-agent" style="color:var(--c-execution);">4.2 run_agent · 驱动引擎</h3>
+  <p>三部曲的第三篇：stream-bridge 管事件流分发、run-manager 管状态生命周期，而 run_agent 是那个<strong>真正驱动 graph 跑起来、喂 chunk、判定成败</strong>的函数（<code>worker.py:246-719</code>）。朴素写法 <code>async for chunk in agent.astream(input): yield chunk</code> 把「agent 执行」焊死在「HTTP 请求」的栈帧里。</p>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-execution);">麻烦 1</span>run 要活过请求，事件走 Bridge 而非 HTTP 响应<span class="pill bad">朴素写法：chunk 直接 yield 给响应</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>chunk 要被任意数量、任意时刻的订阅者消费，不只是创建 run 的那次请求。</div>
+      <p>解：后台 task + <code>bridge.publish(run_id, ...)</code>——事件目的地是 run_id 不是某个 HTTP 连接。<code>_stream_once</code> 里 <code>async with _checkpoint_thread_lock(thread_id)</code>（per-thread 串行化 checkpoint 写入）→ <code>await bridge.publish(run_id, sse_event, serialize(chunk))</code>。</p>
+      <p><strong>关键细节：</strong>单 mode 吐裸 chunk，多 mode/subgraphs 吐 <code>(mode, chunk)</code> 元组，要 <code>_unpack_stream_item</code> 拆包；<code>events</code> 不是 <code>astream</code> 合法 mode，直接跳过。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-execution);">麻烦 2</span>rollback 必须预先拍快照<span class="pill bad">朴素写法：跑完无档可回</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>interrupt = 保留 checkpoint（半截成果）；rollback = 回到 run 之前（当没发生过）。rollback 必须在开跑前存下「那时的状态」。</div>
+      <p>跑前拍两份：workspace 快照 + checkpoint 快照（<code>aget_tuple</code> 读最新 + <code>copy.deepcopy</code> checkpoint/metadata/pending_writes 三份）。rollback 物理上就是「把旧 checkpoint 用新 id/ts 写回去」。</p>
+      <p><strong>关键细节：</strong><code>deepcopy</code> 必须（<code>aget_tuple</code> 返回活引用，不深拷贝会跟着变）；拍快照失败设 <code>snapshot_capture_failed</code> 标志，rollback 前检查——<strong>宁可 rollback 不生效，也不拿半截快照瞎回滚</strong>。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-execution);">麻烦 3</span>goal 自我追问：隐藏续跑轮<span class="pill bad">朴素写法：只跑一轮 astream</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>用户定目标，agent 跑完用户轮后自己判断做没做完，没做完追加隐藏续跑轮。</div>
+      <pre><code><span class="cm"># worker.py:527 —— 可见轮 + while 隐藏续跑</span>
+runtime.context.pop("stop_reason", None)          <span class="cm"># 只在可见轮前清</span>
+await _stream_once(graph_input, initial_runnable_config)
+while not abort_event.is_set() and not llm_error_fallback_message and ...:
+    continuation_input = await _prepare_goal_continuation_input(...)
+    if continuation_input is None or abort_event.is_set(): break
+    await _stream_once(continuation_input, _continuation_runnable_config())</code></pre>
+      <p><strong>关键细节：</strong>续跑 config 要 <code>checkpoint_ns=""</code>、删 <code>checkpoint_id</code>/<code>checkpoint_map</code>（从 thread 最新存档接着跑，不被旧指针锁定）；<code>stop_reason</code> 只在可见轮前清（#4176：可见轮被 middleware 掐，续跑轮干净跑完也仍算被掐）。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-execution);">麻烦 4</span>协作式取消：双路径 + finalizing 协调<span class="pill bad">朴素写法：只能 task.cancel() 强杀</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>粗暴 <code>task.cancel()</code> 可能打在 checkpoint 写一半的当口，留下半截状态。</div>
+      <p><strong>主动路径</strong>：每次 <code>async for</code> 迭代开头查 <code>abort_event.is_set()</code>（chunk 间隙安全退出）。<strong>被动路径</strong>：<code>except asyncio.CancelledError</code> 兜底。两路收尾完全一致：<code>set_finalizing(True)</code> → 按 <code>abort_action</code> 走 rollback（标 error + 回滚）或 interrupt（只标 interrupted，不碰 checkpoint）。</p>
+      <p><strong>关键细节：</strong>interrupt vs rollback 代码只差一行（<code>abort_action == "rollback"</code> 才回滚）；<code>finalizing</code> 不清 = 新 run 在 <code>wait_for_prior_finalizing</code> 永远等下去。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-execution);">麻烦 5</span>LLM 挂了别伪装成功<span class="pill bad">朴素写法：误标 success</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>middleware 不抛异常，而是生成「错误兜底消息」塞进消息列表让 graph「正常结束」——不检查就会把失败 run 标成 success。</div>
+      <p>三件套：① 流循环每 chunk 扫 <code>deerflow_error_fallback</code> marker（<code>or</code> 短路定格）；② <strong>历史去重命门</strong>——<code>msg_id in pre_existing_ids → return None</code>，只认本次 run 新产生的 marker（否则一次故障让 thread 后续所有 run 误标 error）；③ 优先级判定：被取消 > LLM 挂 > 正常成功。</p>
+      <p><strong>关键细节：</strong>两个信号源取并集：流循环抓到的 + journal 的 <code>had_llm_error_fallback</code>（有些 marker 不经过流但触发 LLM end 回调）。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-execution);">麻烦 6</span>finally 全收尾：流必须有终<span class="pill bad">朴素写法：异常一来流断尾丢</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>不管成功/失败/取消/未预期异常，四件事必须做：事件流有终止符、副作用落盘、thread 状态更新、finalizing 清掉。</div>
+      <p>90 行 finally：flush 子 agent 事件 → 记工作区变更 → 落 token 用量 → 回写标题/时长 → 更新 thread 状态 → 清 finalizing → 命门两行：</p>
+      <pre><code>await bridge.publish_end(run_id)              <span class="cm"># ★ 命门：必须 finally、所有 if 之后</span>
+asyncio.create_task(bridge.cleanup(run_id, delay=60))  <span class="cm"># 派后台 + 延迟 60s 给迟到订阅留窗口</span></code></pre>
+      <p><strong>关键细节：</strong><code>publish_end</code> 放任何分支里，订阅者就永远等不到 <code>END_SENTINEL</code>；<code>cleanup</code> 必须在 <code>publish_end</code> 之后（先通知结束、再清存档）。</p>
+    </div>
+  </div>
+
+  <!-- 4.3 -->
+  <h3 id="l-stream" style="color:var(--c-stream);">4.3 StreamBridge · 事件流（活流）</h3>
+  <p>朴素写法 <code>agent.astream() → StreamingResponse</code> 的根本病：<strong>agent 的执行和 HTTP 响应是「同一条命」</strong>，HTTP 一断 agent 也跟着死。StreamBridge 就是那个中间层——agent 只负责 publish，bridge 把事件<strong>可靠地、可重放地、可扇出地、可跨进程地</strong>交给任意订阅者。</p>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-stream);">麻烦 1</span>断线取消<span class="pill bad">朴素写法：CancelledError 杀掉 agent</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>客户端断开 → Starlette 取消 generator → CancelledError 冒泡进 agent 内部破坏状态。历史 bug #3265：/wait 直接 <code>await record.task</code>，吞掉 CancelledError 把半截 run 伪装成正常完成。</div>
+      <p>解：每事件前主动 <code>request.is_disconnected()</code> 检查 + 显式 <code>run_mgr.cancel()</code>（走状态机正规取消：释放 lease、迁移状态、清理资源）。</p>
+      <p><strong>关键细节：</strong>主动检查 + 显式 cancel 优于被动接异常——CancelledError 在任意 await 点冒泡、不可预测，finally 里再 await 还会被再次取消。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-stream);">麻烦 2</span>断线重连（Last-Event-ID）<span class="pill bad">朴素写法：generator 一次性无记忆</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>不能重跑 agent（LLM 花钱、有副作用、采样不同）、从头重放会重复。</div>
+      <p>解：每 run 一份事件日志 <code>_RunStream</code>；事件 id <code>{ts}-{seq}</code> 的 seq 正好等于绝对偏移 → <code>Last-Event-ID</code> 重连变成 O(1) 算术定位（<code>local_index = seq - stream.start_offset</code>）+ 双重校验（下标合法 + id 匹配）。</p>
+      <p><strong>关键细节：</strong>定位失败「宁可重复也不能漏」（从最早留存回放）；<code>_parse_event_seq</code> 用 <code>rpartition("-")</code> 从右切（时间戳含 - 也稳健）；<code>field(default_factory=list)</code> 防共享陷阱。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-stream);">麻烦 3</span>多订阅者 fan-out<span class="pill bad">朴素写法：唯一消费者是那次请求</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>多标签页 join、流式 IM、断线重连都是「新订阅者」。</div>
+      <p>解：<code>asyncio.Condition</code>——publish 加锁 append + <code>notify_all()</code>（fan-out 扳机）；每个订阅者持独立 <code>next_offset</code> 局部变量按自己进度读。事件只存一份，迟到者先回放历史追上进度。</p>
+      <p><strong>关键细节：</strong>所有 HTTP 订阅汇聚到两个 helper（<code>sse_consumer</code> / <code>wait_for_run_completion</code>）；「事件日志 + ID」（麻烦 2）与「fan-out」（麻烦 3）是同一机制的两面。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-stream);">麻烦 4</span>跨进程 / 多 worker<span class="pill bad">朴素写法：进程内存互不可见</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>run 在 W2 跑，请求落到 W1——W1 怎么拿到事件流？</div>
+      <p>抽象基类 + 两实现：<code>MemoryStreamBridge</code>（supports_cross_process=False）/ <code>RedisStreamBridge</code>（True，用 Redis Stream 可回放，非 pub/sub）。守卫 <code>record.store_only and not supports_cross_process → 409</code>。</p>
+      <p><strong>关键细节：</strong>Redis 模式 XADD 的 entry id 直接当 SSE id；<code>xread(count=64, block=15s)</code> 压缩回放 + 阻塞等新事件 + 心跳；跨 worker 取消走 lease 机制（非 bridge），lease 有效 → 409 + Retry-After。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-stream);">麻烦 5</span>长静默期保活（心跳）<span class="pill bad">朴素写法：静默时无字节流动被中间设备掐断</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>pip install 60s、LLM 推理不出 token，nginx proxy_read_timeout 默认 60s、浏览器 EventSource 45s 会掐连接。</div>
+      <p>解：<code>asyncio.wait_for(condition.wait(), timeout=15s)</code> 超时产 <code>HEARTBEAT_SENTINEL</code> → <code>sse_consumer</code> 顺带健康检查（run 是不是悄悄结束了）→ <code>yield ": heartbeat\n\n"</code>。</p>
+      <p><strong>关键细节：</strong>用 SSE 注释帧（<code>:开头</code>客户端忽略但字节流动），不触发客户端回调；15 &lt; 45 &lt; 60，远早于各设备超时。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-stream);">麻烦 6</span>背压 / 内存边界<span class="pill bad">朴素写法：慢用户拖慢整个 worker / 无界队列 OOM</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>生产者 yield 后必须等消费者取，一个慢用户拖慢所有 run；无界 Queue 生产者疯跑 → OOM。</div>
+      <p>解：有界滑动窗口（默认 256），<code>del events[:overflow]</code> + <code>stream.start_offset += overflow</code>（保证重连算术仍成立）。</p>
+      <p><strong>关键细节：</strong>生产者永不阻塞；慢消费者最多丢窗口外历史，不丢「当前在发生」的事件；内存有上限永不 OOM——「有界缓冲 + 允许丢旧」适合实时性 > 完整性的聊天流。</p>
+    </div>
+  </div>
+
+  <p style="color:var(--muted); font-size:14px;">本篇还讲透两大延伸：<strong>IM 通道</strong>（两条总线 <code>MessageBus</code> vs <code>StreamBridge</code> 互不 import；IM 是「经 HTTP 自回环进来的远程订阅者」，9 步往返 + 三路能力分流）与 <strong>调度器</strong>（不订阅事件流，靠 <code>on_run_completed</code> 终态回调钩子——「订阅 vs 回调」的经典对比）。</p>
+
+  <!-- 4.4 -->
+  <h3 id="l-manager" style="color:var(--c-state);">4.4 RunManager · 执行 + 状态</h3>
+  <p>朴素写法 <code>asyncio.create_task(agent.run())</code> 的 task 是函数局部变量，响应一返回就「失联」。RunManager 用六套机制把 run 的执行生命周期与请求生命周期解耦。</p>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-state);">麻烦 1</span>第二次请求想查 run<span class="pill bad">朴素写法：task 失联</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>刷新页面看列表/详情、另开标签页 join 流——新的 HTTP 请求怎么找到后台 run？</div>
+      <p>解：进程级注册表 <code>_runs: dict[run_id, RunRecord]</code> + 二级索引 <code>_runs_by_thread</code>（thread_id → run_id 集合，用 <code>dict[str, None]</code> 保留插入顺序）。<code>RunRecord.task</code> 钉在 record 上 → record 钉在 _runs → _runs 钉在进程级单例 = 三级钉住。</p>
+      <p><strong>关键细节：</strong>两张表必须在锁内同步修改、之间不能有 await（否则查询漏掉刚塞的 run）。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-state);">麻烦 2</span>重启后历史不能丢<span class="pill bad">朴素写法：内存一清全没</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>进程重启，内存全清空，历史 run 还查得到吗？</div>
+      <p>解：内存 + 数据库双层存储；状态每次变化双写。<code>get()</code> 先查内存，没有回退数据库反序列化，并打 <code>store_only=True</code> 标记（「只从存储读，没有活 task」）。</p>
+      <p><strong>关键细节：</strong><code>update_status</code> 的 WHERE 守卫只允许活动态（pending/running/interrupted）被更新——守护「终态不可变」，否则 W2 误判接管的晚到写会覆盖 W1 已写下的 success。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-state);">麻烦 3</span>同 thread 不能并发跑两个 run<span class="pill bad">朴素写法：两请求各跑各的，checkpoint 撞车</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>用户连点两下，两个 run 同时写同一 thread 的 checkpoint → 数据损坏。</div>
+      <p>解：<code>create_or_reject</code> 三步原子——① 持本地锁查 inflight（快路径）② 持锁写数据库（<code>create_run_atomic</code>，部分唯一索引 <code>uq_runs_thread_active</code> 兜底跨进程）③ 库成功后登记本地。锁序不变量：三步在同一把锁内。</p>
+      <p><strong>关键细节：</strong>部分唯一索引只对 <code>status IN ('pending','running')</code> 生效；ORM <code>__table_args__</code> 与 migration 双写（空库 bootstrap 走 create_all 不走 migration）。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-state);">麻烦 4</span>多 worker 下 run 归谁所有<span class="pill bad">朴素写法：进程内存隔离，无法知道对方 task 死活</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>W2 收到「取消 run R」的请求，怎么知道 R 还活着吗、归谁管？</div>
+      <p>解：lease（owner_worker_id + lease_expires_at）+ heartbeat（每 lease/3 秒续租，每 3 周期对账）。<code>update_lease</code> 条件 UPDATE：owner 是自己 + 状态活动才续；续不上 = 被接管，主动停本地 task。</p>
+      <p><strong>关键细节：</strong>grace_seconds（默认 10s）给时钟误差留预算；NULL lease = 已过期（单 worker 保留「重启回收所有 inflight」旧行为）；心跳异常必包死（一次异常让心跳挂 = 所有 run 被当孤儿杀掉）。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-state);">麻烦 5</span>worker 崩了谁收尸<span class="pill bad">朴素写法：孤儿 run 永远卡 running</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>W1 OOM 崩了，它的 run 还标 running，客户端傻等 END_SENTINEL 永远等不到。</div>
+      <p>两条互补路径：① 启动全量对账 <code>reconcile_orphaned_inflight_runs</code>（扫 lease 过期 + 防御性检查本地活 run 防误杀）；② 运行时被动接管（<code>cancel</code> 非本地路径 → <code>claim_for_takeover</code> 条件 UPDATE）。</p>
+      <p><strong>关键细节：</strong><code>claim_for_takeover</code> 用条件 UPDATE（WHERE 含 <code>_lease_expired_or_null</code>）关闭「先读后写」竞态窗口——否则 W1 恰在 W2 判定过期后续租成功，W2 仍盲目 UPDATE 误杀活 run。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-state);">麻烦 6</span>优雅停机<span class="pill bad">朴素写法：进程强退，run 暴毙</span></div>
+    <div class="trouble-body">
+      <div class="t-scene"><b>场景：</b>进程退出时 run 还在写 checkpoint，先关连接池就撞 <code>PoolClosed</code>（issue #3373）。</div>
+      <p>解：<code>shutdown</code> 有界 drain——停心跳 → <code>abort_event.set()</code> + <code>task.cancel()</code> → <code>asyncio.wait(tasks, timeout=5s)</code> 有界等待 → 区分「自己跑完的（保留真实终态）」vs「被迫中断的（标 interrupted）」→ 有界落库。</p>
+      <p><strong>关键细节：</strong>drain 必须在 checkpointer 连接池关闭之前；<code>asyncio.shield</code> 防信号风暴；落库也受 timeout 预算约束（<code>remaining = deadline - elapsed</code>）。</p>
+    </div>
+  </div>
+
+  <!-- 4.5 -->
+  <h3 id="l-checkpointer" style="color:var(--c-checkpoint);">4.5 checkpointer · 存档</h3>
+  <p>朴素写法 <code>InMemorySaver()</code> 每请求 new 一个：内存版函数一返回存档随 GC 消失；数据库版每请求开一次连接池打爆数据库。checkpointer 是「会真正读写存储、占数据库连接」的进程级单例。</p>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-checkpoint);">麻烦 1</span>后端要开数据库连接，不能每次 new<span class="pill bad">朴素写法：每请求开一次连接池</span></div>
+    <div class="trouble-body">
+      <p>解：<code>make_checkpointer</code> 工厂启动时建一次，<code>_build_postgres_pool</code> 建进程级 <code>AsyncConnectionPool</code>（autocommit / prepare_threshold=0 / dict_row / TCP keepalives / <code>check=check_connection</code> 借前 ping）。</p>
+      <p><strong>关键细节：</strong>keepalives 与 check_connection 只在「池是长寿命」前提下有意义——每请求开关池根本用不上。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-checkpoint);">麻烦 2</span>异步构造需要事件循环，import 时跑不了<span class="pill bad">朴素写法：import 时建 → Future attached to a different loop</span></div>
+    <div class="trouble-body">
+      <p>三个问题叠加：无事件循环（await 无地可挂）、时机太早（config/DB 未就绪）、连接绑死错误循环。解：构造挪进 lifespan 的 <code>langgraph_runtime</code>（事件循环在跑、配置已加载、DB 已就绪），<code>await stack.enter_async_context(make_checkpointer(config))</code>。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-checkpoint);">麻烦 3</span>后端选择依赖 config，不能写死<span class="pill bad">朴素写法：写死在代码里</span></div>
+    <div class="trouble-body">
+      <p>三段优先级：老 <code>checkpointer:</code> 段 → 新 <code>database:</code> 段 → <code>InMemorySaver</code> 兜底；每个分支 <code>yield</code> 后 <code>return</code> 确保只走一条。三条路最终 yield 同一接口 <code>Checkpointer</code>（type alias = <code>None | bool | BaseCheckpointSaver</code>）。</p>
+      <p><strong>关键细节：</strong>换后端 = 改 config.yaml，代码一行不动。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-checkpoint);">麻烦 4</span>关机要按顺序回收，否则 PoolClosed<span class="pill bad">朴素写法：先关池，run 写一半</span></div>
+    <div class="trouble-body">
+      <p>真实事故 #3373：langgraph 的 <code>_checkpointer_put_after_previous</code> 在独立后台 task 里 <code>aput</code>，池先关就撞 <code>PoolClosed</code>，且异常在主调用栈 try/except 之外。解：<code>finally</code> 先 <code>_drain_inflight_runs</code> 再 <code>close_engine</code>；drain 用 <code>asyncio.shield</code> 防信号风暴。</p>
+      <p><strong>关键细节：</strong>顺序 = drain run → 引擎关 → 池关（池最先建、最后关）。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-checkpoint);">麻烦 5</span>多 worker 下 SQLite 会互相踩<span class="pill bad">朴素写法：SQLite + 多进程</span></div>
+    <div class="trouble-body">
+      <p>SQLite 文件级写锁撑不住多进程；各连各的 SQLite 文件又互不可见。解：<code>_enforce_postgres_for_multi_worker</code>——<code>GATEWAY_WORKERS &gt; 1</code> 且 backend ≠ postgres → <code>SystemExit</code>；还必须 heartbeat（否则 NULL lease 全算过期，对账误杀活 run）。</p>
+      <p><strong>关键细节：</strong>放在任何构造之前——宁可启动失败，不留半开连接、不生产里踩坑。</p>
+    </div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-checkpoint);">麻烦 6</span>缺失时给干净 503，而非深层 NoneType 崩<span class="pill bad">朴素写法：NoneType 崩 500</span></div>
+    <div class="trouble-body">
+      <p>解：<code>_require</code> 工厂——<code>val = getattr(request.app.state, attr, None)</code>，None 就 <code>raise HTTPException(503, f"{label} not available")</code>，在「取依赖」一步就失败。</p>
+      <p><strong>关键细节：</strong>别被 docstring「FastAPI dependency」带偏——实际是路由里直接调用 <code>get_checkpointer(request)</code>，不是 <code>Depends(...)</code>。</p>
+    </div>
+  </div>
+
+  <!-- 4.6 -->
+  <h3 id="l-history" style="color:var(--c-history);">4.6 run-event-store · 事件历史（死档）</h3>
+  <p>与 StreamBridge 形成最经典的一对对照：<strong>活流 vs 死档</strong>，存同一批 event 两份副本。一个是「现在正在发生什么」（订阅/push/不持久），一个是「曾经发生过什么」（查询/pull/持久）。</p>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-history);">麻烦 1</span>刷新/重启后历史不能丢<span class="pill bad">朴素写法：只往 SSE 塞</span></div>
+    <div class="trouble-body"><p>解：进程级单例 + 启动建一次（<code>make_run_event_store</code> 工厂）+ <code>_require</code> 503 兜底。db/jsonl 连进程外持久存储，重启后仍可查。</p></div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-history);">麻烦 2</span>seq 按 thread 全局单调<span class="pill bad">朴素写法：每 run 各自从 1 数</span></div>
+    <div class="trouble-body"><p>seq 三个字眼：同一 thread 内、严格递增、全局不按 run 分段——前端按 thread 整体翻页是根。memory 后端 <code>_seq_counters: dict[thread_id, int]</code>（key 只有 thread_id）。</p></div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-history);">麻烦 3</span>消息和轨迹分别查<span class="pill bad">朴素写法：每次查扫全表</span></div>
+    <div class="trouble-body"><p>解：category 三分类（message/trace/lifecycle）+ memory 四张投影（{全部 vs 仅 message} × {thread 级 vs run 级}）+ bisect 二分 → 查消息 O(log m + limit)。</p>
+    <p><strong>关键细节：</strong>投影存同一 dict 对象引用（no copies），不占双倍内存——用写入时多 append 几个引用的开销，换查询的指数级提速。</p></div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-history);">麻烦 4</span>db 跨进程 seq 单调：双层锁<span class="pill bad">朴素写法：SELECT max 再 INSERT 有竞态</span></div>
+    <div class="trouble-body"><p>解：进程内 <code>asyncio.Lock</code>（per-thread）+ 跨进程 <code>pg_advisory_xact_lock(hashtext(thread_id))</code>（事务级咨询锁）。<code>put_batch</code> 一次锁批量写，batch 必须同 thread。</p>
+    <p><strong>关键细节：</strong>为什么不用 FOR UPDATE——Postgres 拒绝 <code>SELECT max(...) FOR UPDATE</code>（聚合结果不是可锁的行）；<code>(thread_id, seq)</code> 唯一约束使撞号 = 写入直接失败。</p></div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-history);">麻烦 5</span>多租户隔离<span class="pill bad">朴素写法：全表串台</span></div>
+    <div class="trouble-body"><p>解：<code>AUTO</code> 哨兵三态 + 写入软读（后台 worker 无用户上下文读不到返回 None 不抛错）+ 查询 <code>resolve_user_id</code> 应用 WHERE user_id。</p>
+    <p><strong>关键细节：</strong>UUID → VARCHAR 坑：<code>User.id</code> 是 UUID，列是 VARCHAR(64)，aiosqlite 绑 UUID 报错且 INSERT 静默回滚、worker 挂住——必须 <code>str(user.id)</code>。</p></div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-history);">麻烦 6</span>jsonl 单进程限制 + 路径安全 + 后端冻结<span class="pill bad">朴素写法：多进程撞号 / 路径穿越 / 热重载错配</span></div>
+    <div class="trouble-body"><p>三件事：① jsonl 的 seq 计数器是进程内存的，多进程必撞（docstring 明示硬限制，用 DbRunEventStore）；② <code>_SAFE_ID_PATTERN = ^[A-Za-z0-9_\-]+$</code> 防路径穿越 + <code>asyncio.to_thread</code> 防堵事件循环；③ 配置和 store 成对冻结（<code>reload_boundary.py:48</code> 登记 startup-only），防「config 说 memory、store 还绑 Postgres」错配。</p></div>
+  </div>
+
+  <!-- 4.7 -->
+  <h3 id="l-assembly" style="color:var(--c-assembly);">4.7 lifespan + langgraph-runtime · 装配双闸</h3>
+  <p>这是所有 <code>get_*</code> 的<strong>上游</strong>：<code>app.state</code> 是「取」的终点，但不是「放」的起点——必须有一个装配工序在启动时把单例造出来塞进去、关机时收回来。</p>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-assembly);">麻烦 1</span>config 启动时读，且故意不缓存到 app.state<span class="pill bad">朴素写法：import 时读 config</span></div>
+    <div class="trouble-body"><p><code>startup_config = get_app_config()</code> 是局部变量（只用于一次性 bootstrap），刻意不挂 <code>app.state</code>——保 hot-reload 契约（请求时永远重新读 config.yaml）。</p>
+    <p><strong>关键细节：</strong>「用约束换正确性」：缓存到 app.state 会诱惑路由读旧值，hot-reload 就废了。config 加载失败 re-raise（致命，拒启动）。</p></div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-assembly);">麻烦 2</span>副作用必须在 startup 时发生<span class="pill bad">朴素写法：import 时装 tracer / 联网预热</span></div>
+    <div class="trouble-body"><p>Monocle tracing（import 时装进程级 tracer 会污染同进程一切）、tiktoken 预热（<code>asyncio.to_thread(warm) + wait_for(5s)</code> 有界，失败非致命有字符计数兜底）、清理残留上传文件。全是 try/except 只 warn 非致命。</p></div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-assembly);">麻烦 3</span>嵌套 langgraph_runtime：yield 在它内部<span class="pill bad">朴素写法：lifespan 自己直接 yield</span></div>
+    <div class="trouble-body"><p><code>async with langgraph_runtime(app, startup_config):</code> 包裹 lifespan 的 yield——应用在 langgraph_runtime 还活着时才活着。两层 yield 叠加：lifespan 开机段 → langgraph_runtime 开机段 → 应用服务期 → lifespan 关机段 → langgraph_runtime finally（drain + close_engine）→ AsyncExitStack LIFO 关资源。</p></div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-assembly);">麻烦 4</span>issue #3373：yield 在内、drain 在 close_engine 前<span class="pill bad">朴素写法：先关池再 drain</span></div>
+    <div class="trouble-body"><p>三件套：① yield 嵌套在 langgraph_runtime 内（否则无处插「先 drain 再关池」）② finally 里先 <code>_drain_inflight_runs</code> 再 <code>close_engine</code> ③ <code>asyncio.shield</code> 保护 drain，被取消后再次 shield 等完再 raise。</p>
+    <p><strong>关键细节：</strong>drain 有界（5s）所以等它跑完不会无限挂；中途取消就回到 #3373 状态。</p></div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-assembly);">麻烦 5</span>启动步骤的顺序依赖<span class="pill bad">朴素写法：顺序错导致 None / 半开连接</span></div>
+    <div class="trouble-body"><p>engine 必须先于 checkpointer（auto-create-db 先跑）；<code>_ensure_admin_user</code>（遍历 store）必须在 langgraph_runtime 之后；channel（要 run_manager）同理；scheduler「条件构造 + 条件启动」两段式（构造了就无条件 stop）。</p></div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-assembly);">麻烦 6</span>关机顺序 + bounded<span class="pill bad">朴素写法：关机钩子卡死拖进程</span></div>
+    <div class="trouble-body"><p>关机顺序：先停会产生新 run 的入口（channel/scheduler）→ flush memory（langgraph_runtime 块内，close_engine 前）→ drain run → close_engine → LIFO 关池。每步 <code>asyncio.wait_for</code> 有界。</p>
+    <p><strong>关键细节：</strong>K8s 约束：<code>shutdown_flush_timeout_seconds</code> 必须小于 <code>terminationGracePeriodSeconds</code>；两个 5s 超时常量是独立预算。</p></div>
+  </div>
+
+  <!-- 4.8 -->
+  <h3 id="l-feedback" style="color:var(--c-optional);">4.8 feedback-repo · 轻资源的反面</h3>
+  <p>前三篇讲「重要的东西必须活得久、死得体面」；本篇讲「<strong>可选的东西可以不活，但只要活着，就得守规矩</strong>」。FeedbackRepository 不持连接池、不进 AsyncExitStack、不参与 run 生命周期，却走同一套 <code>app.state + _require</code> 机制——因为它的麻烦落在另一个维度。</p>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-optional);">麻烦 1</span>没配 DB 时该不该可用<span class="pill bad">朴素写法：崩 500 或假装可用丢数据</span></div>
+    <div class="trouble-body"><p>产品决策选「诚实报不可用」：<code>if sf is not None → FeedbackRepository(sf)</code>；<code>else → feedback_repo = None</code>（显式置 None，不造内存版）+ <code>_require</code> 就地 503。</p>
+    <p><strong>关键细节：</strong>同一 if/else 两条策略：run_store（核心功能）没 DB 给内存兜底，feedback（辅助功能）没 DB 宁可 None——功能重要性差异的体现。</p></div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-optional);">麻烦 2</span>不能每请求 new<span class="pill bad">朴素写法：每请求造 factory</span></div>
+    <div class="trouble-body"><p>解：仓库进程级单例 + session_factory 进程级单例（<code>one get_session_factory() call for all</code>，RunRepository/FeedbackRepository/ScheduledTaskRepository 共享同一底层 engine）。</p>
+    <p><strong>关键细节：</strong>「仓库是单例」≠「session 是单例」——每个方法现借新 session，单例的是「工厂」不是「产品」，这是线程/协程安全的根源。</p></div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-optional);">麻烦 3</span>方法级短命 session 借完即还<span class="pill bad">朴素写法：自己攥连接池变重</span></div>
+    <div class="trouble-body"><p><code>async with self._sf() as session:</code> 是全文最重要一行——每个方法都现借新 session、出块自动还。「关连接」由底层 engine 负责，仓库只是 engine 的消费者。</p>
+    <p><strong>关键细节：</strong>对比 checkpointer 自己买游泳池，feedback 是去公共泳池办卡——不进 AsyncExitStack 不是忘了，是不需要。</p></div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-optional);">麻烦 4</span>多租户隔离<span class="pill bad">朴素写法：user_id=None 全表串台</span></div>
+    <div class="trouble-body"><p><code>resolve_user_id</code> 三态（AUTO 哨兵 / 显式 str / 显式 None 管理通道）；每方法 <code>if resolved_user_id is not None</code> 才加 WHERE。</p>
+    <p><strong>关键细节：</strong>get/delete「不是你的当不存在」（存在但不是你的也返回 None/False）——防枚举攻击，别「好心」改成 403/抛错。</p></div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-optional);">麻烦 5</span>upsert 幂等 + 唯一约束<span class="pill bad">朴素写法：纯 INSERT 连点出两条</span></div>
+    <div class="trouble-body"><p>两层保证：底线 = 唯一约束 <code>(thread_id, run_id, user_id)</code>（三列组合，一人一票）；乐观路径 = upsert（SELECT → scalar_one_or_none → 改票/INSERT）。路由用 PUT（幂等语义）。</p>
+    <p><strong>关键细节：</strong>scalar_one_or_none 敢用是因为唯一约束兜底；upsert 是乐观路径，别因有约束删掉「先查后改」逻辑。</p></div>
+  </div>
+
+  <div class="trouble">
+    <div class="trouble-head"><span class="tno" style="background:var(--c-optional);">麻烦 6</span>读侧 enrichment 防 N+1<span class="pill bad">朴素写法：每条 AI 消息查一次反馈</span></div>
+    <div class="trouble-body"><p>两个批量方法：<code>list_by_thread_grouped</code>（一次查整个 thread，内存按 run_id 分组）+ <code>list_by_run_ids</code>（IN 批量 + 空集合守卫）。消费方两个守卫：<code>if last_ai_per_run:</code> / <code>if feedback_run_ids:</code>。</p>
+    <p><strong>关键细节：</strong>enrichment 是副产品，不为它付无谓查询费——没 AI 消息可挂就别发查询。</p></div>
+  </div>
+</section>
+
+<!-- 5. 它们如何配合 -->
+<section id="cooperation">
+  <h2><span class="no">05</span>它们如何配合：八个交汇点 + 协作矩阵</h2>
+  <p class="sub">逐篇看是九个孤立主题，串起来看，有八处的「配合」最能说明这套设计的精巧。</p>
+
+  <div class="card">
+    <h4 style="margin-top:0;">① 同一行代码里的三个主角</h4>
+    <pre><code><span class="cm"># services.py:746 —— 三部曲的物理交汇点</span>
+task = asyncio.create_task(
+    run_agent(
+        bridge,     <span class="cm"># ← stream-bridge 篇的主角（事件往哪儿喂）</span>
+        run_mgr,    <span class="cm"># ← run-manager 篇的主角（状态归谁管）</span>
+        record,     <span class="cm"># ← 这条 run 的身份证</span>
+        ctx=run_ctx, agent_factory=..., graph_input=..., config=...,
+    )
+)
+record.task = task   <span class="cm"># 钉回注册表 → 三级钉住，run 再也不会失联</span></code></pre>
+    <p>事件流、状态、执行三面被「构造进同一次函数调用」——不是巧合，而是它们本来就是「一次 run」不可分割的三个投影。start_run 准备参数，run_agent 消费参数，bridge/run_mgr 在 run_agent 内部被反复调用。</p>
+  </div>
+
+  <div class="card">
+    <h4 style="margin-top:0;">② 同一批事件的两份副本：活流 vs 死档</h4>
+    <p>agent 每产出一个 chunk，<code>RunJournal</code> 同时做两件事：推给 <strong>StreamBridge</strong>（实时订阅者）和写进 <strong>RunEventStore</strong>（未来查询者）。</p>
+    <table>
+      <tr><th>维度</th><th>StreamBridge（活流）</th><th>RunEventStore（死档）</th></tr>
+      <tr><td>访问时机</td><td>run 还在跑的时候</td><td>run 跑完之后（或随时查）</td></tr>
+      <tr><td>访问方式</td><td>订阅 SSE（push）</td><td>主动查询（pull）</td></tr>
+      <tr><td>持久化</td><td>不持久（结束/重启就没了）</td><td>db/jsonl 持久</td></tr>
+      <tr><td>排序/分页</td><td>按插入序 + Last-Event-ID 重放</td><td>按 thread 全局单调 seq + before/after_seq 分页</td></tr>
+    </table>
+    <p>「把实时流当历史存储」或「把历史存储当实时流」都是朴素写法的经典错误——两种访问模式需要两个独立机制。</p>
+  </div>
+
+  <div class="card">
+    <h4 style="margin-top:0;">③ 一条 drain 顺序，横跨四篇（issue #3373）</h4>
+    <p>一个真实事故把 lifespan、langgraph-runtime、get-checkpointer、run-manager 四篇串在了一起：进程退出时，若连接池先关、后台 <code>_checkpointer_put_after_previous</code> 的 <code>aput</code> 还在写 checkpoint，就撞 <code>PoolClosed</code>——且异常在 langgraph 内部 task 里，主调用栈抓不到。</p>
+    <pre><code><span class="cm"># deps.py:332 —— 关机顺序的「铁律」</span>
+try:
+    yield                         <span class="cm"># 应用正常运行</span>
+finally:
+    await _drain_inflight_runs(run_manager)   <span class="cm"># ① 先 drain：让 run 写完最后一档</span>
+    await close_engine()                       <span class="cm"># ② 再关引擎</span>
+<span class="cm"># ③ 出 AsyncExitStack 才 LIFO 关掉 checkpointer 连接池</span></code></pre>
+    <p>分工：<strong>run-manager</strong> 讲 <code>shutdown</code> 内部怎么有界 drain；<strong>lifespan</strong> 讲谁来调、什么时刻调；<strong>get-checkpointer</strong> 讲为什么池必须最后关；<strong>langgraph-runtime</strong> 讲 <code>yield</code> 嵌套给 drain 留插入点 + <code>asyncio.shield</code> 防信号风暴。四篇合起来才把一个 bug 讲完整。</p>
+  </div>
+
+  <div class="card">
+    <h4 style="margin-top:0;">④ 多 worker 硬门槛：一张约束网横跨六篇</h4>
+    <p>「<code>GATEWAY_WORKERS &gt; 1</code> 必须 Postgres + heartbeat」不是单篇的结论，而是六篇各自约束的交集：</p>
+    <ul>
+      <li><strong>checkpointer</strong>：SQLite 文件锁撑不住多进程写 → 必须 Postgres。</li>
+      <li><strong>run-manager</strong>：无 heartbeat 则 lease 全 NULL → 对账把别的 worker 活 run 当孤儿杀掉。</li>
+      <li><strong>stream-bridge</strong>：内存模式跨 worker 拿不到事件流 → 要么 sticky session，要么 Redis。</li>
+      <li><strong>run-event-store</strong>：memory 数据分裂、jsonl seq 撞号 → 只有 db 后端能上多 worker。</li>
+      <li><strong>langgraph-runtime</strong>：把以上收敛成启动第一行的 <code>_enforce_postgres_for_multi_worker</code> → <code>SystemExit</code>。</li>
+    </ul>
+    <p>这就是「宁可启动失败，也不能让 worker 在生产里互相屠杀」的工程态度。</p>
+  </div>
+
+  <div class="card">
+    <h4 style="margin-top:0;">⑤ 取消链路的「接力」：三层各管一段</h4>
+    <p>用户点「停止」时，取消信号经过三个组件接力，每一层职责不同：</p>
+    <ol>
+      <li><strong>start_run / HTTP 层</strong>：把取消请求翻译成 <code>run_mgr.cancel(run_id, action=...)</code>，action 决定 interrupt 还是 rollback。</li>
+      <li><strong>RunManager</strong>：更新 run 状态、处理 lease（跨 worker 时 409 + Retry-After 或条件 UPDATE 接管）、按 <code>abort_action</code> 设 <code>record.abort_event</code> 铃铛。</li>
+      <li><strong>run_agent</strong>：在 chunk 间隙主动查 <code>abort_event.is_set()</code> → break → <code>set_finalizing(True)</code> → rollback（用预拍快照）或 interrupt → finally 里 <code>publish_end</code>。</li>
+    </ol>
+    <p>三层缺一不可：HTTP 层不译码、RunManager 不管状态、run_agent 不查铃铛，取消都无法「干净地」完成。</p>
+  </div>
+
+  <div class="card">
+    <h4 style="margin-top:0;">⑥ 断线重连的「身份链」：run_id 贯穿一切</h4>
+    <p>一个 <code>run_id</code> 是贯穿所有组件的「身份证」：checkpointer 按 thread_id 存档、RunManager 按 run_id 查状态、StreamBridge 按 run_id 路由事件、RunEventStore 按 (thread_id, seq) 排序、前端 useStream 靠 (run_id, thread_id) 绑定 UI。</p>
+    <p>正是这个统一的 ID 体系，让「创建 run 的那次请求」和「之后观察 run 的所有请求」能够对齐——run 才真正成为独立的、可寻址的一等公民实体。</p>
+  </div>
+
+  <div class="card">
+    <h4 style="margin-top:0;">⑦ 单例装配与取用的「上下游」</h4>
+    <p><code>langgraph_runtime</code> 管「建与还」（进程开机按序建、关机按序收），6 个 getter 管「取」（每请求取一次、取不到 503）。两者是同一类东西的上下游：</p>
+    <pre><code><span class="cm"># deps.py:364-369 —— 六个兄弟 getter，同一套 _require 机制</span>
+get_stream_bridge   = _require("stream_bridge",   "Stream bridge")
+get_run_manager     = _require("run_manager",     "Run manager")
+get_checkpointer    = _require("checkpointer",    "Checkpointer")
+get_run_event_store = _require("run_event_store", "Run event store")
+get_feedback_repo   = _require("feedback_repo",   "Feedback")
+get_run_store       = _require("run_store",       "Run store")</code></pre>
+    <p>前四个是「重资源」进 AsyncExitStack，feedback 是「轻资源」不进——同一套取用机制，但「生灭」策略因资源性质而异。</p>
+  </div>
+
+  <div class="card">
+    <h4 style="margin-top:0;">⑧ 协作矩阵：谁生产、谁消费、谁依赖谁</h4>
+    <table>
+      <tr><th>组件</th><th>生产什么</th><th>消费什么</th><th>关键依赖</th></tr>
+      <tr><td>start_run</td><td>干净的 RunRecord + 后台 task</td><td>body / request / config</td><td>goal_thread_lock、create_or_reject、contextvar</td></tr>
+      <tr><td>run_agent</td><td>事件（chunk）、状态变化、checkpoint</td><td>bridge / run_mgr / checkpointer / ctx</td><td>abort_event、pre_run_snapshot</td></tr>
+      <tr><td>StreamBridge</td><td>事件分发（publish_end）</td><td>publish 调用</td><td>Condition / Redis / Last-Event-ID</td></tr>
+      <tr><td>RunManager</td><td>状态、lease、孤儿回收</td><td>create/cancel/get 调用</td><td>RunStore、lease、heartbeat</td></tr>
+      <tr><td>checkpointer</td><td>checkpoint 持久化</td><td>aget_tuple/aput 调用</td><td>engine、连接池</td></tr>
+      <tr><td>RunEventStore</td><td>事件历史（seq 排序）</td><td>RunJournal 写入</td><td>session_factory / 锁</td></tr>
+      <tr><td>lifespan/runtime</td><td>单例（造/挂/回收）</td><td>config</td><td>AsyncExitStack、drain</td></tr>
+    </table>
+  </div>
+</section>
+
+<!-- 6. 设计启示 -->
+<section id="principles">
+  <h2><span class="no">06</span>设计启示：十条可迁移到任何 Agent 系统</h2>
+  <p class="sub">剥掉 DeerFlow 的具体实现，这套设计透露出十条通用的、对「构建 Agent 服务」尤其关键的思路。每条配「朴素反例 vs 正解」。</p>
+
+  <div class="principle">
+    <div class="p-head"><span class="p-num" style="background:var(--c-execution);">01</span><span class="p-title">把「执行」从「触发它的请求」里解放出来</span></div>
+    <p class="p-what">这是全部九篇文档的根。Run 是独立的一等公民实体：有自己的 ID、状态机、存储、事件流，而不是某个请求栈帧里的局部变量。</p>
+    <div class="code-compare">
+      <div class="code-pane bad"><div class="pane-title">✗ 朴素反例（野任务）</div>
+        <pre><code>async def stream(thread_id, input_text):
+    task = asyncio.create_task(agent.astream(...))
+    <span class="cm"># 函数返回，task 无人引用 → 失联</span>
+    return StreamingResponse(consume(task))</code></pre></div>
+      <div class="code-pane good"><div class="pane-title">✓ 正解（三级钉住）</div>
+        <pre><code>record.task = asyncio.create_task(run_agent(...))
+run_mgr._runs[run_id] = record   <span class="cm"># 注册表</span>
+<span class="cm"># task → RunRecord → _runs → 进程级单例</span></code></pre></div>
+    </div>
+  </div>
+
+  <div class="principle">
+    <div class="p-head"><span class="p-num" style="background:var(--c-stream);">02</span><span class="p-title">三面解耦，各自单一职责</span></div>
+    <p class="p-what">一个 run 的「活过请求」被拆成三个正交的侧面，各自一个组件、一篇文档、一个 getter。</p>
+    <div class="p-how"><ul>
+      <li><strong>事件流</strong>（StreamBridge）：产出怎么广播出去——与「谁在听」解耦。</li>
+      <li><strong>执行 + 状态</strong>（RunManager）：run 怎么活、可查可取消可恢复——与「谁触发」解耦。</li>
+      <li><strong>存档</strong>（checkpointer）：状态怎么持久化——与「进程死活」解耦。</li>
+      <li>再加 <strong>执行引擎</strong>（run_agent）驱动 graph、<strong>创建阀门</strong>（start_run）安全启动。</li>
+    </ul></div>
+  </div>
+
+  <div class="principle">
+    <div class="p-head"><span class="p-num" style="background:var(--c-history);">03</span><span class="p-title">「活流」与「死档」分离</span></div>
+    <p class="p-what">实时订阅（push、不持久）和历史查询（pull、持久）是两种完全不同的访问模式，绝不该用一个机制硬凑。</p>
+    <div class="p-how"><ul>
+      <li>同一批事件两份副本：StreamBridge 管「现在正在发生什么」，RunEventStore 管「曾经发生过什么」。</li>
+      <li>这对应 Agent 产品的两个真实需求：边跑边看（打字机）vs 刷新/回溯（历史页）。</li>
+    </ul></div>
+  </div>
+
+  <div class="principle">
+    <div class="p-head"><span class="p-num" style="background:var(--c-checkpoint);">04</span><span class="p-title">进程级单例 + 依赖注入 + fail-fast</span></div>
+    <p class="p-what">重资源必须「启动建一次、进程内共享」，并通过统一入口取用，取不到就明确报错。</p>
+    <div class="code-compare">
+      <div class="code-pane bad"><div class="pane-title">✗ 深层崩溃（信号又晚又弱）</div>
+        <pre><code>checkpointer = getattr(app.state, "checkpointer", None)
+await checkpointer.aget_tuple(config)
+<span class="cm"># AttributeError: 'NoneType' object has no attribute 'aget_tuple' → 500</span></code></pre></div>
+      <div class="code-pane good"><div class="pane-title">✓ 就地 503（信号又早又准）</div>
+        <pre><code>def dep(request):
+    val = getattr(request.app.state, attr, None)
+    if val is None:
+        raise HTTPException(503, f"{label} not available")
+    return val</code></pre></div>
+    </div>
+  </div>
+
+  <div class="principle">
+    <div class="p-head"><span class="p-num" style="background:var(--c-assembly);">05</span><span class="p-title">资源生命周期的显式管理</span></div>
+    <p class="p-what">「谁进栈、谁手动关、谁根本不用关」要分得清清楚楚。</p>
+    <div class="p-how"><ul>
+      <li><code>AsyncExitStack</code> LIFO：有连接要关的（bridge/checkpointer/store）进栈，后进先关。</li>
+      <li>engine「活但不进栈」：写模块全局，靠 <code>finally</code> 手动 <code>close_engine</code>。</li>
+      <li>纯数据（run_event_store / feedback_repo）「不需要还」：不进栈是设计，不是疏忽。</li>
+      <li>启动步骤「致命 / 非致命」分级：config 失败拒启动，边缘组件失败只 warn。</li>
+    </ul></div>
+  </div>
+
+  <div class="principle">
+    <div class="p-head"><span class="p-num" style="background:var(--c-state);">06</span><span class="p-title">并发一致性分层：锁要「各管一层」</span></div>
+    <p class="p-what">单进程与跨进程是两回事，不能一把锁打天下，也不能只锁一层留缺口。</p>
+    <div class="p-how"><ul>
+      <li><strong>进程内</strong>：<code>asyncio.Lock</code>（per-thread 分锁，不阻塞别的 thread）。</li>
+      <li><strong>跨进程</strong>：数据库是「真相之源」——部分唯一索引、条件 UPDATE（<code>WHERE</code> 原子「检查+更新」）、advisory lock。</li>
+      <li>铁律：<strong>「先读后写」是竞态温床</strong>，一律换成带 <code>WHERE</code> 的条件 UPDATE，把判断与写入压成一个原子操作。</li>
+    </ul></div>
+  </div>
+
+  <div class="principle">
+    <div class="p-head"><span class="p-num" style="background:var(--c-state);">07</span><span class="p-title">分布式协调：把「谁拥有 + 还活着吗」变成数据</span></div>
+    <p class="p-what">多 worker 下进程内存互不可见。与其猜，不如把所有权写进共享存储，用周期更新表达存活。</p>
+    <div class="p-how"><ul>
+      <li>lease（租约）+ heartbeat（心跳续租）+ grace_seconds（时钟误差预算）。</li>
+      <li>孤儿对账（启动全量扫）+ 被动接管（条件 UPDATE 关闭竞态窗口）。</li>
+      <li>铁律：心跳异常必须包死（一次异常让心跳挂 = 所有 run 被当孤儿杀掉）；续租间隔取 lease/3 留容错。</li>
+    </ul></div>
+  </div>
+
+  <div class="principle">
+    <div class="p-head"><span class="p-num" style="background:var(--c-assembly);">08</span><span class="p-title">优雅停机：顺序 + 有界 + 抗信号风暴</span></div>
+    <p class="p-what">进程退出时后台 run 还在写 checkpoint——关闭顺序错一点就是数据丢失。</p>
+    <div class="p-how"><ul>
+      <li>顺序铁律：<strong>drain run → close_engine → LIFO 关池</strong>（先排干再关池）。</li>
+      <li><code>asyncio.shield</code> 抗二次 SIGINT/超时（信号风暴）。</li>
+      <li>每个关机钩子有界（<code>wait_for</code> 超时）；drain 中自己跑完的 run 保留真实终态，不粗暴覆盖。</li>
+    </ul></div>
+  </div>
+
+  <div class="principle">
+    <div class="p-head"><span class="p-num" style="background:var(--c-orchestration);">09</span><span class="p-title">安全与多租户：细节决定边界</span></div>
+    <p class="p-what">Agent 会持久化、会跨用户、会被外部输入注入——安全边界要在每一层都设防。</p>
+    <div class="p-how"><ul>
+      <li>越权返回 <strong>404 而非 403</strong>（防枚举）；「不是你的当不存在」。</li>
+      <li><code>AUTO</code> 哨兵三态：区分「没指定（推断）」vs「显式 None（不过滤）」——用专属类型当默认值。</li>
+      <li>config 加固多层：剥 <code>__</code> 前缀私钥、一次性 token 只进 <code>context</code> 不进 <code>configurable</code>、身份「先清后写」。</li>
+      <li>先鉴权后建 run；脱敏副本与活 config 两条路分开。</li>
+    </ul></div>
+  </div>
+
+  <div class="principle">
+    <div class="p-head"><span class="p-num" style="background:var(--c-optional);">10</span><span class="p-title">可选性设计：可选功能诚实不可用</span></div>
+    <p class="p-what">不是所有功能都同等重要，可用性边界要显式表达。</p>
+    <div class="p-how"><ul>
+      <li>核心功能（run_store）没 DB 也给内存兜底；可选功能（feedback）没 DB 就显式 <code>None</code> + 503——<strong>宁可诚实报不可用，也不假装可用丢数据</strong>。</li>
+      <li>这是产品取舍在工程层的体现，和「重要资源必须活得久」是同一枚硬币的两面。</li>
+    </ul></div>
+  </div>
+
+  <div class="callout">
+    <b>方法论层面的启示：</b>九篇文档每篇都遵循同一套写作/设计范式——先写一段「朴素写法」的反面教材，再把它在真实世界里必然翻车的点逐个列成 6 个「麻烦」，最后给每个麻烦一个机制。
+    这种「从反模式出发」的推导，比「从抽象原则出发」更落地：它强迫你把「为什么不能简单点」想清楚，而 Agent 系统的复杂度，恰恰就藏在这些「看似能简单点」的地方。
+  </div>
+</section>
+
+<!-- 7. 附录 -->
+<section id="appendix">
+  <h2><span class="no">07</span>附录：九篇文档速查</h2>
+  <p class="sub">一张表定位九篇文档与关键源码，方便回查。</p>
+
+  <table>
+    <tr><th>文档</th><th>主角</th><th>核心代码</th><th>一句话职责</th></tr>
+    <tr><td>start-run-deep-dive</td><td><code>start_run</code></td><td class="path">services.py:608-770</td><td>安全启动的编排阀门（6 件横切关注点）</td></tr>
+    <tr><td>run-agent-deep-dive</td><td><code>run_agent</code></td><td class="path">worker.py:246-719</td><td>驱动 graph、喂 chunk、判定成败、保证收尾</td></tr>
+    <tr><td>stream-bridge-deep-dive</td><td><code>StreamBridge</code></td><td class="path">deps.py:364</td><td>事件流分发（活流）：重连 / fan-out / 心跳 / 背压</td></tr>
+    <tr><td>run-manager-deep-dive</td><td><code>RunManager</code></td><td class="path">deps.py:365</td><td>执行 + 状态生命周期：注册表 / lease / 孤儿 / drain</td></tr>
+    <tr><td>get-checkpointer-deep-dive</td><td><code>checkpointer</code></td><td class="path">deps.py:366</td><td>存档持久化：后端选择 / 连接池 / 关机顺序</td></tr>
+    <tr><td>run-event-store-deep-dive</td><td><code>RunEventStore</code></td><td class="path">deps.py:367</td><td>事件历史（死档）：seq 单调 / 双层锁 / 四投影</td></tr>
+    <tr><td>get-feedback-repo-deep-dive</td><td><code>FeedbackRepository</code></td><td class="path">deps.py:368</td><td>可选功能的对照：隔离 / 幂等 / 防 N+1</td></tr>
+    <tr><td>lifespan-deep-dive</td><td><code>lifespan</code></td><td class="path">app.py:170-341</td><td>外总闸：持资源对象从 import/退出中解耦</td></tr>
+    <tr><td>langgraph-runtime-deep-dive</td><td><code>langgraph_runtime</code></td><td class="path">deps.py:222-343</td><td>内总闸：运行时单例的「造 → 挂 → 回收」</td></tr>
+  </table>
+
+  <p style="color:var(--dim); font-size:13px; margin-top:30px;">
+    生成自九篇源码深潜文档（<code>backend/docs/BACKEND_AGENT_DESIGN/</code>）的深度融合解读 · 关键行号均已对照源码核验 · 自包含单文件，无外部依赖。
+  </p>
+</section>
+
+</div>
+
+<button id="top" title="回到顶部">↑</button>
+
+<script>
+  const progress = document.getElementById('progress');
+  const topBtn = document.getElementById('top');
+  window.addEventListener('scroll', () => {
+    const h = document.documentElement;
+    progress.style.width = ((h.scrollTop / (h.scrollHeight - h.clientHeight)) * 100) + '%';
+    topBtn.classList.toggle('show', h.scrollTop > 600);
+  }, { passive: true });
+  topBtn.addEventListener('click', () => window.scrollTo({ top: 0, behavior: 'smooth' }));
+</script>
+
+</body>
+</html>
