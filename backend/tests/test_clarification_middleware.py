@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.graph.message import add_messages
 
 from deerflow.agents.middlewares.clarification_middleware import ClarificationMiddleware
@@ -674,6 +675,54 @@ class TestClarificationCommandIdempotency:
         assert merged[0].content == first_message.content
         assert merged[0].artifact == first_message.artifact
 
+    @staticmethod
+    def _turn(ai_message_id, call_id, question):
+        return AIMessage(
+            id=ai_message_id,
+            content="",
+            tool_calls=[{"name": "ask_clarification", "id": call_id, "args": {"question": question, "clarification_type": "missing_info"}}],
+        )
+
+    @staticmethod
+    def _result(middleware, messages, *, disabled):
+        call = messages[-1].tool_calls[0]
+        request = SimpleNamespace(
+            tool_call=call,
+            state={"messages": messages},
+            runtime=SimpleNamespace(context={"disable_clarification": True} if disabled else {}),
+        )
+        result = middleware.wrap_tool_call(request, lambda _req: pytest.fail("handler should not be called"))
+        return result if disabled else result.update["messages"][0]
+
+    @pytest.mark.parametrize("disabled", [False, True], ids=["interactive", "unattended"])
+    def test_retry_from_the_same_ai_message_keeps_its_message_id(self, middleware, disabled):
+        messages = [HumanMessage(content="Plan a trip"), self._turn("ai-1", "call_0", "Which city?")]
+
+        first = self._result(middleware, messages, disabled=disabled)
+        second = self._result(middleware, messages, disabled=disabled)
+
+        assert second.id == first.id
+        assert len(add_messages(add_messages(messages, [first]), [second])) == 3
+
+    @pytest.mark.parametrize("call_id", ["call_0", ""], ids=["reused-id", "missing-id"])
+    @pytest.mark.parametrize("disabled", [False, True], ids=["interactive", "unattended"])
+    def test_reused_call_id_in_a_later_turn_gets_its_own_message_id(self, middleware, call_id, disabled):
+        """Providers that number calls per response reuse ``call_0`` across turns."""
+        history = [HumanMessage(content="Plan a trip"), self._turn("ai-1", call_id, "Which city?")]
+        first = self._result(middleware, history, disabled=disabled)
+        history = add_messages(history, [first, HumanMessage(content="Seoul"), self._turn("ai-2", call_id, "Which city?")])
+
+        second = self._result(middleware, history, disabled=disabled)
+        merged = add_messages(history, [second])
+
+        assert second.id != first.id
+        # The earlier question stays in place and the new call gets its result.
+        assert [message.id for message in merged] == [merged[0].id, "ai-1", first.id, merged[3].id, "ai-2", second.id]
+        assert merged[2].content == first.content
+        if not disabled:
+            assert first.artifact["human_input"]["request_id"] == first.id
+            assert second.artifact["human_input"]["request_id"] == second.id
+
     def test_tool_message_model_dump_preserves_human_input_artifact(self, middleware):
         request = SimpleNamespace(
             tool_call={
@@ -729,6 +778,37 @@ class TestClarificationDisabled:
         result = middleware.wrap_tool_call(request, lambda _req: pytest.fail("handler should not be called"))
         assert "disabled" in result.content.lower()
         assert "proceed" in result.content.lower()
+
+    @pytest.mark.parametrize("mode", ["autonomous", "webhook", "scheduled"])
+    @pytest.mark.parametrize("async_path", [False, True])
+    def test_unattended_fallback_preserves_risk_and_authorization_boundaries(self, middleware, mode, async_path):
+        import asyncio
+
+        from langchain_core.messages import ToolMessage
+
+        request = self._request(runtime_context={"interaction_mode": mode})
+        request.tool_call["args"]["question"] = "May I delete the production database?"
+
+        async def handler(_req):
+            return pytest.fail("handler should not be called")
+
+        if async_path:
+            result = asyncio.run(middleware.awrap_tool_call(request, handler))
+        else:
+            result = middleware.wrap_tool_call(request, lambda _req: pytest.fail("handler should not be called"))
+
+        assert isinstance(result, ToolMessage)
+        assert result.artifact is None
+        assert result.tool_call_id == "call-clarify-1"
+        assert "low-risk" in result.content
+        assert "reversible" in result.content
+        assert "high-risk" in result.content
+        assert "irreversible" in result.content
+        assert "authorization" in result.content
+        assert "BLOCKED" in result.content
+        assert "missing decision" in result.content
+        assert "assumptions" in result.content
+        assert "carry out the requested action" not in result.content
 
     def test_disabled_async_path(self, middleware):
         request = self._request(runtime_context={"disable_clarification": True})
@@ -1038,6 +1118,41 @@ class TestDropParallelSiblingTools:
             {"type": "function_call", "name": "ask_clarification", "args": {"question": "q?"}},
         ]
         assert [tc["name"] for tc in patched.tool_calls] == ["ask_clarification"]
+
+    def test_keeps_openai_responses_clarification_block_matched_by_call_id(self, middleware):
+        # Responses blocks carry the fc_ item id in ``id`` and the tool-call id
+        # in ``call_id``; matching on ``id`` would drop the kept call's block.
+        clarify = {"type": "function_call", "id": "fc_1", "call_id": "c1", "name": "ask_clarification", "arguments": "{}"}
+        sibling = {"type": "function_call", "id": "fc_2", "call_id": "b1", "name": "bash", "arguments": "{}"}
+        msg = self._ai(
+            [
+                {"id": "c1", "name": "ask_clarification", "args": {"question": "q?"}},
+                {"id": "b1", "name": "bash", "args": {"command": "ls"}},
+            ],
+            content=[clarify, sibling],
+        )
+        patched = middleware.after_model({"messages": [msg]}, self._runtime())["messages"][0]
+        assert patched.content == [clarify]
+
+    def test_keeps_content_block_for_invalid_sibling_left_on_message(self, middleware):
+        # The invalid sibling stays on invalid_tool_calls and is answered by
+        # DanglingToolCallMiddleware, so its block must stay to pair with it.
+        content = [
+            {"type": "tool_use", "id": "c1", "name": "ask_clarification", "input": {"question": "q?"}},
+            {"type": "tool_use", "id": "b1", "name": "bash", "input": {"command": "ls"}},
+            {"type": "tool_use", "id": "w1", "name": "write_file", "input": {}},
+        ]
+        msg = self._ai(
+            [
+                {"id": "c1", "name": "ask_clarification", "args": {"question": "q?"}},
+                {"id": "b1", "name": "bash", "args": {"command": "ls"}},
+            ],
+            content=content,
+            invalid_tool_calls=[{"id": "w1", "name": "write_file", "args": "{", "error": "parse", "type": "invalid_tool_call"}],
+        )
+        patched = middleware.after_model({"messages": [msg]}, self._runtime())["messages"][0]
+        assert [block["id"] for block in patched.content] == ["c1", "w1"]
+        assert [tc["id"] for tc in patched.invalid_tool_calls] == ["w1"]
 
     def test_aafter_model_matches_sync(self, middleware):
         import asyncio

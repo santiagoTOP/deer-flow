@@ -1,5 +1,6 @@
 """Route-level authorization tests for the Gateway permission decorators."""
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -19,7 +20,9 @@ from app.gateway.authz import (
 from app.gateway.routers import runs, scheduled_tasks
 from deerflow.authz.provider import AuthzDecision, AuthzReason
 from deerflow.authz.rbac import RbacAuthorizationProvider
+from deerflow.config.app_config import AppConfig, pop_current_app_config, push_current_app_config
 from deerflow.config.authorization_config import AuthorizationConfig, AuthorizationProviderConfig
+from deerflow.config.sandbox_config import SandboxConfig
 
 
 class _RecordingProvider:
@@ -91,6 +94,13 @@ async def test_route_permissions_disabled_preserves_all_permissions(monkeypatch)
         Permissions.RUNS_CREATE,
         Permissions.RUNS_READ,
         Permissions.RUNS_CANCEL,
+        Permissions.MEMORY_READ,
+        Permissions.MEMORY_WRITE,
+        Permissions.AGENTS_READ,
+        Permissions.AGENTS_WRITE,
+        Permissions.PROJECTS_READ,
+        Permissions.PROJECTS_WRITE,
+        Permissions.PROJECTS_DELETE,
     ]
     cached.assert_not_called()
 
@@ -107,6 +117,13 @@ async def test_route_permissions_use_async_provider_and_trusted_principal(monkey
         Permissions.THREADS_WRITE,
         Permissions.RUNS_CREATE,
         Permissions.RUNS_READ,
+        Permissions.MEMORY_READ,
+        Permissions.MEMORY_WRITE,
+        Permissions.AGENTS_READ,
+        Permissions.AGENTS_WRITE,
+        Permissions.PROJECTS_READ,
+        Permissions.PROJECTS_WRITE,
+        Permissions.PROJECTS_DELETE,
     ]
     assert [(request.resource, request.action, request.target) for request in provider.requests] == [
         ("route", "read", Permissions.THREADS_READ),
@@ -115,6 +132,13 @@ async def test_route_permissions_use_async_provider_and_trusted_principal(monkey
         ("route", "create", Permissions.RUNS_CREATE),
         ("route", "read", Permissions.RUNS_READ),
         ("route", "cancel", Permissions.RUNS_CANCEL),
+        ("route", "read", Permissions.MEMORY_READ),
+        ("route", "write", Permissions.MEMORY_WRITE),
+        ("route", "read", Permissions.AGENTS_READ),
+        ("route", "write", Permissions.AGENTS_WRITE),
+        ("route", "read", Permissions.PROJECTS_READ),
+        ("route", "write", Permissions.PROJECTS_WRITE),
+        ("route", "delete", Permissions.PROJECTS_DELETE),
     ]
     principal = provider.requests[0].principal
     assert principal.user_id == "user-123"
@@ -137,6 +161,13 @@ async def test_route_permissions_fail_closed_denies_only_the_failed_permission(m
         Permissions.THREADS_DELETE,
         Permissions.RUNS_CREATE,
         Permissions.RUNS_READ,
+        Permissions.MEMORY_READ,
+        Permissions.MEMORY_WRITE,
+        Permissions.AGENTS_READ,
+        Permissions.AGENTS_WRITE,
+        Permissions.PROJECTS_READ,
+        Permissions.PROJECTS_WRITE,
+        Permissions.PROJECTS_DELETE,
     ]
 
 
@@ -154,6 +185,13 @@ async def test_route_permissions_fail_open_allows_the_failed_permission(monkeypa
         Permissions.RUNS_CREATE,
         Permissions.RUNS_READ,
         Permissions.RUNS_CANCEL,
+        Permissions.MEMORY_READ,
+        Permissions.MEMORY_WRITE,
+        Permissions.AGENTS_READ,
+        Permissions.AGENTS_WRITE,
+        Permissions.PROJECTS_READ,
+        Permissions.PROJECTS_WRITE,
+        Permissions.PROJECTS_DELETE,
     ]
 
 
@@ -171,6 +209,13 @@ async def test_route_permissions_fail_open_allows_the_failed_permission(monkeypa
                 Permissions.RUNS_CREATE,
                 Permissions.RUNS_READ,
                 Permissions.RUNS_CANCEL,
+                Permissions.MEMORY_READ,
+                Permissions.MEMORY_WRITE,
+                Permissions.AGENTS_READ,
+                Permissions.AGENTS_WRITE,
+                Permissions.PROJECTS_READ,
+                Permissions.PROJECTS_WRITE,
+                Permissions.PROJECTS_DELETE,
             ],
         ),
     ],
@@ -207,6 +252,44 @@ async def test_route_permissions_use_builtin_rbac_route_policy(monkeypatch):
     permissions = await resolve_route_permissions(_user(), is_internal=False)
 
     assert permissions == [Permissions.THREADS_READ, Permissions.RUNS_READ]
+
+
+@pytest.mark.asyncio
+async def test_route_permissions_read_config_in_a_worker_with_the_caller_context(monkeypatch):
+    """The config read runs off the loop thread and still sees a runtime config override."""
+    import app.gateway.authz as authz_module
+
+    monkeypatch.setattr(authz_module, "_route_provider_cache", {})
+    monkeypatch.setattr(authz_module, "_route_provider_config_id", None)
+    monkeypatch.setattr(authz_module, "_route_provider_config_sig", None)
+    read_threads: list[int] = []
+    read_config = authz_module._get_route_authorization_config
+
+    def recording_read():
+        read_threads.append(threading.get_ident())
+        return read_config()
+
+    monkeypatch.setattr(authz_module, "_get_route_authorization_config", recording_read)
+    override = AppConfig(
+        sandbox=SandboxConfig(use="deerflow.sandbox.local:LocalSandboxProvider"),
+        authorization=AuthorizationConfig(
+            enabled=True,
+            default_role="user",
+            provider=AuthorizationProviderConfig(
+                use="deerflow.authz.rbac:RbacAuthorizationProvider",
+                config={"roles": {"user": {"routes": {"allow": [Permissions.THREADS_READ]}}}},
+            ),
+        ),
+    )
+
+    push_current_app_config(override)
+    try:
+        permissions = await resolve_route_permissions(_user(), is_internal=False)
+    finally:
+        pop_current_app_config()
+
+    assert read_threads and threading.get_ident() not in read_threads
+    assert permissions == [Permissions.THREADS_READ]
 
 
 @pytest.mark.asyncio

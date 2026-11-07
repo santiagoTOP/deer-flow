@@ -422,6 +422,27 @@ class TestMessageRewrite:
         assert patched.content[-1]["type"] == "text"
         assert "safety-related signal" in patched.content[-1]["text"]
 
+    def test_drops_suppressed_calls_provider_tool_use_blocks(self):
+        mw = SafetyFinishReasonMiddleware()
+        call = _write_call()
+        state = {
+            "messages": [
+                _ai(
+                    content=[
+                        {"type": "text", "text": "partial answer"},
+                        {"type": "tool_use", "id": call["id"], "name": call["name"], "input": call["args"]},
+                    ],
+                    tool_calls=[call],
+                    response_metadata={"stop_reason": "refusal"},
+                )
+            ]
+        }
+
+        patched = mw.after_model(state, _runtime())["messages"][0]
+
+        assert [block["type"] for block in patched.content] == ["text", "text"]
+        assert "safety-related signal" in patched.content[-1]["text"]
+
     def test_idempotent_on_already_cleared_message(self):
         # Re-running the middleware on a message we already cleared must not
         # re-trigger (tool_calls is now empty → fast passthrough).
@@ -504,9 +525,9 @@ class TestDetectorWiring:
 class TestFromConfig:
     def test_default_config_uses_builtin_detectors(self):
         mw = SafetyFinishReasonMiddleware.from_config(SafetyFinishReasonConfig())
-        assert len(mw._detectors) == 3
+        assert len(mw._detectors) == 4
         names = {d.name for d in mw._detectors}
-        assert names == {"openai_compatible_content_filter", "anthropic_refusal", "gemini_safety"}
+        assert names == {"openai_compatible_content_filter", "openai_responses_content_filter", "anthropic_refusal", "gemini_safety"}
 
     def test_custom_detectors_loaded_via_reflection(self):
         cfg = SafetyFinishReasonConfig(

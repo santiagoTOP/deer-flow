@@ -26,6 +26,9 @@ class SubagentBatchRow(Base):
     max_running_items: Mapped[int] = mapped_column(Integer)
     max_attempts: Mapped[int] = mapped_column(Integer)
     execution_spec: Mapped[dict[str, Any]] = mapped_column(JSON)
+    continuation_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    continuation_status: Mapped[str | None] = mapped_column(String(24), nullable=True, index=True)
+    continuation_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -47,6 +50,8 @@ class SubagentBatchItemRow(Base):
     item_key: Mapped[str] = mapped_column(String(128))
     position: Mapped[int] = mapped_column(Integer)
     prompt: Mapped[str] = mapped_column(Text)
+    acceptance_criteria: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    acceptance_verdict: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String(24), index=True)
     attempt: Mapped[int] = mapped_column(Integer, default=0)
     lease_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -54,6 +59,7 @@ class SubagentBatchItemRow(Base):
     cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     model_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     result: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_artifact: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     result_preview: Mapped[str | None] = mapped_column(Text, nullable=True)
     result_truncated: Mapped[bool] = mapped_column(default=False)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -69,3 +75,12 @@ class SubagentBatchItemRow(Base):
         UniqueConstraint("batch_id", "position", name="uq_subagent_batch_items_position"),
         Index("ix_subagent_batch_items_claim", "status", "lease_expires_at", "batch_id"),
     )
+
+
+class SubagentBatchDependencyRow(Base):
+    __tablename__ = "subagent_batch_dependencies"
+
+    item_id: Mapped[str] = mapped_column(ForeignKey("subagent_batch_items.id", ondelete="CASCADE"), primary_key=True)
+    prerequisite_id: Mapped[str] = mapped_column(ForeignKey("subagent_batch_items.id", ondelete="CASCADE"), primary_key=True)
+
+    __table_args__ = (Index("ix_subagent_batch_dependencies_prerequisite", "prerequisite_id"),)

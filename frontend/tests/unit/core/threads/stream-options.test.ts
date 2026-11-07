@@ -1,10 +1,12 @@
 import { afterEach, expect, test, rs } from "@rstest/core";
 
-async function captureThreadStreamOptions() {
+async function captureThreadStreamOptions(assistantId?: string) {
   let capturedOptions: Record<string, unknown> | undefined;
 
   rs.resetModules();
   rs.doMock("react", () => ({
+    createContext: () => ({}),
+    useContext: () => undefined,
     useCallback: <T extends (...args: never[]) => unknown>(callback: T) =>
       callback,
     useEffect: () => undefined,
@@ -27,7 +29,10 @@ async function captureThreadStreamOptions() {
       isLoading: false,
     }),
     useMutation: rs.fn(),
-    useQuery: rs.fn(),
+    useQuery: () => ({
+      data: [],
+      refetch: rs.fn(),
+    }),
     useQueryClient: () => ({
       invalidateQueries: rs.fn(),
       setQueriesData: rs.fn(),
@@ -53,6 +58,7 @@ async function captureThreadStreamOptions() {
       t: {
         pages: { newChat: "New chat" },
         uploads: { uploadingFiles: "Uploading files" },
+        inputBox: { runInputUnavailable: "The current Run is unavailable" },
       },
     }),
   }));
@@ -70,6 +76,7 @@ async function captureThreadStreamOptions() {
       context: {
         mode: "flash",
       },
+      assistantId,
       isMock: true,
     } as never);
     return null;
@@ -96,4 +103,10 @@ test("does not subscribe to unsupported LangGraph events mode", async () => {
   expect(options).not.toHaveProperty("onLangChainEvent");
   expect(options).toHaveProperty("onUpdateEvent");
   expect(options).toHaveProperty("onCustomEvent");
+});
+
+test("forwards the custom-agent assistant identity to the stream", async () => {
+  const options = await captureThreadStreamOptions("researcher");
+
+  expect(options).toHaveProperty("assistantId", "researcher");
 });

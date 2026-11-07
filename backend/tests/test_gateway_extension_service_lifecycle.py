@@ -53,6 +53,46 @@ def _patch_runtime_resources(monkeypatch, events: list[str]) -> None:
 
 
 @pytest.mark.asyncio
+async def test_host_capabilities_outlive_extension_stop_and_close_before_database(monkeypatch):
+    from app.gateway.deps import langgraph_runtime
+
+    events = []
+    _patch_runtime_resources(monkeypatch, events)
+    evidence, mutations = object(), object()
+
+    class Host:
+        def __init__(self, *args):
+            self.bindings = {"example:install": (evidence, mutations)}
+
+        async def start(self):
+            events.append("host_start")
+
+        async def close(self):
+            events.append("host_close")
+
+    class Service:
+        async def start(self, deps):
+            assert deps.completed_run_evidence is evidence
+            assert deps.skill_mutations is mutations
+            events.append("service_start")
+
+        async def stop(self):
+            events.append("service_stop")
+
+    monkeypatch.setattr("deerflow.extensions.host_capabilities.HostCapabilities", Host)
+    monkeypatch.setattr("deerflow.persistence.thread_meta.make_thread_store", lambda *_: (_ for _ in ()).throw(RuntimeError("later failure")))
+    registry = ExtensionRegistry()
+    with registry.attributed_to("example:install"):
+        registry.service(Service())
+    app = FastAPI()
+    app.state.extensions = registry.build()
+    with pytest.raises(RuntimeError, match="later failure"):
+        async with langgraph_runtime(app, SimpleNamespace(database=_database_config())):
+            pytest.fail("must not yield")
+    assert events == ["host_start", "service_start", "service_stop", "host_close", "engine_close"]
+
+
+@pytest.mark.asyncio
 async def test_runtime_owns_engine_cleanup_before_initialization(monkeypatch):
     from app.gateway.deps import langgraph_runtime
 
@@ -191,6 +231,74 @@ async def test_cancellation_during_service_start_propagates_after_cleanup(monkey
     task = asyncio.create_task(run_runtime())
     await asyncio.wait_for(blocking_start_entered.wait(), timeout=1.0)
     task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert events == [
+        "start:first",
+        "start:blocking",
+        "stop:blocking",
+        "stop:first",
+        "engine_close",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_host_cancellation_does_not_abandon_extension_service_shutdown(monkeypatch):
+    from app.gateway.deps import langgraph_runtime
+
+    events: list[str] = []
+    blocking_stop_entered = asyncio.Event()
+    allow_blocking_stop = asyncio.Event()
+
+    class _Service:
+        def __init__(self, name: str, *, block_stop: bool = False) -> None:
+            self.name = name
+            self.block_stop = block_stop
+
+        async def start(self, _deps) -> None:
+            events.append(f"start:{self.name}")
+
+        async def stop(self) -> None:
+            events.append(f"stop:{self.name}")
+            if self.block_stop:
+                blocking_stop_entered.set()
+                await allow_blocking_stop.wait()
+
+    registry = ExtensionRegistry()
+    with registry.attributed_to("first:install"):
+        registry.service(_Service("first"))
+    with registry.attributed_to("blocking:install"):
+        registry.service(_Service("blocking", block_stop=True))
+
+    _patch_runtime_resources(monkeypatch, events)
+    monkeypatch.setattr(
+        "deerflow.persistence.thread_meta.make_thread_store",
+        lambda _sf, _store: (_ for _ in ()).throw(RuntimeError("later startup failure")),
+    )
+    app = FastAPI()
+    app.state.extensions = registry.build()
+
+    async def run_runtime() -> None:
+        async with langgraph_runtime(
+            app,
+            SimpleNamespace(database=_database_config()),
+        ):
+            pytest.fail("runtime must not yield")
+
+    task = asyncio.create_task(run_runtime())
+    await asyncio.wait_for(blocking_stop_entered.wait(), timeout=1.0)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert not task.done(), "host cancellation abandoned extension shutdown"
+    assert "stop:first" not in events
+
+    allow_blocking_stop.set()
     with pytest.raises(asyncio.CancelledError):
         await task
 

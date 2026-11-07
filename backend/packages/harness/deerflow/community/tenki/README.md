@@ -13,7 +13,6 @@ sandbox:
   api_key: $TENKI_API_KEY   # falls back to TENKI_API_KEY / TENKI_AUTH_TOKEN env var
   base_url: https://tenki.cloud  # optional; SDK default when omitted
   image: my-base-image      # optional; Tenki account default base image when omitted
-  project_id: proj_...       # optional; auto-selected if the account has exactly one
   workspace_id: ws_...       # optional; auto-selected if the account has exactly one
   cpu_cores: 2               # optional per-sandbox vCPUs
   memory_mb: 2048            # optional per-sandbox memory
@@ -26,14 +25,21 @@ sandbox:
     PYTHONUNBUFFERED: "1"
 ```
 
+`sticky` also accepts an environment reference such as `sticky: $TENKI_STICKY`.
+Boolean strings are case-insensitive: `false`, `0`, `off`, and `no` disable host
+pinning; `true`, `1`, `on`, and `yes` enable it. Invalid boolean values are
+rejected when the provider loads its configuration. Omitted or `null` values
+keep pinning disabled.
+
 Install the optional SDK before selecting this provider:
 
 ```bash
 pip install "deerflow-harness[tenki]"
 ```
 
-The `tenki-sandbox` package is an optional DeerFlow harness extra, not part of
-the default install. Get an API key from <https://tenki.cloud/docs/sandbox/sdk>.
+The `tenki>=1.4.0` package (which provides the `tenki_sandbox` module) is an optional
+DeerFlow harness extra, not part of the default install. Get an API key from
+<https://tenki.cloud/docs/sandbox/sdk>.
 
 ## Design
 
@@ -61,6 +67,9 @@ API; directory and content search shell out and reuse `deerflow.sandbox.search`,
 mirroring `e2b_sandbox`:
 
 - `execute_command` — `sh -lc`, with per-call env and timeout.
+  Timed-out commands preserve partial output and report `Error: command timed out`
+  with `Exit Code: 124`, even if the SDK returned exit code zero. They are not
+  retried, and the sandbox remains available for subsequent commands.
 - `read_file` / `write_file` / `update_file` — native `fs.read_text` / `fs.mkdir` / `fs.write_stream` (binary-safe, streamed).
 - `download_file` — native `fs.read_stream`, restricted to the `/mnt/user-data` prefix; the 100 MB cap is enforced on bytes actually received, so a file growing mid-transfer cannot slip past it.
 - `list_dir` / `glob` / `grep` — `find` / `grep` with busybox-portable flags (the fs API is single-level and has no content search); results filtered/capped in Python and reported back under `/mnt/user-data`.
@@ -75,7 +84,31 @@ working via the remap.
 Warm-pool capacity is governed by `sandbox.replicas` across active + warm
 sandboxes. `sandbox.idle_timeout` controls how long released warm sandboxes stay
 running; `0` disables idle reaping. Active sandboxes are never evicted to satisfy
-the cap.
+the cap. Handles awaiting a failed termination also count toward capacity and
+cannot be reused. Idle sweeps retry their termination; with idle reaping disabled,
+call `shutdown()` again to retry cleanup.
+
+`reset()` retires the provider and parks its existing sandboxes; `shutdown()`
+permanently fences admission and requests termination. A synchronous SDK creation
+already in progress remains owned by its worker, which requests termination
+instead of publishing its late result. Shutdown raises an actionable `RuntimeError`
+while acquires or terminations remain outstanding; retry after the workers finish
+or the service recovers. An async caller cancelling its wait does not stop the
+SDK worker. If the provider remains open, the completed acquire can still be reused
+by the same scope. Accepted termination requests do not prove that a remote VM
+has physically stopped. Pending handles are process-local and do not survive a
+Gateway crash; cross-process orphan recovery remains outside this contract.
+The process-exit hook logs outstanding cleanup without an exception traceback;
+explicit `shutdown()` calls still raise so callers can retry.
+
+The warm-pool health probe accepts an exact `ok` line alongside login-shell
+profile output or stderr warnings. Timeout, nonzero-exit, and command-error
+diagnostics still prevent reuse. Failed probes log the sandbox ID and returned
+output before the unhealthy microVM is terminated and replaced.
+
+Terminal failures are bound to the adapter that issued the operation. If another
+operation already replaced that sandbox, a delayed failure from the old adapter
+cannot terminate its healthy replacement, whether active or waiting in the warm pool.
 
 ## Scope: stable features only
 
@@ -92,6 +125,6 @@ sandboxes left by a previous gateway process) and a preview-URL surface.
 Verified end-to-end against live Tenki sandboxes: provider resolution →
 `execute_command` → full file-op surface (`read`/`write`/`update`/`download`,
 `list_dir`/`glob`/`grep`) → warm-pool reclaim → terminate, plus the
-`/mnt/user-data` sudo symlink. Unit tests run in CI without `tenki-sandbox`
+`/mnt/user-data` sudo symlink. Unit tests run in CI without `tenki`
 installed; `test_integration_real_sandbox` exercises a real microVM when
 `TENKI_API_KEY` is set.

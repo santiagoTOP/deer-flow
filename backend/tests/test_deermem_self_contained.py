@@ -13,18 +13,21 @@ injected onto the updater so no network is needed.
 
 from __future__ import annotations
 
+import json
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 from deerflow.agents.memory.backends.deermem.deer_mem import DeerMem
+from deerflow.agents.memory.backends.deermem.deermem.core import storage as deermem_storage
 from deerflow.agents.memory.backends.deermem.deermem.core.message_processing import (
     filter_messages_for_memory,
 )
 from deerflow.agents.memory.backends.deermem.deermem.core.storage import FileMemoryStorage
-from deerflow.agents.memory.manager import MemoryCallbacks
+from deerflow.agents.memory.manager import MemoryCallbacks, MemoryCorruptionError
 
 
 @pytest.fixture
@@ -52,6 +55,25 @@ def _deermem_with_fake_llm(backend_config=None, payload=None, callbacks=None) ->
     dm._llm = fake
     dm._updater._llm = fake
     return dm
+
+
+def _legacy_alias_normalize_category(fact: dict) -> None:
+    """The pre-native-category ``storage._normalize_category``.
+
+    Historical builds parked any label outside CORE_CATEGORIES in
+    ``categoryExtension`` and stored ``category="other"``; migration-retry and
+    update-path regressions below replay data an interrupted such build left
+    behind, so the tests need the exact historical writer.
+    """
+    raw_category = fact.get("category", "context")
+    if not isinstance(raw_category, str):
+        raise ValueError("fact.category must be a string")
+    category = raw_category or "context"
+    if category not in deermem_storage.CORE_CATEGORIES:
+        fact.setdefault("categoryExtension", category)
+        fact["category"] = "other"
+    else:
+        fact["category"] = category
 
 
 def test_add_swallows_queue_full_so_backpressure_does_not_break_caller(deermem_data_dir, caplog) -> None:
@@ -210,6 +232,7 @@ def test_import_empty_summary_sections_replace_existing_summaries_with_complete_
         "workContext": {"summary": "", "updatedAt": ""},
         "personalContext": {"summary": "", "updatedAt": ""},
         "topOfMind": {"summary": "", "updatedAt": ""},
+        "cognitiveStyle": {"summary": "", "updatedAt": ""},
     }
     assert imported["history"] == {
         "recentMonths": {"summary": "", "updatedAt": ""},
@@ -536,6 +559,132 @@ def test_search_survives_non_float_confidence(deermem_data_dir):
     assert [r["id"] for r in results] == ["b", "a", "c"]
 
 
+def test_create_fact_category_round_trips_into_search_and_documents(deermem_data_dir):
+    """A non-core category label must survive the write and stay searchable.
+
+    Regression: ``storage._normalize_category`` rewrote every label outside
+    CORE_CATEGORIES to "other" (parking the original in a write-only
+    ``categoryExtension`` field), so a fact added via
+    ``memory_add(category="personal")`` -- an example label in the memory_add
+    docstring -- was persisted as "other", never matched
+    ``memory_search(category="personal")`` ("Only facts with this exact category
+    are returned"), and kept reporting "other" in get_memory documents.
+    """
+    dm = DeerMem(backend_config={"storage_path": str(deermem_data_dir)})
+    memory_data, fact_id = dm.create_fact(
+        "The user lives in Paris",
+        category="personal",
+        confidence=0.9,
+        user_id="u1",
+    )
+    assert fact_id is not None
+
+    assert next(f for f in memory_data["facts"] if f["id"] == fact_id)["category"] == "personal"
+    document = dm.get_memory(user_id="u1")
+    assert next(f for f in document["facts"] if f["id"] == fact_id)["category"] == "personal"
+
+    results = dm.search("Paris", top_k=10, user_id="u1", category="personal")
+    assert [f["id"] for f in results] == [fact_id]
+
+
+def test_interrupted_legacy_migration_retry_recovers_aliased_category(deermem_data_dir, monkeypatch):
+    """Regression: a migration interrupted after its Markdown commit recovers.
+
+    An older build (pre-native-category ``_normalize_category``) committed a
+    per-agent legacy JSON migration and stopped before deleting the JSON.  Its
+    Markdown fact holds ``category="other"`` + ``categoryExtension="personal"``
+    while the retained JSON holds ``category="personal"``.  The next build's
+    migration candidate keeps "personal" natively, so the retry must recognize
+    the alias as the same fact and finish recovery (delete the JSON) instead of
+    raising a migration conflict that fails every read and retry for the agent
+    (HTTP 500 at the Gateway).  A genuinely different label must still conflict.
+    """
+    dm = DeerMem(backend_config={"storage_path": str(deermem_data_dir)})
+    memory_path = dm._storage._get_memory_file_path("researcher", user_id="u1")
+    legacy_path = FileMemoryStorage._legacy_agent_memory_path(dm._storage, memory_path, "researcher")
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "version": "1.0",
+                "lastUpdated": "2026-09-01T00:00:00Z",
+                "user": {},
+                "history": {},
+                "facts": [
+                    {
+                        "id": "fact_interrupted_personal",
+                        "content": "The user's sister is called Lea",
+                        "category": "personal",
+                        "confidence": 0.9,
+                        "source": "manual",
+                        "createdAt": "2026-09-01T00:00:00Z",
+                        "revision": 1,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    retained = legacy_path.read_bytes()
+
+    native_normalize = deermem_storage._normalize_category
+    monkeypatch.setattr(deermem_storage, "_normalize_category", _legacy_alias_normalize_category)
+    dm.get_memory(agent_name="researcher", user_id="u1")  # the old Gateway commits the migration
+    legacy_path.write_bytes(retained)  # ... and stops before the unlink
+    monkeypatch.setattr(deermem_storage, "_normalize_category", native_normalize)
+
+    # The retry must complete recovery instead of raising a conflict.
+    document = dm.get_memory(agent_name="researcher", user_id="u1")
+    assert not legacy_path.exists()
+    fact = next(f for f in document["facts"] if f["id"] == "fact_interrupted_personal")
+    # The already-committed Markdown fact is adopted as-is, not rewritten.
+    assert (fact["category"], fact.get("categoryExtension")) == ("other", "personal")
+
+    # Recovery must not relax genuine conflicts: a retained JSON label that
+    # disagrees with the committed alias still stops the migration and keeps
+    # the legacy file for a human decision.
+    payload = json.loads(retained)
+    payload["facts"][0]["category"] = "work"
+    legacy_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(MemoryCorruptionError):
+        dm.get_memory(agent_name="researcher", user_id="u1")
+    assert legacy_path.exists()
+
+
+def test_update_legacy_aliased_fact_to_native_category_clears_extension(deermem_data_dir, monkeypatch):
+    """Regression: rewriting a legacy "other"+extension fact drops the stale extension.
+
+    ``_normalize_fact`` deep-copies every key, so a legacy fact persisted as
+    ``category="other"`` + ``categoryExtension="personal"`` that is updated to
+    the now-native ``category="personal"`` used to keep the stale extension --
+    contradicting the Gateway contract that the field is only set "when
+    category is 'other'".  The update must clear it, and the rewritten fact
+    must be findable by its native label.
+    """
+    dm = DeerMem(backend_config={"storage_path": str(deermem_data_dir)})
+    native_normalize = deermem_storage._normalize_category
+    monkeypatch.setattr(deermem_storage, "_normalize_category", _legacy_alias_normalize_category)
+    _, fact_id = dm.create_fact(
+        "The user's sister is called Lea",
+        category="personal",
+        agent_name="researcher",
+        user_id="u1",
+    )
+    monkeypatch.setattr(deermem_storage, "_normalize_category", native_normalize)
+
+    stored = next(f for f in dm.get_memory(agent_name="researcher", user_id="u1")["facts"] if f["id"] == fact_id)
+    assert (stored["category"], stored.get("categoryExtension")) == ("other", "personal")
+
+    updated = dm.update_fact(fact_id, category="personal", agent_name="researcher", user_id="u1")
+
+    fact = next(f for f in updated["facts"] if f["id"] == fact_id)
+    assert fact["category"] == "personal"
+    assert "categoryExtension" not in fact
+    assert fact["revision"] == 2
+    results = dm.search("sister", top_k=10, user_id="u1", agent_name="researcher", category="personal")
+    assert [f["id"] for f in results] == [fact_id]
+
+
 def test_query_search_records_access_but_default_injection_does_not(deermem_data_dir):
     dm = DeerMem(
         backend_config={
@@ -584,7 +733,13 @@ def test_default_confidence_policy_does_not_collect_hybrid_usage(deermem_data_di
     assert dm._storage.get_fact_usage(agent_name="__default__", user_id="u1") == {}
 
 
-def test_hybrid_capacity_keeps_recent_confirmation_over_stale_confidence(deermem_data_dir):
+@pytest.fixture
+def recent_fact_timestamp():
+    """Keep recent facts fresh regardless of when the eviction tests run."""
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def test_hybrid_capacity_keeps_recent_confirmation_over_stale_confidence(deermem_data_dir, recent_fact_timestamp):
     dm = DeerMem(
         backend_config={
             "storage_path": str(deermem_data_dir),
@@ -604,7 +759,7 @@ def test_hybrid_capacity_keeps_recent_confirmation_over_stale_confidence(deermem
                         "content": f"high {index}",
                         "category": "preference",
                         "confidence": 0.99,
-                        "createdAt": "2026-08-12T00:00:00Z",
+                        "createdAt": recent_fact_timestamp,
                     }
                     for index in range(8)
                 ],
@@ -621,7 +776,7 @@ def test_hybrid_capacity_keeps_recent_confirmation_over_stale_confidence(deermem
                     "category": "preference",
                     "confidence": 0.7,
                     "createdAt": "2025-01-01T00:00:00Z",
-                    "lastConfirmedAt": "2026-08-12T00:00:00Z",
+                    "lastConfirmedAt": recent_fact_timestamp,
                 },
             ],
         },
@@ -641,7 +796,7 @@ def test_hybrid_capacity_keeps_recent_confirmation_over_stale_confidence(deermem
     assert "stale_high" not in kept_ids
 
 
-def test_hybrid_import_applies_same_capacity_policy(deermem_data_dir):
+def test_hybrid_import_applies_same_capacity_policy(deermem_data_dir, recent_fact_timestamp):
     dm = DeerMem(
         backend_config={
             "storage_path": str(deermem_data_dir),
@@ -661,7 +816,7 @@ def test_hybrid_import_applies_same_capacity_policy(deermem_data_dir):
                         "content": f"high {index}",
                         "category": "preference",
                         "confidence": 0.99,
-                        "createdAt": "2026-08-12T00:00:00Z",
+                        "createdAt": recent_fact_timestamp,
                     }
                     for index in range(8)
                 ],
@@ -678,14 +833,14 @@ def test_hybrid_import_applies_same_capacity_policy(deermem_data_dir):
                     "category": "preference",
                     "confidence": 0.7,
                     "createdAt": "2025-01-01T00:00:00Z",
-                    "lastConfirmedAt": "2026-08-12T00:00:00Z",
+                    "lastConfirmedAt": recent_fact_timestamp,
                 },
                 {
                     "id": "new_context",
                     "content": "new useful context",
                     "category": "context",
                     "confidence": 0.8,
-                    "createdAt": "2026-08-12T00:00:00Z",
+                    "createdAt": recent_fact_timestamp,
                 },
             ],
         },
@@ -693,11 +848,12 @@ def test_hybrid_import_applies_same_capacity_policy(deermem_data_dir):
     )
 
     kept_ids = {fact["id"] for fact in memory["facts"]}
+    assert len(kept_ids) == 10
     assert "confirmed_recently" in kept_ids
     assert "stale_high" not in kept_ids
 
 
-def test_hybrid_capacity_reserves_correction_and_writes_audit(deermem_data_dir):
+def test_hybrid_capacity_reserves_correction_and_writes_audit(deermem_data_dir, recent_fact_timestamp):
     dm = DeerMem(
         backend_config={
             "storage_path": str(deermem_data_dir),
@@ -716,7 +872,7 @@ def test_hybrid_capacity_reserves_correction_and_writes_audit(deermem_data_dir):
                     "content": f"preference {index}",
                     "category": "preference",
                     "confidence": 0.99,
-                    "createdAt": "2026-08-12T00:00:00Z",
+                    "createdAt": recent_fact_timestamp,
                 }
                 for index in range(10)
             ],
@@ -739,7 +895,7 @@ def test_hybrid_capacity_reserves_correction_and_writes_audit(deermem_data_dir):
     assert "Never repeat this corrected behavior" not in audit_path.read_text()
 
 
-def test_confidence_policy_shadow_does_not_change_actual_selection(deermem_data_dir):
+def test_confidence_policy_shadow_does_not_change_actual_selection(deermem_data_dir, recent_fact_timestamp):
     dm = DeerMem(
         backend_config={
             "storage_path": str(deermem_data_dir),
@@ -755,7 +911,7 @@ def test_confidence_policy_shadow_does_not_change_actual_selection(deermem_data_
                 "content": f"high {index}",
                 "category": "preference",
                 "confidence": 0.99,
-                "createdAt": "2026-08-12T00:00:00Z",
+                "createdAt": recent_fact_timestamp,
             }
             for index in range(8)
         ],
@@ -772,7 +928,7 @@ def test_confidence_policy_shadow_does_not_change_actual_selection(deermem_data_
             "category": "preference",
             "confidence": 0.7,
             "createdAt": "2025-01-01T00:00:00Z",
-            "lastConfirmedAt": "2026-08-12T00:00:00Z",
+            "lastConfirmedAt": recent_fact_timestamp,
         },
     ]
     dm.import_memory({"user": {}, "history": {}, "facts": facts}, user_id="u1")
@@ -930,3 +1086,76 @@ def test_from_backend_config_null_values_do_not_warn_as_unknown(caplog):
     with caplog.at_level("WARNING", logger=cfg_logger):
         DeerMemConfig.from_backend_config({"model": None})
     assert not any("Unknown backend_config keys" in r.message for r in caplog.records)
+
+
+def test_apply_updates_cognitive_style_and_fact_category(deermem_data_dir) -> None:
+    dm = DeerMem(backend_config=None)
+    current_memory = dm.get_memory(user_id="cognitive-user")
+
+    result = dm._updater._apply_updates(
+        current_memory,
+        {
+            "user": {
+                "cognitiveStyle": {
+                    "summary": "Prefers conclusions first, then details.",
+                    "shouldUpdate": True,
+                    "scope": "user",
+                    "authority": "descriptive",
+                }
+            },
+            "newFacts": [
+                {
+                    "content": "User prefers conclusions before implementation details.",
+                    "category": "cognitive",
+                    "confidence": 0.92,
+                    "scope": "user",
+                    "durability": "durable",
+                    "authority": "descriptive",
+                }
+            ],
+        },
+        thread_id="thread-cognitive",
+    )
+
+    assert result["user"]["cognitiveStyle"]["summary"] == "Prefers conclusions first, then details."
+    assert result["user"]["cognitiveStyle"]["updatedAt"]
+    assert result["facts"][0]["category"] == "cognitive"
+    assert result["facts"][0]["source"] == "thread-cognitive"
+
+
+def test_import_memory_persists_normalized_legacy_payload(deermem_data_dir) -> None:
+    dm = DeerMem(backend_config=None)
+    legacy = {
+        "version": "1.0",
+        "lastUpdated": "",
+        "user": {},
+        "history": {},
+        "facts": [{"content": "User prefers conclusions first.", "category": "cognitive"}],
+    }
+
+    result = dm.import_memory(legacy, user_id="legacy-user")
+
+    assert result["user"]["cognitiveStyle"] == {"summary": "", "updatedAt": ""}
+    assert result["facts"][0]["id"].startswith("fact_")
+    assert result["facts"][0]["category"] == "cognitive"
+    assert result["facts"][0]["confidence"] == 0.5
+    assert result["facts"][0]["createdAt"] == ""
+    assert result["facts"][0]["source"] == "unknown"
+
+
+@pytest.mark.parametrize("facts", [[{"id": "keep", "content": "   "}], [None], {}, None, "missing", [{"id": "keep", "content": 42}], [{"id": "new", "content": "valid"}, {}]])
+def test_replacement_import_rejects_unrecoverable_facts_without_writes(deermem_data_dir, facts):
+    dm = DeerMem(backend_config=None)
+    before = dm.import_memory({"user": {}, "history": {}, "facts": [{"id": "keep", "content": "Saved preference"}]}, user_id="alice")
+    snapshot = {str(path.relative_to(deermem_data_dir)): path.read_bytes() for path in deermem_data_dir.rglob("*") if path.is_file()}
+
+    payload = {"user": {}, "history": {}, "facts": facts}
+    if facts == "missing":
+        payload.pop("facts")
+    with pytest.raises(ValueError, match="facts"):
+        dm.import_memory(payload, user_id="alice")
+
+    assert {str(path.relative_to(deermem_data_dir)): path.read_bytes() for path in deermem_data_dir.rglob("*") if path.is_file()} == snapshot
+    reloaded = DeerMem(backend_config=None).get_memory(user_id="alice")
+    assert reloaded["facts"] == before["facts"]
+    assert reloaded["revision"] == before["revision"]

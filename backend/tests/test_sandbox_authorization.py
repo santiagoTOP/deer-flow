@@ -1,7 +1,7 @@
 """Phase 3 sandbox-level authorization tests.
 
-Covers the ``authorize("sandbox", "execute")`` gate at the sandbox-acquisition
-entry point. When denied, a :class:`SandboxAuthorizationError` propagates up
+Covers the ``authorize("sandbox", "execute")`` gate at the sandbox-use entry
+point. When denied, a :class:`SandboxAuthorizationError` propagates up
 through the tool so the agent's tool-error handling returns a friendly message
 (RFC §9), rather than crashing the run.
 
@@ -13,7 +13,9 @@ and is called from:
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import asyncio
+import sys
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -22,7 +24,7 @@ from deerflow.authz.provider import AuthzDecision, AuthzReason
 from deerflow.authz.rbac import RbacAuthorizationProvider
 from deerflow.authz.sandbox_authz import authorize_sandbox_execution
 from deerflow.config.app_config import AppConfig
-from deerflow.config.authorization_config import AuthorizationConfig
+from deerflow.config.authorization_config import AuthorizationConfig, AuthorizationProviderConfig
 from deerflow.config.model_config import ModelConfig
 from deerflow.config.sandbox_config import SandboxConfig
 from deerflow.sandbox.exceptions import SandboxAuthorizationError
@@ -238,6 +240,34 @@ def test_ensure_sandbox_initialized_denies_on_authz_reject(monkeypatch):
     sandbox_provider.acquire.assert_not_called()
 
 
+def test_ensure_sandbox_initialized_rechecks_authz_for_reused_sandbox(monkeypatch):
+    """A persisted sandbox id must not outlive a revoked execute grant."""
+    from deerflow.sandbox import tools as sandbox_tools
+
+    provider = RbacAuthorizationProvider(roles={"user": {"sandbox": {"allow": []}}})
+    app_config = _make_app_config()
+    _enable_authz(app_config)
+    monkeypatch.setattr(
+        "deerflow.authz.sandbox_authz.resolve_authorization_provider",
+        lambda config: provider,
+    )
+    monkeypatch.setattr("deerflow.config.get_app_config", lambda: app_config)
+
+    sandbox_provider = MagicMock()
+    sandbox_provider.get.return_value = MagicMock()
+    monkeypatch.setattr(sandbox_tools, "get_sandbox_provider", lambda: sandbox_provider)
+    runtime = SimpleNamespace(
+        state={"sandbox": {"sandbox_id": "sbx-existing"}},
+        context={"thread_id": "t1", "user_id": "u1", "user_role": "user"},
+        config=None,
+    )
+
+    with pytest.raises(SandboxAuthorizationError):
+        sandbox_tools.ensure_sandbox_initialized(runtime)
+    sandbox_provider.get.assert_not_called()
+    sandbox_provider.acquire.assert_not_called()
+
+
 def test_ensure_sandbox_initialized_allows_on_authz_permit(monkeypatch):
     """ensure_sandbox_initialized proceeds to acquire on allow."""
     from deerflow.sandbox import tools as sandbox_tools
@@ -327,6 +357,59 @@ def test_authorize_sandbox_calls_provider_with_correct_request(monkeypatch):
 # via ensure_sandbox_initialized) to sync files. A role denied sandbox:execute
 # must not trigger sandbox allocation there; the primary operation (upload /
 # artifact edit) still succeeds with the sandbox sync skipped.
+
+
+def test_gateway_missing_client_keeps_infrastructure_error_lease():
+    from app.gateway.authz import try_acquire_sandbox_for_request
+    from deerflow.sandbox.lease import discard_sandbox_lease_manager
+
+    provider = MagicMock()
+    provider.acquire_async = AsyncMock(return_value="lost-after-acquire")
+    provider.get.return_value = None
+
+    async def go():
+        lease = await try_acquire_sandbox_for_request(None, provider, "thread-1", user_id="user-1", app_config=None)
+        assert lease.sandbox is None
+        assert lease.sandbox_id == "lost-after-acquire"
+        assert lease.denied is False
+        assert lease.owner_id is None
+        assert lease.provider is provider
+        await lease.release()
+        await lease.release()
+
+    try:
+        asyncio.run(go())
+        provider.release.assert_called_once_with("lost-after-acquire")
+    finally:
+        discard_sandbox_lease_manager(provider)
+
+
+@pytest.mark.parametrize("failure", ["acquire", "lookup", "rollback"])
+def test_gateway_client_lease_preserves_provider_errors(failure):
+    from app.gateway.authz import try_acquire_sandbox_for_request
+    from deerflow.sandbox.lease import discard_sandbox_lease_manager
+
+    error = RuntimeError(f"{failure} failed")
+    provider = MagicMock()
+    provider.acquire_async = AsyncMock(return_value="lost-after-acquire")
+    provider.get.return_value = None
+    if failure == "acquire":
+        provider.acquire_async.side_effect = error
+    elif failure == "lookup":
+        provider.get.side_effect = error
+    else:
+        provider.release.side_effect = error
+
+    try:
+        with pytest.raises(RuntimeError) as exc_info:
+            asyncio.run(try_acquire_sandbox_for_request(None, provider, "thread-1", user_id="user-1", app_config=None))
+        assert exc_info.value is error
+        if failure == "acquire":
+            provider.release.assert_not_called()
+        else:
+            provider.release.assert_called_once_with("lost-after-acquire")
+    finally:
+        discard_sandbox_lease_manager(provider)
 
 
 def _make_upload_app(monkeypatch, provider, *, fail_closed: bool = True):
@@ -531,7 +614,7 @@ def test_artifact_sandbox_sync_skipped_when_denied(monkeypatch, tmp_path):
     sandbox_provider.uses_thread_data_mounts = False
     sandbox_provider.acquire_async = AsyncMock(side_effect=AssertionError("must not acquire"))
     monkeypatch.setattr(artifacts_router, "get_sandbox_provider", lambda: sandbox_provider)
-    monkeypatch.setattr(artifacts_router, "resolve_thread_virtual_path", lambda _t, _p, user_id=None: tmp_path / "note.txt")
+    monkeypatch.setattr(artifacts_router, "resolve_outputs_confined_path", lambda _t, _p, user_id=None: tmp_path / "note.txt")
 
     from contextlib import asynccontextmanager
 
@@ -660,6 +743,299 @@ def test_ensure_sandbox_initialized_async_denies_on_authz_reject(monkeypatch):
     with pytest.raises(SandboxAuthorizationError):
         asyncio.run(sandbox_tools.ensure_sandbox_initialized_async(runtime))
     sandbox_provider.acquire_async.assert_not_called()
+
+
+def test_ensure_sandbox_initialized_async_rechecks_authz_for_reused_sandbox(monkeypatch):
+    """Async tool calls also re-check a revoked grant before sandbox reuse."""
+    from deerflow.sandbox import tools as sandbox_tools
+
+    provider = RbacAuthorizationProvider(roles={"user": {"sandbox": {"allow": []}}})
+    app_config = _make_app_config()
+    _enable_authz(app_config)
+    monkeypatch.setattr(
+        "deerflow.authz.sandbox_authz.resolve_authorization_provider",
+        lambda config: provider,
+    )
+    monkeypatch.setattr("deerflow.config.get_app_config", lambda: app_config)
+
+    sandbox_provider = MagicMock()
+    sandbox_provider.get.return_value = MagicMock()
+    sandbox_provider.acquire_async = AsyncMock(return_value="sbx-new")
+    monkeypatch.setattr(sandbox_tools, "get_sandbox_provider", lambda: sandbox_provider)
+    runtime = SimpleNamespace(
+        state={"sandbox": {"sandbox_id": "sbx-existing"}},
+        context={"thread_id": "t1", "user_id": "u1", "user_role": "user"},
+        config=None,
+    )
+    import asyncio
+
+    with pytest.raises(SandboxAuthorizationError):
+        asyncio.run(sandbox_tools.ensure_sandbox_initialized_async(runtime))
+    sandbox_provider.get.assert_not_called()
+    sandbox_provider.acquire_async.assert_not_called()
+
+
+def test_async_provider_is_constructed_on_running_event_loop(monkeypatch):
+    """A loop-affine custom provider must not be constructed in a worker."""
+    from deerflow.authz.sandbox_authz import authorize_sandbox_execution_async
+
+    provider_module = ModuleType("loop_affine_authz_test_provider")
+    constructed_on = []
+
+    class LoopAffineProvider:
+        name = "loop-affine"
+
+        def __init__(self):
+            self.loop = asyncio.get_running_loop()
+            constructed_on.append(self.loop)
+
+        def authorize(self, request):
+            return AuthzDecision(allow=True)
+
+        async def aauthorize(self, request):
+            assert asyncio.get_running_loop() is self.loop
+            return AuthzDecision(allow=True)
+
+        def filter_resources(self, principal, resource_type, candidates):
+            return list(candidates)
+
+    provider_module.LoopAffineProvider = LoopAffineProvider
+    monkeypatch.setitem(sys.modules, provider_module.__name__, provider_module)
+
+    app_config = _make_app_config()
+    app_config.authorization = AuthorizationConfig(
+        enabled=True,
+        fail_closed=True,
+        default_role="user",
+        provider=AuthorizationProviderConfig(use=f"{provider_module.__name__}:LoopAffineProvider"),
+    )
+
+    async def _run() -> None:
+        running_loop = asyncio.get_running_loop()
+        await authorize_sandbox_execution_async(context=_context(), app_config=app_config)
+        assert constructed_on == [running_loop]
+
+    asyncio.run(_run())
+
+
+def test_async_sandbox_tool_authorizes_once_via_async_provider(monkeypatch):
+    """One async tool invocation must make one async authorization decision."""
+    from deerflow.sandbox import tools as sandbox_tools
+
+    provider = MagicMock()
+    provider.authorize.return_value = AuthzDecision(allow=True)
+    provider.aauthorize = AsyncMock(return_value=AuthzDecision(allow=True))
+    app_config = _make_app_config()
+    _enable_authz(app_config)
+    monkeypatch.setattr(
+        "deerflow.authz.sandbox_authz.resolve_authorization_provider",
+        lambda config: provider,
+    )
+    monkeypatch.setattr("deerflow.config.get_app_config", lambda: app_config)
+
+    sandbox = MagicMock()
+    sandbox.list_dir.return_value = []
+    sandbox_provider = MagicMock()
+    sandbox_provider.get.return_value = sandbox
+    monkeypatch.setattr(sandbox_tools, "get_sandbox_provider", lambda: sandbox_provider)
+    monkeypatch.setattr(sandbox_tools, "is_local_sandbox", lambda runtime: False)
+    runtime = SimpleNamespace(
+        state={"sandbox": {"sandbox_id": "sbx-existing"}},
+        context={"thread_id": "t1", "user_id": "u1", "user_role": "user"},
+        config=None,
+    )
+
+    import asyncio
+
+    result = asyncio.run(
+        sandbox_tools.ls_tool.coroutine(
+            runtime=runtime,
+            description="list workspace",
+            path="/mnt/user-data/workspace",
+        )
+    )
+
+    assert result == "(empty)"
+    provider.aauthorize.assert_awaited_once()
+    provider.authorize.assert_not_called()
+
+
+def _composed_file_request(name, args, runtime, messages=()):
+    from langgraph.prebuilt.tool_node import ToolCallRequest
+
+    return ToolCallRequest(
+        tool_call={"name": name, "args": args, "id": f"call-{name}"},
+        tool=None,
+        state={"messages": list(messages)},
+        runtime=runtime,
+    )
+
+
+def _install_composed_file_authz(monkeypatch, *, allow=True):
+    from deerflow.sandbox import tools as sandbox_tools
+
+    provider = MagicMock()
+    provider.authorize.return_value = AuthzDecision(allow=allow)
+    provider.aauthorize = AsyncMock(return_value=AuthzDecision(allow=allow))
+    app_config = _make_app_config()
+    _enable_authz(app_config)
+    monkeypatch.setattr(
+        "deerflow.authz.sandbox_authz.resolve_authorization_provider",
+        lambda config: provider,
+    )
+    monkeypatch.setattr("deerflow.config.get_app_config", lambda: app_config)
+
+    sandbox = MagicMock()
+    sandbox.id = "sbx-existing"
+    sandbox_provider = MagicMock()
+    sandbox_provider.get.return_value = sandbox
+    monkeypatch.setattr(sandbox_tools, "get_sandbox_provider", lambda: sandbox_provider)
+    monkeypatch.setattr(sandbox_tools, "is_local_sandbox", lambda runtime: False)
+    runtime = SimpleNamespace(
+        state={"sandbox": {"sandbox_id": "sbx-existing"}},
+        context={"thread_id": "t1", "user_id": "u1", "user_role": "user"},
+        config=None,
+    )
+    return provider, sandbox, runtime
+
+
+@pytest.mark.parametrize("tool_name", ["read_file", "write_file", "str_replace"])
+def test_composed_sync_file_tool_authorizes_once(monkeypatch, tool_name):
+    """Read-before-write re-entry shares one synchronous provider decision."""
+    from langchain_core.messages import ToolMessage
+
+    from deerflow.agents.middlewares.read_before_write_middleware import ReadBeforeWriteMiddleware
+    from deerflow.sandbox import tools as sandbox_tools
+
+    provider, sandbox, runtime = _install_composed_file_authz(monkeypatch)
+    path = "/mnt/user-data/outputs/report.md"
+    middleware = ReadBeforeWriteMiddleware()
+    messages = ()
+
+    if tool_name == "read_file":
+        sandbox.read_file.return_value = "v1"
+        args = {"description": "read report", "path": path}
+
+        def handler(_request):
+            content = sandbox_tools.read_file_tool.func(runtime, args["description"], path)
+            return ToolMessage(content=content, tool_call_id="call-read_file", name="read_file")
+
+    elif tool_name == "write_file":
+        sandbox.read_file.side_effect = FileNotFoundError(path)
+        args = {"description": "write report", "path": path, "content": "v1"}
+
+        def handler(_request):
+            content = sandbox_tools.write_file_tool.func(runtime, args["description"], path, args["content"])
+            return ToolMessage(content=content, tool_call_id="call-write_file", name="write_file")
+
+    else:
+        import hashlib
+
+        sandbox.read_file.return_value = "v1"
+        args = {"description": "edit report", "path": path, "old_str": "v1", "new_str": "v2"}
+        read_mark = ToolMessage(content="v1", tool_call_id="prior-read", name="read_file")
+        read_mark.additional_kwargs["deerflow_read_mark"] = {
+            "path": path,
+            "hash": hashlib.sha256(b"v1").hexdigest(),
+        }
+        messages = (read_mark,)
+
+        def handler(_request):
+            content = sandbox_tools.str_replace_tool.func(runtime, args["description"], path, args["old_str"], args["new_str"])
+            return ToolMessage(content=content, tool_call_id="call-str_replace", name="str_replace")
+
+    result = middleware.wrap_tool_call(_composed_file_request(tool_name, args, runtime, messages), handler)
+
+    assert result.status != "error"
+    provider.authorize.assert_called_once()
+    provider.aauthorize.assert_not_called()
+
+
+@pytest.mark.parametrize("tool_name", ["read_file", "write_file", "str_replace"])
+def test_composed_async_file_tool_authorizes_once(monkeypatch, tool_name):
+    """Async gate, tool body, and read-mark worker share one async decision."""
+    import asyncio
+
+    from langchain_core.messages import ToolMessage
+
+    from deerflow.agents.middlewares.read_before_write_middleware import ReadBeforeWriteMiddleware
+    from deerflow.sandbox import tools as sandbox_tools
+
+    provider, sandbox, runtime = _install_composed_file_authz(monkeypatch)
+    path = "/mnt/user-data/outputs/report.md"
+    middleware = ReadBeforeWriteMiddleware()
+    messages = ()
+
+    if tool_name == "read_file":
+        sandbox.read_file.return_value = "v1"
+        args = {"description": "read report", "path": path}
+
+        async def handler(_request):
+            content = await sandbox_tools.read_file_tool.coroutine(runtime, args["description"], path)
+            return ToolMessage(content=content, tool_call_id="call-read_file", name="read_file")
+
+    elif tool_name == "write_file":
+        sandbox.read_file.side_effect = FileNotFoundError(path)
+        args = {"description": "write report", "path": path, "content": "v1"}
+
+        async def handler(_request):
+            content = await sandbox_tools.write_file_tool.coroutine(runtime, args["description"], path, args["content"])
+            return ToolMessage(content=content, tool_call_id="call-write_file", name="write_file")
+
+    else:
+        import hashlib
+
+        sandbox.read_file.return_value = "v1"
+        args = {"description": "edit report", "path": path, "old_str": "v1", "new_str": "v2"}
+        read_mark = ToolMessage(content="v1", tool_call_id="prior-read", name="read_file")
+        read_mark.additional_kwargs["deerflow_read_mark"] = {
+            "path": path,
+            "hash": hashlib.sha256(b"v1").hexdigest(),
+        }
+        messages = (read_mark,)
+
+        async def handler(_request):
+            content = await sandbox_tools.str_replace_tool.coroutine(runtime, args["description"], path, args["old_str"], args["new_str"])
+            return ToolMessage(content=content, tool_call_id="call-str_replace", name="str_replace")
+
+    result = asyncio.run(middleware.awrap_tool_call(_composed_file_request(tool_name, args, runtime, messages), handler))
+
+    assert result.status != "error"
+    provider.aauthorize.assert_awaited_once()
+    provider.authorize.assert_not_called()
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+def test_composed_write_authorization_deny_is_not_swallowed(monkeypatch, is_async):
+    """The gate's generic fail-open path must never turn an authz deny into allow."""
+    import asyncio
+
+    from deerflow.agents.middlewares.read_before_write_middleware import ReadBeforeWriteMiddleware
+
+    provider, sandbox, runtime = _install_composed_file_authz(monkeypatch, allow=False)
+    path = "/mnt/user-data/outputs/report.md"
+    args = {"description": "write report", "path": path, "content": "v1"}
+    request = _composed_file_request("write_file", args, runtime)
+    middleware = ReadBeforeWriteMiddleware()
+    handler = MagicMock(side_effect=AssertionError("denied handler must not run"))
+
+    if is_async:
+
+        async def async_handler(_request):
+            handler(_request)
+
+        result = asyncio.run(middleware.awrap_tool_call(request, async_handler))
+        provider.aauthorize.assert_awaited_once()
+        provider.authorize.assert_not_called()
+    else:
+        result = middleware.wrap_tool_call(request, handler)
+        provider.authorize.assert_called_once()
+        provider.aauthorize.assert_not_called()
+
+    assert result.status == "error"
+    assert "not permitted" in str(result.content).lower()
+    handler.assert_not_called()
+    sandbox.read_file.assert_not_called()
 
 
 def test_abefore_agent_deny_skips_acquisition(monkeypatch):

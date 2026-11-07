@@ -32,8 +32,8 @@ function normalizeDuration(value: unknown): number | undefined {
 /**
  * Locate the single UI position that owns each completed run's wall-clock
  * duration. The backend keeps the value on every AI message for compatibility,
- * but the UI treats it as run-scoped metadata and renders it after the last
- * visible group belonging to that run.
+ * but the UI treats it as run-scoped metadata owned by the last visible
+ * group belonging to that run.
  */
 export function getRunDurationDisplaysByGroupIndex(
   groups: MessageGroup[],
@@ -71,6 +71,27 @@ export function getRunDurationDisplaysByGroupIndex(
   }
 
   return displays;
+}
+
+const ISO_TIMEZONE_SUFFIX = /(?:Z|[+-]\d{2}:?\d{2})$/i;
+
+/**
+ * Parse a run's `created_at` into epoch milliseconds. The backend measures
+ * `turn_duration` from this timestamp and reads offset-less values as UTC, so
+ * the live elapsed time does the same instead of using the browser's zone.
+ */
+export function parseRunStartTime(createdAt: unknown): number | null {
+  if (typeof createdAt !== "string") {
+    return null;
+  }
+  const value = createdAt.trim();
+  if (!value) {
+    return null;
+  }
+  const time = Date.parse(
+    ISO_TIMEZONE_SUFFIX.test(value) ? value : `${value}Z`,
+  );
+  return Number.isFinite(time) ? time : null;
 }
 
 export function formatRunDuration(

@@ -36,6 +36,14 @@ def test_every_contract_kind_added_for_the_0_2_series_is_exported():
     import deerflow_extension_api as api
 
     for name in (
+        "ActionContext",
+        "BackendAction",
+        "BrowserModule",
+        "ModelTool",
+        "PluginToolResult",
+        "PluginContribution",
+        "SettingsField",
+        "ToolContext",
         "AgentAssemblyDescriptor",
         "AgentAssemblyObserver",
         "CompactionEvent",
@@ -68,5 +76,6 @@ def test_registry_protocol_declares_every_registration_method():
         "context_compaction_observer",
         "service",
         "routers",
+        "plugin",
     ):
         assert hasattr(ExtensionRegistry, method), f"ExtensionRegistry must declare {method}()"

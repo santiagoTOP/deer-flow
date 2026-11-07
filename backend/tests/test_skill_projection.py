@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -14,7 +16,14 @@ import pytest
 
 from deerflow.config.extensions_config import ExtensionsConfig, SkillStateConfig
 from deerflow.config.paths import Paths
-from deerflow.skills.projection import ensure_public_skill_projection, ensure_skill_projections, rebuild_skill_projections, skill_projection_mutation
+from deerflow.sandbox.middleware import SandboxMiddleware
+from deerflow.skills.projection import (
+    ensure_public_skill_projection,
+    ensure_skill_projections,
+    ensure_thread_skill_projection,
+    rebuild_skill_projections,
+    skill_projection_mutation,
+)
 from deerflow.skills.storage.user_scoped_skill_storage import UserScopedSkillStorage
 
 
@@ -225,6 +234,242 @@ def test_managed_integration_projection_is_filtered_per_user(projection_env) -> 
     bob_storage = UserScopedSkillStorage("bob", host_path=str(env.skills_root), app_config=env.config)
     bob_projection = rebuild_skill_projections(bob_storage)
     assert (bob_projection.integrations / "lark-cli" / "lark-doc" / "SKILL.md").is_file()
+
+
+def test_thread_projection_enforces_agent_allowlist_across_skill_categories(projection_env) -> None:
+    env = projection_env
+    _write_skill(env.skills_root / "public", "public-allowed")
+    _write_skill(env.skills_root / "public", "public-denied")
+    env.storage.write_custom_skill("custom-allowed", "SKILL.md", _skill_content("custom-allowed"))
+    env.storage.write_custom_skill("custom-denied", "SKILL.md", _skill_content("custom-denied"))
+    integration_root = env.paths.integration_skills_dir() / "provider"
+    _write_skill(integration_root, "integration-allowed")
+    _write_skill(integration_root, "integration-denied")
+
+    projected = ensure_thread_skill_projection(
+        env.storage,
+        "thread-1",
+        {"public-allowed", "custom-allowed", "integration-allowed"},
+    )
+
+    assert projected is not None
+    assert (projected.public / "public-allowed" / "SKILL.md").is_file()
+    assert not (projected.public / "public-denied").exists()
+    assert (projected.custom / "custom-allowed" / "SKILL.md").is_file()
+    assert not (projected.custom / "custom-denied").exists()
+    assert (projected.integrations / "provider" / "integration-allowed" / "SKILL.md").is_file()
+    assert not (projected.integrations / "provider" / "integration-denied").exists()
+
+
+def test_thread_projection_rejects_symlink_escape_to_omitted_skill(
+    projection_env,
+) -> None:
+    env = projection_env
+    allowed_file = _write_skill(env.skills_root / "public", "public-allowed")
+    _write_skill(env.skills_root / "public", "public-denied", "DENIED_MARKER")
+    leak = allowed_file.parent / "leak.md"
+    try:
+        leak.symlink_to(Path("..") / "public-denied" / "SKILL.md")
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink creation requires SeCreateSymbolicLinkPrivilege")
+        raise
+
+    with pytest.raises(ValueError, match="symlink escapes its package"):
+        ensure_thread_skill_projection(
+            env.storage,
+            "thread-symlink-escape",
+            {"public-allowed"},
+        )
+
+    root = env.paths.thread_skills_view_dir(
+        "thread-symlink-escape",
+        user_id="alice",
+    )
+    assert all(list((root / category).iterdir()) == [] for category in ("public", "custom", "legacy", "integrations"))
+    assert not (root / ".projection-manifest.json").exists()
+
+
+def test_thread_projection_exposes_only_effective_same_name_winner(
+    projection_env,
+) -> None:
+    env = projection_env
+    _write_skill(env.skills_root / "public", "shadowed-skill", "public copy")
+    env.storage.write_custom_skill(
+        "shadowed-skill",
+        "SKILL.md",
+        _skill_content("shadowed-skill", "custom copy"),
+    )
+
+    projected = ensure_thread_skill_projection(
+        env.storage,
+        "thread-shadowing",
+        {"shadowed-skill"},
+    )
+
+    assert projected is not None
+    assert not (projected.public / "shadowed-skill").exists()
+    custom_file = projected.custom / "shadowed-skill" / "SKILL.md"
+    assert custom_file.is_file()
+    assert "custom copy" in custom_file.read_text(encoding="utf-8")
+
+
+def test_thread_projection_enforces_allowlist_for_legacy_skills(
+    projection_env,
+) -> None:
+    env = projection_env
+    _write_skill(env.skills_root / "custom", "legacy-allowed")
+    _write_skill(env.skills_root / "custom", "legacy-denied")
+
+    projected = ensure_thread_skill_projection(
+        env.storage,
+        "thread-legacy",
+        {"legacy-allowed"},
+    )
+
+    assert projected is not None
+    assert (projected.legacy / "legacy-allowed" / "SKILL.md").is_file()
+    assert not (projected.legacy / "legacy-denied").exists()
+
+
+def test_thread_projection_intersects_agent_allowlist_with_deployment_state(
+    projection_env,
+) -> None:
+    env = projection_env
+    _write_skill(env.skills_root / "public", "deployment-disabled")
+    env.extensions.skills["deployment-disabled"] = SkillStateConfig(enabled=False)
+
+    projected = ensure_thread_skill_projection(
+        env.storage,
+        "thread-disabled",
+        {"deployment-disabled"},
+    )
+
+    assert projected is not None
+    assert not (projected.public / "deployment-disabled").exists()
+
+
+def test_empty_agent_allowlist_projects_no_business_skills(projection_env) -> None:
+    env = projection_env
+    _write_skill(env.skills_root / "public", "public-skill")
+    env.storage.write_custom_skill("custom-skill", "SKILL.md", _skill_content("custom-skill"))
+
+    projected = ensure_thread_skill_projection(env.storage, "thread-empty", set())
+
+    assert projected is not None
+    for category in (projected.public, projected.custom, projected.legacy, projected.integrations):
+        assert list(category.iterdir()) == []
+
+
+def test_unrestricted_thread_without_policy_keeps_shared_projection(
+    projection_env,
+) -> None:
+    env = projection_env
+
+    projected = ensure_thread_skill_projection(
+        env.storage,
+        "thread-unrestricted",
+        None,
+    )
+
+    assert projected is None
+    assert not env.paths.thread_skills_view_dir(
+        "thread-unrestricted",
+        user_id="alice",
+    ).exists()
+
+
+def test_unrestricted_run_reuses_existing_thread_mount_with_full_enabled_view(projection_env) -> None:
+    env = projection_env
+    _write_skill(env.skills_root / "public", "alpha")
+    _write_skill(env.skills_root / "public", "beta")
+
+    projected = ensure_thread_skill_projection(env.storage, "thread-switch", {"alpha"})
+    assert projected is not None
+    category_inodes = {category: getattr(projected, category).stat().st_ino for category in ("public", "custom", "legacy", "integrations")}
+    assert (projected.public / "alpha" / "SKILL.md").is_file()
+    assert not (projected.public / "beta").exists()
+
+    unrestricted = ensure_thread_skill_projection(env.storage, "thread-switch", None)
+
+    assert unrestricted == projected
+    assert (projected.public / "alpha" / "SKILL.md").is_file()
+    assert (projected.public / "beta" / "SKILL.md").is_file()
+    assert {category: getattr(projected, category).stat().st_ino for category in ("public", "custom", "legacy", "integrations")} == category_inodes
+
+
+def test_subagent_non_owner_preserves_restricted_lead_projection(
+    projection_env,
+    monkeypatch,
+) -> None:
+    env = projection_env
+    _write_skill(env.skills_root / "public", "allowed")
+    _write_skill(env.skills_root / "public", "omitted")
+    provider = SimpleNamespace(supports_agent_skill_isolation=True)
+    monkeypatch.setattr(
+        "deerflow.sandbox.middleware.get_sandbox_provider",
+        lambda: provider,
+    )
+    monkeypatch.setattr("deerflow.config.get_app_config", lambda: env.config)
+    monkeypatch.setattr(
+        "deerflow.skills.storage.get_or_new_user_skill_storage",
+        lambda *_args, **_kwargs: env.storage,
+    )
+
+    lead = SandboxMiddleware(available_skills={"allowed"})
+    projected = lead._prepare_agent_skill_projection(
+        "thread-delegation",
+        user_id="alice",
+    )
+    assert projected is not None
+    assert (projected.public / "allowed" / "SKILL.md").is_file()
+    assert not (projected.public / "omitted").exists()
+
+    subagent = SandboxMiddleware(
+        available_skills=None,
+        owns_agent_skill_projection=False,
+    )
+    assert (
+        subagent._prepare_agent_skill_projection(
+            "thread-delegation",
+            user_id="alice",
+        )
+        is None
+    )
+    assert (projected.public / "allowed" / "SKILL.md").is_file()
+    assert not (projected.public / "omitted").exists()
+
+
+def test_thread_projection_revokes_removed_skill_before_repopulation(projection_env, monkeypatch) -> None:
+    env = projection_env
+    _write_skill(env.skills_root / "public", "alpha")
+    _write_skill(env.skills_root / "public", "beta")
+    projected = ensure_thread_skill_projection(env.storage, "thread-update", {"alpha", "beta"})
+    assert projected is not None
+
+    from deerflow.skills import projection as projection_module
+
+    real_stage_skill = projection_module._stage_skill
+    staging_started = Event()
+    release_staging = Event()
+
+    def _delayed_stage_skill(*args, **kwargs):
+        if not staging_started.is_set():
+            staging_started.set()
+            assert release_staging.wait(timeout=5)
+        return real_stage_skill(*args, **kwargs)
+
+    monkeypatch.setattr(projection_module, "_stage_skill", _delayed_stage_skill)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        rebuild = executor.submit(ensure_thread_skill_projection, env.storage, "thread-update", {"alpha"})
+        assert staging_started.wait(timeout=5)
+        beta_was_revoked = not (projected.public / "beta").exists()
+        release_staging.set()
+        rebuild.result(timeout=5)
+
+    assert beta_was_revoked
+    assert (projected.public / "alpha" / "SKILL.md").is_file()
+    assert not (projected.public / "beta").exists()
 
 
 def test_disabling_custom_skill_hides_only_target_while_rebuilding(projection_env, monkeypatch) -> None:
@@ -505,7 +750,10 @@ def test_rebuild_failure_clears_old_projection(projection_env, monkeypatch) -> N
     replacement = source.with_suffix(".replacement")
     replacement.write_text(_skill_content("demo-skill", "after"), encoding="utf-8")
     replacement.replace(source)
-    monkeypatch.setattr("deerflow.skills.projection._stage_skill", lambda *_args: (_ for _ in ()).throw(OSError("disk full")))
+    monkeypatch.setattr(
+        "deerflow.skills.projection._stage_skill",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
 
     with pytest.raises(OSError, match="disk full"):
         ensure_skill_projections(env.storage)
@@ -673,3 +921,162 @@ def test_concurrent_custom_skill_toggles_do_not_lose_state(projection_env) -> No
         "skill-b": {"enabled": False},
     }
     assert list(env.paths.user_custom_skills_view_dir("alice").iterdir()) == []
+
+
+@pytest.mark.parametrize("permanent_error", [False, True])
+def test_projection_read_windows_lock_retries_only_contention(tmp_path, monkeypatch, permanent_error):
+    import errno
+
+    from deerflow.skills import projection
+
+    calls = []
+
+    class FakeMsvcrt:
+        LK_NBLCK = 2
+        LK_UNLCK = 0
+
+        @staticmethod
+        def locking(fd, operation, length):
+            calls.append(operation)
+            if operation == FakeMsvcrt.LK_NBLCK and len(calls) == 1:
+                raise OSError(errno.EBADF if permanent_error else errno.EACCES, "Lock unavailable")
+
+    monkeypatch.setattr(projection, "fcntl", None)
+    monkeypatch.setattr(projection, "msvcrt", FakeMsvcrt, raising=False)
+    storage = SimpleNamespace(user_id=None, get_skills_root_path=lambda: tmp_path)
+    if not permanent_error:
+        with projection.skill_projection_read_lock(storage, timeout=1):
+            assert calls == [FakeMsvcrt.LK_NBLCK] * 2
+        assert calls == [FakeMsvcrt.LK_NBLCK] * 2 + [FakeMsvcrt.LK_UNLCK]
+    else:
+        with pytest.raises(OSError) as caught:
+            with projection.skill_projection_read_lock(storage, timeout=1):
+                pytest.fail("Must not enter after a permanent lock error")
+        assert caught.value.errno == errno.EBADF
+        assert calls == [FakeMsvcrt.LK_NBLCK]
+
+
+def test_thread_projection_stays_fresh_when_view_metadata_drifts(projection_env) -> None:
+    """Identical bytes with new inodes/timestamps never trigger another copy."""
+    from deerflow.skills import projection as projection_module
+
+    env = projection_env
+    _write_skill(env.skills_root / "public", "alpha")
+    projected = ensure_thread_skill_projection(env.storage, "thread-view-drift", {"alpha"})
+    target = projected.public / "alpha" / "SKILL.md"
+    original = target.read_bytes()
+    with patch.object(projection_module, "_rebuild_thread_locked", wraps=projection_module._rebuild_thread_locked) as rebuild:
+        for offset in range(3):
+            replacement = target.with_suffix(".tmp")
+            replacement.write_bytes(original)
+            replacement.chmod(target.stat().st_mode)
+            replacement.replace(target)
+            os.utime(target, ns=(1_000_000_000 + offset, 2_000_000_000 + offset))
+            ensure_thread_skill_projection(env.storage, "thread-view-drift", {"alpha"})
+    assert not rebuild.called
+
+
+def test_thread_projection_rebuilds_when_a_source_skill_changes(projection_env) -> None:
+    from deerflow.skills import projection as projection_module
+
+    env = projection_env
+    _write_skill(env.skills_root / "public", "alpha", "v1")
+    allowed = {"alpha"}
+    ensure_thread_skill_projection(env.storage, "thread-source-change", allowed)
+
+    _write_skill(env.skills_root / "public", "alpha", "a longer replacement body")
+
+    with patch.object(
+        projection_module,
+        "_rebuild_thread_locked",
+        wraps=projection_module._rebuild_thread_locked,
+    ) as rebuild:
+        ensure_thread_skill_projection(env.storage, "thread-source-change", allowed)
+
+    assert rebuild.called
+
+
+@pytest.mark.parametrize("category", ["public", "custom", "legacy", "integrations"])
+def test_thread_view_instruction_tampering_is_repaired(projection_env, category) -> None:
+    env = projection_env
+    roots = {
+        "public": env.skills_root / "public",
+        "custom": env.storage.get_user_custom_root(),
+        "legacy": env.skills_root / "custom",
+        "integrations": env.paths.integration_skills_dir() / "provider",
+    }
+    source = _write_skill(roots[category], "alpha")
+    projected = ensure_thread_skill_projection(env.storage, "thread-tamper", {"alpha"})
+    relative = Path("provider/alpha/SKILL.md") if category == "integrations" else Path("alpha/SKILL.md")
+    target = getattr(projected, category) / relative
+    target.write_text("MUTATED\n", encoding="utf-8")
+
+    ensure_thread_skill_projection(env.storage, "thread-tamper", {"alpha"})
+
+    assert target.read_bytes() == source.read_bytes()
+
+
+@pytest.mark.parametrize("damage", ["overwrite", "delete", "inject_file", "inject_directory", "symlink", "fifo", "executable"])
+def test_thread_view_support_tampering_is_repaired(projection_env, damage) -> None:
+    env = projection_env
+    source = _write_skill(env.skills_root / "public", "alpha").parent
+    (source / "run.py").write_text("print('original')\n", encoding="utf-8")
+    (source / "run.py").chmod(0o755)
+    projected = ensure_thread_skill_projection(env.storage, "thread-support-tamper", {"alpha"})
+    package = projected.public / "alpha"
+    target = package / "run.py"
+    external = env.root / "external.txt"
+    external.write_text("outside the projection", encoding="utf-8")
+    if damage == "overwrite":
+        metadata = target.stat()
+        target.write_text("print('modified')\n", encoding="utf-8")
+        os.utime(target, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+    elif damage == "delete":
+        target.unlink()
+    elif damage == "inject_file":
+        (package / "injected.txt").write_text("injected", encoding="utf-8")
+    elif damage == "inject_directory":
+        (package / "injected").mkdir()
+    elif damage == "symlink":
+        target.unlink()
+        try:
+            target.symlink_to(external)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1314:
+                pytest.skip("Windows symlink creation requires SeCreateSymbolicLinkPrivilege")
+            raise
+    elif damage == "fifo":
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("FIFOs require POSIX")
+        target.unlink()
+        os.mkfifo(target)
+    elif damage == "executable":
+        if os.name == "nt":
+            pytest.skip("Windows chmod does not expose POSIX executable bits")
+        target.chmod(0o644)
+
+    ensure_thread_skill_projection(env.storage, "thread-support-tamper", {"alpha"})
+
+    assert not target.is_symlink()
+    assert target.is_file()
+    assert target.read_bytes() == (source / "run.py").read_bytes()
+    assert sorted(path.name for path in package.iterdir()) == ["SKILL.md", "run.py"]
+    if os.name != "nt":
+        assert target.stat().st_mode & 0o111 == 0o111
+    assert external.read_text(encoding="utf-8") == "outside the projection"
+
+
+def test_thread_projection_upgrades_metadata_only_manifest(projection_env) -> None:
+    env = projection_env
+    source = _write_skill(env.skills_root / "public", "alpha")
+    projected = ensure_thread_skill_projection(env.storage, "thread-old-manifest", {"alpha"})
+    target = projected.public / "alpha" / "SKILL.md"
+    manifest_path = projected.public.parent / ".projection-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["view_signature"] = "old-metadata-only-signature"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    target.write_text("MUTATED\n", encoding="utf-8")
+
+    ensure_thread_skill_projection(env.storage, "thread-old-manifest", {"alpha"})
+
+    assert target.read_bytes() == source.read_bytes()

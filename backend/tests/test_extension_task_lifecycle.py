@@ -144,6 +144,66 @@ async def test_budget_exhaustion_mid_hook_logs_a_warning_not_a_traceback(caplog)
 
 
 @pytest.mark.asyncio
+async def test_budget_exhaustion_is_classified_without_a_clock_recheck(monkeypatch, caplog):
+    # ``BaseEventLoop._run_once`` runs a scheduled timeout up to one
+    # ``clock_resolution`` *early* (it compares each handle's ``_when`` against
+    # ``now + clock_resolution``), so on a coarse clock the budget can expire
+    # while ``loop.time()`` still sits strictly before ``deadline`` — the
+    # Windows behaviour in #6453. Freezing the clock the handler reads makes
+    # that race deterministic on every platform; the timeout itself still
+    # schedules against the real loop, exactly as it does in production.
+    class _FrozenClockLoop:
+        """Loop proxy whose ``time()`` never advances."""
+
+        def __init__(self, loop, frozen_at):
+            self._loop = loop
+            self._frozen_at = frozen_at
+
+        def time(self):
+            return self._frozen_at
+
+        def __getattr__(self, name):
+            return getattr(self._loop, name)
+
+    class _AsyncioWithFrozenLoop:
+        """The ``asyncio`` module, but reporting a frozen running loop."""
+
+        def __init__(self, module, loop):
+            self._module = module
+            self._loop = loop
+
+        def get_running_loop(self):
+            return self._loop
+
+        def __getattr__(self, name):
+            return getattr(self._module, name)
+
+    class _Hang:
+        async def on_task_stop(self, app_store, task_store, info, outcome):
+            await asyncio.sleep(10)
+
+    real_loop = asyncio.get_running_loop()
+    monkeypatch.setattr(
+        "deerflow.extensions.notify.asyncio",
+        _AsyncioWithFrozenLoop(asyncio, _FrozenClockLoop(real_loop, real_loop.time())),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="deerflow.extensions.notify"):
+        await notify_task_stop(
+            _extensions(_Hang()),
+            ExtensionData("task-1"),
+            _info(),
+            TaskOutcome.COMPLETED,
+            timeout=0.02,
+        )
+
+    records = [record for record in caplog.records if record.name == "deerflow.extensions.notify"]
+    assert [record.levelno for record in records] == [logging.WARNING]
+    assert "timed out" in records[0].getMessage()
+    assert records[0].exc_info is None
+
+
+@pytest.mark.asyncio
 async def test_contributor_timeout_error_before_budget_is_a_hook_failure(caplog):
     # A TimeoutError the contributor raises on its own is not budget
     # exhaustion; it stays classified as a hook failure.
@@ -187,9 +247,11 @@ class _RunRecorder(_Recorder):
 class _OkAgent:
     def __init__(self) -> None:
         self.runtime_context = None
+        self.runtime_task_store = None
 
     async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
         self.runtime_context = (config or {}).get("context")
+        self.runtime_task_store = self.runtime_context.get(EXTENSION_TASK_STORE_KEY)
         yield {"messages": []}
 
 
@@ -231,7 +293,7 @@ async def test_run_agent_uses_the_run_bound_snapshot_for_lifecycle_and_task_stor
         ("stop", record.run_id, "completed"),
     ]
     assert recorder.start_infos[0].agent_name == "custom-agent"
-    assert agent.runtime_context[EXTENSION_TASK_STORE_KEY] is recorder.start_stores[0]
+    assert agent.runtime_task_store is recorder.start_stores[0]
 
 
 @pytest.mark.asyncio
@@ -355,6 +417,116 @@ async def test_lead_stop_interrupt_is_deferred_until_final_cleanup():
 
     assert record.finalizing is False
     bridge.publish_end.assert_awaited_once_with(record.run_id)
+
+
+@pytest.mark.asyncio
+async def test_completion_cancellation_does_not_skip_survivor_after_rogue_stop_cancel():
+    completion_hook_entered = asyncio.Event()
+
+    async def _block_completion(_record):
+        completion_hook_entered.set()
+        await asyncio.wait_for(asyncio.Event().wait(), timeout=1)
+
+    class _Rogue:
+        async def on_task_stop(self, app_store, task_store, info, outcome):
+            raise asyncio.CancelledError()
+
+    survivor = _RunRecorder()
+    manager = RunManager()
+    record = await manager.create("thread-completion-cancel-rogue-stop")
+    bridge = _bridge()
+    task = asyncio.create_task(
+        run_agent(
+            bridge,
+            manager,
+            record,
+            ctx=RunContext(
+                checkpointer=InMemorySaver(),
+                extensions=_extensions(_Rogue(), survivor),
+                on_run_completed=_block_completion,
+            ),
+            agent_factory=lambda *, config: _OkAgent(),
+            graph_input={},
+            config={},
+        )
+    )
+
+    await asyncio.wait_for(completion_hook_entered.wait(), timeout=1)
+    task.cancel("first completion cancellation")
+
+    with pytest.raises(asyncio.CancelledError, match="first completion cancellation"):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert survivor.events[-1] == ("stop", record.run_id, "completed")
+    assert task.cancelling() == 0
+    assert record.finalizing is False
+    bridge.publish_end.assert_awaited_once_with(record.run_id)
+
+
+@pytest.mark.asyncio
+async def test_second_real_stop_cancellation_finishes_all_observers_and_cleanup():
+    class _CleanupTrackingRunManager(RunManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cleanup_calls: list[tuple[str, float]] = []
+
+        async def cleanup(self, run_id: str, *, delay: float = 300) -> None:
+            self.cleanup_calls.append((run_id, delay))
+
+    completion_hook_entered = asyncio.Event()
+    first_stop_entered = asyncio.Event()
+    release_first_stop = asyncio.Event()
+
+    async def _block_completion(_record):
+        completion_hook_entered.set()
+        await asyncio.Event().wait()
+
+    class _FirstStop(_RunRecorder):
+        async def on_task_stop(self, app_store, task_store, info, outcome):
+            await super().on_task_stop(app_store, task_store, info, outcome)
+            first_stop_entered.set()
+            await release_first_stop.wait()
+
+    first = _FirstStop()
+    second = _RunRecorder()
+    manager = _CleanupTrackingRunManager()
+    record = await manager.create("thread-double-finalization-cancel")
+    bridge = _bridge()
+    task = asyncio.create_task(
+        run_agent(
+            bridge,
+            manager,
+            record,
+            ctx=RunContext(
+                checkpointer=InMemorySaver(),
+                extensions=_extensions(first, second),
+                on_run_completed=_block_completion,
+            ),
+            agent_factory=lambda *, config: _OkAgent(),
+            graph_input={},
+            config={},
+        )
+    )
+
+    await asyncio.wait_for(completion_hook_entered.wait(), timeout=1)
+    task.cancel("first completion cancellation")
+    await asyncio.wait_for(first_stop_entered.wait(), timeout=1)
+    task.cancel("second task-stop cancellation")
+    await asyncio.sleep(0)
+    release_first_stop.set()
+
+    with pytest.raises(asyncio.CancelledError, match="first completion cancellation"):
+        await asyncio.wait_for(task, timeout=1)
+    await asyncio.sleep(0)
+
+    expected = [("stop", record.run_id, "completed")]
+    assert first.events[-1:] == expected
+    assert second.events[-1:] == expected
+    assert task.cancelling() == 0
+    assert record.finalizing is False
+    bridge.publish_end.assert_awaited_once_with(record.run_id)
+    bridge.cleanup.assert_awaited_once_with(record.run_id, delay=60)
+    assert manager.cleanup_calls == [(record.run_id, 300)]
 
 
 @pytest.mark.asyncio

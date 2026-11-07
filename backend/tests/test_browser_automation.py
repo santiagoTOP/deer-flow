@@ -8,6 +8,8 @@ skipped automatically when Playwright (or its browser binary) is unavailable.
 from __future__ import annotations
 
 import asyncio
+import gc
+import ipaddress
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,7 +26,31 @@ from deerflow.community.browser_automation.session import (
     BrowserSessionManager,
     PageSnapshot,
     SnapshotElement,
+    browser_multi_worker_error,
 )
+
+
+@pytest.fixture(autouse=True)
+def isolated_worker_env(monkeypatch):
+    """Keep the suite independent of the invoking shell's worker count.
+
+    ``WEB_CONCURRENCY`` is a common ambient convention on uvicorn/gunicorn/PaaS hosts,
+    and either spelling now decides whether process-local browser sessions are refused.
+    The tests that exercise the refusal set the spelling they mean to exercise.
+    """
+    monkeypatch.delenv("GATEWAY_WORKERS", raising=False)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+
+
+@pytest.fixture
+def public_dns():
+    """Keep mocked tool calls offline while exercising the real URL safety check."""
+    with patch(
+        "deerflow.community.browser_automation.tools._resolve_host_addresses",
+        return_value=[ipaddress.ip_address("93.184.216.34")],
+    ):
+        yield
+
 
 PlaywrightTimeoutError = type(
     "TimeoutError",
@@ -69,6 +95,7 @@ class TestBrowserTools:
         manager.get_session.return_value = session
         return patch.object(tools, "get_browser_session_manager", return_value=manager), manager
 
+    @pytest.mark.usefixtures("public_dns")
     async def test_navigate_returns_snapshot(self):
         session = MagicMock()
         session.navigate = AsyncMock(return_value=_snapshot())
@@ -85,6 +112,7 @@ class TestBrowserTools:
         session.navigate.assert_awaited_once_with("https://example.com")
         manager.get_session.assert_called_once()
 
+    @pytest.mark.usefixtures("public_dns")
     async def test_navigate_emits_screenshot_artifact_and_browser_view(self, tmp_path):
         outputs = tmp_path / "outputs"
         outputs.mkdir()
@@ -112,6 +140,7 @@ class TestBrowserTools:
         assert meta["url"] == "https://example.com/"
         assert meta["title"] == "Example"
 
+    @pytest.mark.usefixtures("public_dns")
     async def test_navigate_screenshot_failure_does_not_break_action(self, tmp_path):
         outputs = tmp_path / "outputs"
         outputs.mkdir()
@@ -551,7 +580,7 @@ async def test_ensure_page_serializes_concurrent_rebuilds():
     browser.is_connected.return_value = True
     browser.new_context = AsyncMock(return_value=context)
 
-    async def launch(*, headless):
+    async def launch(*, headless, proxy):
         launch_started.set()
         await release_launch.wait()
         return browser
@@ -574,9 +603,149 @@ async def test_ensure_page_serializes_concurrent_rebuilds():
         release_launch.set()
 
         assert await asyncio.wait_for(asyncio.gather(first, second), timeout=1.0) == [page, page]
-    chromium.launch.assert_awaited_once_with(headless=True)
+    chromium.launch.assert_awaited_once_with(headless=True, proxy=None)
     browser.new_context.assert_awaited_once()
     context.new_page.assert_awaited_once()
+
+
+@pytest.fixture
+def fake_playwright_api(monkeypatch):
+    """Lifecycle unit tests do not require the optional browser extra."""
+    async_api = ModuleType("playwright.async_api")
+    async_api.async_playwright = MagicMock()
+    playwright = ModuleType("playwright")
+    playwright.async_api = async_api
+    monkeypatch.setitem(sys.modules, "playwright", playwright)
+    monkeypatch.setitem(sys.modules, "playwright.async_api", async_api)
+
+
+@pytest.mark.parametrize("surviving_tab", [True, False])
+@pytest.mark.parametrize("cdp", [False, True])
+@pytest.mark.asyncio
+async def test_ensure_page_reuses_context_after_active_tab_closes(surviving_tab, cdp, fake_playwright_api):
+    """Closing an OAuth popup or the final tab must retain session storage."""
+    session = BrowserSession(MagicMock(), headless=True, timeout_ms=1000, viewport={"width": 1000, "height": 500})
+    closed = MagicMock()
+    closed.is_closed.return_value = True
+    page = MagicMock()
+    page.is_closed.return_value = False
+    focused = False
+
+    async def focus_page():
+        nonlocal focused
+        assert session._page is closed
+        await asyncio.sleep(0)
+        focused = True
+
+    page.bring_to_front = AsyncMock(side_effect=focus_page)
+    original_set_active_page = session._set_active_page
+
+    def adopt_page(target):
+        assert focused is not cdp
+        original_set_active_page(target)
+
+    session._set_active_page = MagicMock(side_effect=adopt_page)
+    context = MagicMock()
+    context.pages = [page] if surviving_tab else []
+    creation_started = asyncio.Event()
+    release_creation = asyncio.Event()
+
+    async def new_page():
+        creation_started.set()
+        await release_creation.wait()
+        return page
+
+    context.new_page = AsyncMock(side_effect=new_page)
+    browser = MagicMock()
+    browser.is_connected.return_value = True
+    browser.contexts = [context]
+    browser.new_context = AsyncMock(side_effect=AssertionError("discarded the existing context"))
+    session._browser = browser
+    session._connected_over_cdp = cdp
+    session._context = context
+    session._page = closed
+    session._request_guard_bound = True
+    session._page_listener_bound = True
+    session._playwright = MagicMock()
+
+    if surviving_tab:
+        assert await session._ensure_page() is page
+        context.new_page.assert_not_awaited()
+    else:
+        first = asyncio.create_task(session._ensure_page())
+        try:
+            # Await the operation too, so a broken implementation fails without
+            # stranding a caller while waiting for the creation signal.
+            signal = asyncio.create_task(creation_started.wait())
+            await asyncio.wait({first, signal}, return_when=asyncio.FIRST_COMPLETED)
+            if first.done():
+                await first
+            second = asyncio.create_task(session._ensure_page())
+            release_creation.set()
+            assert await asyncio.gather(first, second) == [page, page]
+        finally:
+            release_creation.set()
+            signal.cancel()
+            await asyncio.gather(first, signal, return_exceptions=True)
+        context.new_page.assert_awaited_once()
+
+    assert session._context is context
+    assert session._page is page
+    assert session._request_guard_bound is True
+    assert session._page_listener_bound is True
+    browser.new_context.assert_not_awaited()
+    context.on.assert_not_called()
+    session._set_active_page.assert_called_once_with(page)
+    if cdp:
+        page.bring_to_front.assert_not_awaited()
+    else:
+        page.bring_to_front.assert_awaited_once_with()
+
+
+@pytest.mark.parametrize("cdp", [False, True])
+@pytest.mark.asyncio
+async def test_ensure_page_rebinds_hooks_when_context_is_replaced(cdp, fake_playwright_api):
+    session = BrowserSession(
+        MagicMock(),
+        headless=True,
+        timeout_ms=1000,
+        viewport={"width": 1000, "height": 500},
+        cdp_url="http://127.0.0.1:9222" if cdp else None,
+        url_guard=lambda _url: None,
+    )
+    page = MagicMock()
+    page.is_closed.return_value = False
+    closed = MagicMock()
+    closed.is_closed.return_value = True
+    old_context = MagicMock()
+    context = MagicMock()
+    context.pages = [page] if cdp else []
+    context.new_page = AsyncMock(return_value=page)
+    context.route = AsyncMock()
+    browser = MagicMock()
+    browser.is_connected.return_value = True
+    browser.contexts = [context] if cdp else []
+    browser.new_context = AsyncMock(return_value=context)
+    session._browser = browser
+    session._context = old_context
+    session._page = closed
+    session._request_guard_bound = True
+    session._page_listener_bound = True
+    session._playwright = MagicMock()
+
+    assert await session._ensure_page() is page
+    context.on.assert_called_once()
+    event, on_page = context.on.call_args.args
+    assert event == "page"
+    popup = MagicMock()
+    on_page(popup)
+    assert session._page is popup
+    if cdp:
+        context.route.assert_not_awaited()
+        assert session._request_guard_bound is False
+    else:
+        context.route.assert_awaited_once()
+        assert session._request_guard_bound is True
 
 
 @pytest.mark.asyncio
@@ -866,9 +1035,20 @@ class TestSessionManager:
 
     async def test_get_session_rejects_runtime_multi_worker_browser_use(self, monkeypatch):
         monkeypatch.setenv("GATEWAY_WORKERS", "2")
+        monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
         manager = BrowserSessionManager()
 
         with pytest.raises(RuntimeError, match="process-local"):
+            manager.get_session("thread-a")
+
+    async def test_get_session_rejects_worker_count_from_the_uvicorn_fallback(self, monkeypatch):
+        # backend/Dockerfile and scripts/serve.sh start uvicorn with no --workers, so
+        # WEB_CONCURRENCY is what really decides the process count here too.
+        monkeypatch.delenv("GATEWAY_WORKERS", raising=False)
+        monkeypatch.setenv("WEB_CONCURRENCY", "2")
+        manager = BrowserSessionManager()
+
+        with pytest.raises(RuntimeError, match=r"WEB_CONCURRENCY=2 cannot enable agentic browser tools"):
             manager.get_session("thread-a")
 
     async def test_cdp_requires_explicit_unguarded_trust_opt_in(self):
@@ -932,7 +1112,60 @@ class TestSessionManager:
         assert session.active_refs == 0
 
 
-def test_resolve_session_always_reads_browser_navigate_config():
+@pytest.mark.parametrize(
+    ("gateway_workers", "web_concurrency", "expected"),
+    [
+        pytest.param(None, "4", 4, id="uvicorn-fallback-counts"),
+        pytest.param("2", None, 2, id="documented-knob-counts"),
+        pytest.param("1", "4", 1, id="documented-knob-wins-when-both-set"),
+        pytest.param("  ", "3", 3, id="blank-is-unset"),
+        pytest.param("abc", "4", 4, id="unparsable-knob-does-not-mask-the-fallback"),
+        pytest.param(None, None, 1, id="nothing-set"),
+        pytest.param(None, "auto", 1, id="uvicorn_rejects_it_so_stay_inert"),
+    ],
+)
+def test_worker_count_resolution_reads_both_spellings(monkeypatch, gateway_workers, web_concurrency, expected):
+    for name, value in (("GATEWAY_WORKERS", gateway_workers), ("WEB_CONCURRENCY", web_concurrency)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    assert session_mod._worker_count_from_env()[0] == expected
+
+
+def test_worker_count_error_names_the_variable_that_set_the_count(monkeypatch):
+    monkeypatch.delenv("GATEWAY_WORKERS", raising=False)
+    monkeypatch.setenv("WEB_CONCURRENCY", "4")
+
+    error = browser_multi_worker_error()
+
+    assert error is not None
+    assert error.startswith("WEB_CONCURRENCY=4 ")
+    assert "Set WEB_CONCURRENCY=1" in error
+
+
+def test_worker_count_error_names_the_fallback_for_a_passed_in_count(monkeypatch):
+    # The Gateway startup gate resolves the count and calls this with the number only;
+    # the refusal still has to name the knob the operator set, or its advice would
+    # silence the gate while uvicorn keeps starting the extra processes.
+    monkeypatch.delenv("GATEWAY_WORKERS", raising=False)
+    monkeypatch.setenv("WEB_CONCURRENCY", "4")
+
+    assert browser_multi_worker_error(4).startswith("WEB_CONCURRENCY=4 ")
+
+
+def test_worker_count_error_keeps_naming_the_documented_knob_when_passed_in(monkeypatch):
+    # With neither spelling in the environment there is nothing to attribute the count
+    # to, so a passed-in number keeps naming GATEWAY_WORKERS as it always has.
+    monkeypatch.delenv("GATEWAY_WORKERS", raising=False)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+
+    assert browser_multi_worker_error(3).startswith("GATEWAY_WORKERS=3 ")
+
+
+@pytest.mark.asyncio
+async def test_resolve_session_always_reads_browser_navigate_config():
     """Launch config is deterministic regardless of which tool runs first.
 
     ``get_session`` caches per thread and ignores launch params for later
@@ -958,7 +1191,12 @@ def test_resolve_session_always_reads_browser_navigate_config():
         def get_session(self, thread_id, **kwargs):
             captured.update(kwargs)
             captured["thread_id"] = thread_id
-            return MagicMock()
+            session = MagicMock()
+            session.snapshot = AsyncMock(side_effect=RuntimeError("stop after launch"))
+            return session
+
+        def release_session(self, thread_id, session):
+            pass
 
     with (
         patch.object(tools, "_get_tool_config", lambda name: configs.get(name, {})),
@@ -966,7 +1204,7 @@ def test_resolve_session_always_reads_browser_navigate_config():
     ):
         # Even when a NON-navigate tool resolves the session, launch config comes
         # from browser_navigate.
-        tools._resolve_session(_runtime(), "browser_snapshot")
+        await tools.browser_snapshot_tool.coroutine(runtime=_runtime(), tool_call_id="call-1")
 
     assert captured["headless"] is False
     assert captured["timeout_ms"] == 12345
@@ -1011,6 +1249,47 @@ async def test_real_playwright_navigate_click_type():
     finally:
         await manager.close_session("it-thread")
         session_mod.reset_browser_session_manager()
+
+
+@pytest.mark.asyncio
+async def test_real_playwright_preserves_context_after_popup_closes():
+    """Real popup/tab closure keeps the opener, login cookie and local storage."""
+    pytest.importorskip("playwright.async_api")
+    session = BrowserSession(MagicMock(), headless=True, timeout_ms=5000, viewport={"width": 800, "height": 600})
+    try:
+        opener = await session._ensure_page()
+        context = session._context
+
+        async def app_page(route):
+            await route.fulfill(body="<title>Authenticated app</title><button>Continue</button>", content_type="text/html")
+
+        await context.route("https://app.example/**", app_page)
+        await session._navigate("https://app.example/home")
+        await opener.evaluate("localStorage.setItem('account', 'alice')")
+        async with context.expect_page() as popup_event:
+            await opener.evaluate("window.open('/login')")
+        popup = await popup_event.value
+        await popup.wait_for_load_state("domcontentloaded")
+        assert session._page is popup
+        await popup.evaluate("document.cookie = 'logged_in=yes; path=/'")
+        await popup.close()
+
+        tabs = await session._tabs()
+        assert [(tab.url, tab.active) for tab in tabs] == [("https://app.example/home", True)]
+        assert session._page is opener
+        assert session._context is context
+        assert len(session._browser.contexts) == 1
+        assert await opener.evaluate("localStorage.getItem('account')") == "alice"
+        assert any(cookie["name"] == "logged_in" for cookie in await context.cookies())
+
+        await opener.close()
+        replacement = await session._ensure_page()
+        assert session._context is context
+        await replacement.goto("https://app.example/home")
+        assert await replacement.evaluate("localStorage.getItem('account')") == "alice"
+        assert any(cookie["name"] == "logged_in" for cookie in await context.cookies())
+    finally:
+        await session._close()
 
 
 class _FakeRoute:
@@ -1124,3 +1403,51 @@ async def test_request_guard_not_installed_for_cdp_sessions():
     await session._install_request_guard()
     assert context.routed is False
     assert session._request_guard_bound is False
+
+
+@pytest.mark.parametrize(
+    ("schedule_attr", "coro_attr", "pending_attr"),
+    [
+        ("_schedule_settle_live_frames", "_settle_live_frames", "_settle_live_frames_pending"),
+        ("_schedule_input_live_frame", "_flush_input_live_frames", "_input_live_frame_pending"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_live_frame_schedulers_retain_task_reference(schedule_attr, coro_attr, pending_attr):
+    """Detached live-frame tasks must stay referenced until they finish.
+
+    The event loop only holds weak references to tasks, so an unreferenced task
+    can be collected before it runs. Both schedulers clear their ``*_pending``
+    guard in a ``finally`` block, so losing the task would strand the guard at
+    ``True`` and silently stop every later refresh for the session.
+    """
+    session = BrowserSession(
+        MagicMock(),
+        headless=True,
+        timeout_ms=1000,
+        viewport={"width": 1000, "height": 500},
+    )
+    release = asyncio.Event()
+
+    async def _blocked() -> None:
+        try:
+            await release.wait()
+        finally:
+            setattr(session, pending_attr, False)
+
+    setattr(session, coro_attr, _blocked)
+
+    getattr(session, schedule_attr)()
+    assert getattr(session, pending_attr) is True
+    assert len(session._background_tasks) == 1
+
+    # A weakly-referenced task would be collectable at this point.
+    gc.collect()
+    assert len(session._background_tasks) == 1
+
+    release.set()
+    await asyncio.gather(*session._background_tasks)
+    await asyncio.sleep(0)  # let the done callback run
+
+    assert session._background_tasks == set()
+    assert getattr(session, pending_attr) is False

@@ -9,6 +9,7 @@ import {
   sortPinnedThreads,
   textOfMessage,
   THREAD_PINNED_METADATA_KEY,
+  titleOfThread,
 } from "@/core/threads/utils";
 
 function makeThread(
@@ -58,11 +59,17 @@ test("uses provided context when pathOfThread is called with a thread id", () =>
   );
 });
 
-test("uses agent chat route when thread metadata has agent_name", () => {
+test("routes an IM-selected thread to its custom agent from search metadata", () => {
   expect(
     pathOfThread({
       thread_id: "thread-456",
-      metadata: { agent_name: "coder" },
+      // Thread-search results do not include run context. The channel manager
+      // therefore persists both its restart key and this canonical routing key.
+      metadata: {
+        channel_source: { type: "im_channel", provider: "telegram" },
+        channel_agent_name: "coder",
+        agent_name: "coder",
+      },
     }),
   ).toBe("/workspace/agents/coder/chats/thread-456");
 });
@@ -150,6 +157,14 @@ test("formats the Buzz channel source label", () => {
   });
 });
 
+test("formats the QQ channel source label", () => {
+  expect(
+    channelSourceOfThread({
+      metadata: { channel_source: { type: "im_channel", provider: "qq" } },
+    }),
+  ).toMatchObject({ provider: "qq", label: "QQ" });
+});
+
 test("ignores threads without valid IM channel source metadata", () => {
   expect(channelSourceOfThread({ metadata: {} })).toBeNull();
   expect(
@@ -199,4 +214,18 @@ test("textOfMessage returns null when array content has no text", () => {
   } as unknown as Message;
 
   expect(textOfMessage(message)).toBeNull();
+});
+
+test("titleOfThread falls back to the given label for an untitled thread", () => {
+  const untitled = {
+    thread_id: "t",
+    metadata: {},
+    values: {},
+  } as unknown as AgentThread;
+  expect(titleOfThread(untitled, "未命名")).toBe("未命名");
+  // Export filenames keep the English default.
+  expect(titleOfThread(untitled)).toBe("Untitled");
+  expect(titleOfThread(makeThread("Weekly report"), "未命名")).toBe(
+    "Weekly report",
+  );
 });

@@ -16,6 +16,10 @@ def _clear_langfuse_env(monkeypatch):
     for name in ("LANGFUSE_TRACING", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL", "DEER_FLOW_ENV", "ENVIRONMENT"):
         monkeypatch.delenv(name, raising=False)
     reset_tracing_config()
+    # These tests bypass route auth to exercise parsing and tracing. Model
+    # admission is covered through HTTP in test_suggestions_model_authorization.
+    monkeypatch.setattr(suggestions, "get_current_user_from_request", AsyncMock(return_value=SimpleNamespace()))
+    monkeypatch.setattr(suggestions, "authorize_model_use", lambda *_args, **_kwargs: None)
     yield
     reset_tracing_config()
 
@@ -42,23 +46,23 @@ def test_parse_json_string_list_rejects_non_list():
 
 def test_strip_think_blocks_removes_complete_block():
     text = "<think>\nreasoning here\n</think>\nanswer"
-    assert suggestions._strip_think_blocks(text) == "answer"
+    assert suggestions._strip_think_blocks_outside_json_strings(text) == "answer"
 
 
 def test_strip_think_blocks_is_case_insensitive():
     text = "<Think>reasoning</THINK>\nanswer"
-    assert suggestions._strip_think_blocks(text) == "answer"
+    assert suggestions._strip_think_blocks_outside_json_strings(text) == "answer"
 
 
 def test_strip_think_blocks_drops_unclosed_block():
     # Reasoning models truncated at max_tokens emit an unclosed <think>.
     text = "<think>\nreasoning that never finished because tokens ran out"
-    assert suggestions._strip_think_blocks(text) == ""
+    assert suggestions._strip_think_blocks_outside_json_strings(text) == ""
 
 
 def test_strip_think_blocks_keeps_text_without_think():
     text = '["a", "b"]'
-    assert suggestions._strip_think_blocks(text) == '["a", "b"]'
+    assert suggestions._strip_think_blocks_outside_json_strings(text) == '["a", "b"]'
 
 
 def test_parse_json_string_list_ignores_brackets_inside_think_block():

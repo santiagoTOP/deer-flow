@@ -16,31 +16,30 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
-from app.gateway.authz import require_permission, try_acquire_sandbox_for_request
+from app.gateway.authz import SandboxRequestLease, require_permission, try_acquire_sandbox_for_request
 from app.gateway.deps import get_run_manager
 from app.gateway.internal_auth import get_trusted_internal_owner_user_id
-from app.gateway.path_utils import resolve_thread_virtual_path
+from app.gateway.path_utils import normalize_outputs_virtual_path, resolve_outputs_confined_path, resolve_thread_virtual_path
 from deerflow.authz.sandbox_authz import safe_app_config
 from deerflow.config.paths import make_safe_user_id
 from deerflow.runtime import ConflictError, ThreadOperationKind
 from deerflow.runtime.user_context import get_effective_user_id
 from deerflow.sandbox.sandbox_provider import get_sandbox_provider
+from deerflow.utils.atomic_write import cleanup_failed_atomic_write
+from deerflow.utils.file_io import await_drained
+from deerflow.utils.text_detection import _is_active_content_mime_type, is_text_file_by_content
 from deerflow.utils.thread_id import ThreadId
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["artifacts"])
 
-ACTIVE_CONTENT_MIME_TYPES = {
-    "text/html",
-    "application/xhtml+xml",
-    "image/svg+xml",
-}
-
+# Active-content MIME classification (``_is_active_content_mime_type``) lives
+# in ``deerflow.utils.text_detection``, shared with the project-document shelf.
 MAX_SKILL_ARCHIVE_MEMBER_BYTES = 16 * 1024 * 1024
 _SKILL_ARCHIVE_READ_CHUNK_SIZE = 64 * 1024
 MAX_EDITABLE_ARTIFACT_BYTES = 2 * 1024 * 1024
-_EDITABLE_OUTPUTS_PREFIX = "mnt/user-data/outputs/"
+MAX_VIEWED_IMAGE_BLOB_BYTES = 20 * 1024 * 1024
 _ARTIFACT_EDIT_TEMP_PREFIX = ".artifact-edit-"
 
 
@@ -68,12 +67,15 @@ async def reserve_artifact_write(request: Request, thread_id: str, *, user_id: s
 
 
 def _normalize_editable_artifact_path(path: str) -> str:
-    stripped = path.lstrip("/")
-    if not stripped.startswith(_EDITABLE_OUTPUTS_PREFIX):
-        raise HTTPException(status_code=400, detail="Only files in /mnt/user-data/outputs can be edited")
-    if ".skill/" in stripped or stripped.endswith(".skill"):
+    # The outputs-only rule is shared with channel attachment delivery:
+    # ``normalize_outputs_virtual_path`` collapses ``..`` before its prefix check
+    # and ``resolve_outputs_confined_path`` re-checks the resolved host path, so
+    # neither an encoded ``..`` nor a symlink planted in ``outputs/`` can
+    # redirect the edit to a sibling ``user-data/`` directory.
+    virtual_path = normalize_outputs_virtual_path(path)
+    if ".skill/" in virtual_path or virtual_path.endswith(".skill"):
         raise HTTPException(status_code=415, detail="Skill archives cannot be edited in the artifacts panel")
-    return f"/{stripped}"
+    return virtual_path
 
 
 def _load_editable_artifact(actual_path: Path, path: str, expected_sha256: str) -> tuple[bytes, os.stat_result]:
@@ -88,7 +90,8 @@ def _load_editable_artifact(actual_path: Path, path: str, expected_sha256: str) 
     if file_stat.st_size > MAX_EDITABLE_ARTIFACT_BYTES:
         raise HTTPException(status_code=413, detail="Artifact is too large to edit")
 
-    current = actual_path.read_bytes()
+    with actual_path.open("rb") as handle:
+        current = handle.read(MAX_EDITABLE_ARTIFACT_BYTES + 1)
     if len(current) > MAX_EDITABLE_ARTIFACT_BYTES:
         raise HTTPException(status_code=413, detail="Artifact is too large to edit")
     if b"\x00" in current:
@@ -141,16 +144,42 @@ def _replace_artifact_atomically(actual_path: Path, content: bytes, file_stat: o
         # clearing the whole 256-entry LRU costs nothing (see PR review).
         _sha256_of_file_cached.cache_clear()
     finally:
-        if temp_fd >= 0:
-            os.close(temp_fd)
-        try:
-            temp_path.unlink()
-        except FileNotFoundError:
-            pass
+        # The helper keeps the published case silent (the temp name is already
+        # gone), warns when a leftover temp cannot be removed, and never lets a
+        # cleanup error replace the edit's outcome.
+        cleanup_failed_atomic_write(temp_path, temp_fd if temp_fd >= 0 else None)
 
 
 def _sync_artifact_to_sandbox(sandbox, virtual_path: str, content: bytes) -> None:
     sandbox.update_file(virtual_path, content)
+
+
+async def _commit_artifact_update(
+    *,
+    sandbox,
+    virtual_path: str,
+    actual_path: Path,
+    current: bytes,
+    updated: bytes,
+    file_stat: os.stat_result,
+) -> None:
+    """Keep remote/local artifact mutation ownership until commit or rollback."""
+    try:
+        if sandbox is not None:
+            await asyncio.to_thread(_sync_artifact_to_sandbox, sandbox, virtual_path, updated)
+        await asyncio.to_thread(_replace_artifact_atomically, actual_path, updated, file_stat)
+    except Exception:
+        # Non-cancelled failures are logged again by the outer route handler.
+        # Keep this inner log because await_drained re-raises caller cancellation
+        # after consuming the drained task's exception, which would otherwise make
+        # a cancelled-then-failed commit silent.
+        logger.exception("Failed to commit artifact update before rollback: %s", virtual_path)
+        if sandbox is not None:
+            try:
+                await asyncio.to_thread(_sync_artifact_to_sandbox, sandbox, virtual_path, current)
+            except Exception:
+                logger.exception("Failed to roll back remote artifact after artifact update failure: %s", virtual_path)
+        raise
 
 
 def _build_content_disposition(disposition_type: str, filename: str) -> str:
@@ -159,7 +188,9 @@ def _build_content_disposition(disposition_type: str, filename: str) -> str:
 
 
 def _build_attachment_headers(filename: str, extra_headers: dict[str, str] | None = None) -> dict[str, str]:
-    headers = {"Content-Disposition": _build_content_disposition("attachment", filename)}
+    # nosniff: a declared binary/document type must never be reinterpreted as
+    # HTML — the transport-level guarantee behind unsandboxed PDF preview.
+    headers = {"Content-Disposition": _build_content_disposition("attachment", filename), "X-Content-Type-Options": "nosniff"}
     if extra_headers:
         headers.update(extra_headers)
     return headers
@@ -208,17 +239,6 @@ def _slice_byte_range(content: bytes, range_header: str | None) -> tuple[bytes, 
         }
     )
     return ranged_content, 206, headers
-
-
-def is_text_file_by_content(path: Path, sample_size: int = 8192) -> bool:
-    """Check if file is text by examining content for null bytes."""
-    try:
-        with open(path, "rb") as f:
-            chunk = f.read(sample_size)
-            # Text files shouldn't contain null bytes
-            return b"\x00" not in chunk
-    except Exception:
-        return False
 
 
 def _read_skill_archive_member(zip_ref: zipfile.ZipFile, info: zipfile.ZipInfo) -> bytes:
@@ -305,7 +325,7 @@ def _read_artifact_payload(actual_path: Path, path: str, download: bool) -> tupl
         raise HTTPException(status_code=400, detail=f"Path is not a file: {path}")
     mime_type, _ = mimetypes.guess_type(actual_path)
     # Active content / explicit download is streamed by FileResponse — no read here.
-    if download or mime_type in ACTIVE_CONTENT_MIME_TYPES:
+    if download or _is_active_content_mime_type(mime_type):
         return ("file", mime_type)
     if mime_type and mime_type.startswith("text/"):
         return ("inline_file", mime_type)
@@ -322,22 +342,53 @@ def _sha256_of_file(path: Path) -> str:
     (e.g. http://<lan-ip>:<port>) and otherwise breaks artifact preview +
     inline editing (see issue #4864).
 
-    The digest is cached by (path, mtime_ns, size) so the many small ``Range``
+    The digest is cached by path and file identity/change metadata so small ``Range``
     requests a browser issues while scrubbing/paginating a preview do not each
     re-hash a potentially huge artifact from scratch (raised in PR review).
     """
     stat = path.stat()
-    return _sha256_of_file_cached(str(path), stat.st_mtime_ns, stat.st_size)
+    # Sandbox syncs and other writers can atomically replace a same-size file
+    # while preserving its mtime. Identity separates those generations; ctime
+    # also invalidates in-place writes where the filesystem exposes change time.
+    return _sha256_of_file_cached(
+        str(path),
+        stat.st_dev,
+        stat.st_ino,
+        stat.st_ctime_ns,
+        stat.st_mtime_ns,
+        stat.st_size,
+    )
 
 
 @functools.lru_cache(maxsize=256)
-def _sha256_of_file_cached(path: str, mtime_ns: int, size: int) -> str:
-    """Cached SHA-256 of *path*; the size/mtime args invalidate stale entries."""
+def _sha256_of_file_cached(path: str, device: int, inode: int, ctime_ns: int, mtime_ns: int, size: int) -> str:
+    """Cached SHA-256 of *path*; metadata arguments separate file generations."""
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _artifact_etag(path: Path) -> str:
+    """Keep content revisions for editable files and metadata-only tags for large files."""
+    file_stat = path.stat()
+    if file_stat.st_size <= MAX_EDITABLE_ARTIFACT_BYTES:
+        return f'"{_sha256_of_file(path)}"'
+
+    # Do not read oversized artifacts just to validate a small byte range.
+    # The prefix keeps this opaque validator distinct from an editable SHA-256.
+    identity = f"{file_stat.st_dev}:{file_stat.st_ino}:{file_stat.st_ctime_ns}:{file_stat.st_mtime_ns}:{file_stat.st_size}"
+    return f'"stat-{hashlib.sha256(identity.encode("ascii")).hexdigest()}"'
+
+
+class _ArtifactFileResponse(FileResponse):
+    """Require an ETag to authorize conditional ranges of replaceable artifacts."""
+
+    def _should_use_range(self, http_if_range: str) -> bool:
+        # Sandbox syncs can preserve mtimes across replacements, so Last-Modified
+        # is not a strong validator. Date-form If-Range must return the full file.
+        return http_if_range == self.headers["etag"]
 
 
 @router.get(
@@ -359,7 +410,7 @@ async def get_artifact(thread_id: ThreadId, path: str, request: Request, downloa
 
     Returns:
         The file content as a FileResponse with appropriate content type:
-        - Active content (HTML/XHTML/SVG): Served as download attachment
+        - Active content (HTML and XML documents, including XHTML/SVG): Served as download attachment
         - Text files: Plain text with proper MIME type
         - Binary files: Inline display with download option
 
@@ -371,13 +422,13 @@ async def get_artifact(thread_id: ThreadId, path: str, request: Request, downloa
 
     Query Parameters:
         download (bool): If true, forces attachment download for file types that are
-            otherwise returned inline or as plain text. Active HTML/XHTML/SVG content
-            is always downloaded regardless of this flag.
+            otherwise returned inline or as plain text. Active HTML/XML content
+            (including XHTML and SVG) is always downloaded regardless of this flag.
 
     Example:
         - Get text file inline: `/api/threads/abc123/artifacts/mnt/user-data/outputs/notes.txt`
         - Download file: `/api/threads/abc123/artifacts/mnt/user-data/outputs/data.csv?download=true`
-        - Active web content such as `.html`, `.xhtml`, and `.svg` artifacts is always downloaded
+        - Active web content such as `.html`, `.xhtml`, `.svg`, and `.xml` artifacts is always downloaded
     """
     # Trusted internal callers may act on behalf of a thread's owner via the
     # owner-user-id header (honored only after the internal token validates).
@@ -405,7 +456,7 @@ async def get_artifact(thread_id: ThreadId, path: str, request: Request, downloa
         # Add cache headers to avoid repeated ZIP extraction (cache for 5 minutes)
         cache_headers = {"Cache-Control": "private, max-age=300"}
         download_name = Path(internal_path).name or actual_skill_path.stem
-        if download or mime_type in ACTIVE_CONTENT_MIME_TYPES:
+        if download or _is_active_content_mime_type(mime_type):
             return Response(content=content, media_type=mime_type or "application/octet-stream", headers=_build_attachment_headers(download_name, cache_headers))
 
         # Archive members are already bounded during extraction. Preserve byte
@@ -417,6 +468,7 @@ async def get_artifact(thread_id: ThreadId, path: str, request: Request, downloa
         inline_headers = {
             **cache_headers,
             **range_headers,
+            "X-Content-Type-Options": "nosniff",
             # Real SHA-256 so the browser can skip crypto.subtle (unavailable on
             # non-secure contexts) when previewing / editing artifacts (#4864).
             "ETag": f'"{hashlib.sha256(content).hexdigest()}"',
@@ -444,21 +496,22 @@ async def get_artifact(thread_id: ThreadId, path: str, request: Request, downloa
     # Offload path stat + MIME sniff (blocking filesystem IO). Every regular
     # artifact response is streamed by FileResponse; the worker only reports
     # disposition and media type.
-    kind, mime_type = await asyncio.to_thread(_read_artifact_payload, actual_path, path, download)
+    try:
+        kind, mime_type = await asyncio.to_thread(_read_artifact_payload, actual_path, path, download)
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+        blob_response = await _get_viewed_image_blob_response(thread_id, path, request, download=download)
+        if blob_response is not None:
+            return blob_response
+        raise
 
     if kind == "file":
         # Always force download for active content types to prevent script
         # execution in the application origin when users open generated artifacts.
         headers = {**_build_attachment_headers(actual_path.name)}
-        file_size = await asyncio.to_thread(lambda: actual_path.stat().st_size)
-        if file_size <= MAX_EDITABLE_ARTIFACT_BYTES:
-            # Real SHA-256 so the browser can skip crypto.subtle (unavailable
-            # on non-secure contexts) when previewing / editing artifacts (#4864).
-            # Skipped for oversized artifacts to avoid a full-file read on every
-            # GET / Range request (raised in review as a performance P1).
-            content_sha256 = await asyncio.to_thread(_sha256_of_file, actual_path)
-            headers["ETag"] = f'"{content_sha256}"'
-        return FileResponse(
+        headers["ETag"] = await asyncio.to_thread(_artifact_etag, actual_path)
+        return _ArtifactFileResponse(
             path=actual_path,
             filename=actual_path.name,
             media_type=mime_type,
@@ -467,23 +520,100 @@ async def get_artifact(thread_id: ThreadId, path: str, request: Request, downloa
 
     if kind == "inline_file":
         # FileResponse honors byte-Range requests for large text previews and
-        # media seeking without buffering the full artifact in the Gateway.
-        headers = {"Content-Disposition": _build_content_disposition("inline", actual_path.name)}
-        file_size = await asyncio.to_thread(lambda: actual_path.stat().st_size)
-        if file_size <= MAX_EDITABLE_ARTIFACT_BYTES:
-            # Real SHA-256 so the browser can skip crypto.subtle (unavailable
-            # on non-secure contexts) when previewing / editing artifacts (#4864).
-            # Skipped for oversized artifacts to avoid a full-file read on every
-            # GET / Range request (raised in review as a performance P1).
-            content_sha256 = await asyncio.to_thread(_sha256_of_file, actual_path)
-            headers["ETag"] = f'"{content_sha256}"'
-        return FileResponse(
+        headers = {"Content-Disposition": _build_content_disposition("inline", actual_path.name), "X-Content-Type-Options": "nosniff"}
+        headers["ETag"] = await asyncio.to_thread(_artifact_etag, actual_path)
+        return _ArtifactFileResponse(
             path=actual_path,
             media_type=mime_type,
             headers=headers,
         )
 
     raise AssertionError(f"Unhandled artifact response kind: {kind!r}")
+
+
+# Legacy local-file reads allow untracked threads. Shared checkpoint blobs must
+# recheck a surviving authorization record, including trusted internal owners.
+@require_permission("threads", "read", owner_check=True, require_existing=True)
+async def _get_viewed_image_blob_response(
+    thread_id: str,
+    path: str,
+    request: Request,
+    *,
+    download: bool,
+) -> Response | None:
+    """Resolve a checkpointed viewed-image blob when this Gateway lacks the file.
+
+    The checkpoint binds the content-addressed reference to the authorized
+    thread and virtual path. Metadata and bytes are revalidated before serving;
+    an absent or unusable reference leaves the normal artifact 404 in place.
+    """
+    from deerflow.storage import BlobRef, get_blob_store_if_enabled
+
+    virtual_path = f"/{path.lstrip('/')}"
+    try:
+        store = await asyncio.to_thread(get_blob_store_if_enabled)
+        if store is None:
+            return None
+
+        from app.gateway.services import build_thread_checkpoint_state_accessor
+
+        accessor, config = await build_thread_checkpoint_state_accessor(request, thread_id=thread_id)
+        snapshot = await accessor.aget(config)
+        values = getattr(snapshot, "values", None)
+        viewed_images = values.get("viewed_images") if isinstance(values, dict) else None
+        metadata = viewed_images.get(virtual_path) if isinstance(viewed_images, dict) else None
+        if metadata is None and isinstance(viewed_images, dict):
+            metadata = viewed_images.get(path)
+        if not isinstance(metadata, dict):
+            return None
+
+        expected_size = metadata.get("size")
+        expected_sha256 = metadata.get("sha256")
+        mime_type = metadata.get("mime_type")
+        if (
+            isinstance(expected_size, bool)
+            or not isinstance(expected_size, int)
+            or not 0 <= expected_size <= MAX_VIEWED_IMAGE_BLOB_BYTES
+            or not isinstance(expected_sha256, str)
+            or not isinstance(mime_type, str)
+            or not mime_type.startswith("image/")
+        ):
+            return None
+        # A cold mimetypes database stats/reads system files during its first lookup.
+        path_mime_type, _ = await asyncio.to_thread(mimetypes.guess_type, virtual_path)
+        if path_mime_type != mime_type:
+            return None
+        blob_ref_data = metadata.get("blob_ref")
+        if not isinstance(blob_ref_data, dict):
+            return None
+        blob_ref = BlobRef.model_validate(blob_ref_data)
+        if blob_ref.kind != "viewed-image" or blob_ref.sha256 != expected_sha256 or blob_ref.size != expected_size or blob_ref.content_type != mime_type:
+            return None
+        content = await asyncio.to_thread(store.get_bytes, blob_ref)
+        if len(content) != expected_size or hashlib.sha256(content).hexdigest() != expected_sha256:
+            return None
+    except Exception as exc:
+        logger.warning("Could not resolve viewed-image blob for thread artifact (%s)", type(exc).__name__)
+        return None
+
+    etag = f'"{expected_sha256}"'
+    headers = {
+        "ETag": etag,
+        "X-Content-Type-Options": "nosniff",
+        "Accept-Ranges": "bytes",
+    }
+    if download or _is_active_content_mime_type(mime_type):
+        headers.update(_build_attachment_headers(Path(virtual_path).name, headers))
+    else:
+        headers["Content-Disposition"] = _build_content_disposition("inline", Path(virtual_path).name)
+
+    range_header = request.headers.get("range") if request is not None else None
+    if_range = request.headers.get("if-range") if request is not None else None
+    if if_range and if_range != etag:
+        range_header = None
+    ranged_content, status_code, range_headers = _slice_byte_range(content, range_header)
+    headers.update(range_headers)
+    return Response(content=ranged_content, status_code=status_code, media_type=mime_type, headers=headers)
 
 
 @router.put(
@@ -501,23 +631,22 @@ async def update_artifact(
 ) -> ArtifactUpdateResponse:
     """Update an existing text artifact while the thread has no active run.
 
-    The host-side artifact file is updated first; when the sandbox provider is
-    not thread-mounted, the new content is also synced into the thread's
-    sandbox. Under ``authorization.enabled``, a caller denied
-    ``sandbox:execute`` skips that sandbox sync (the host-side update still
-    completes).
+    For non-mounted providers, the sandbox copy is written before the host file
+    so a local replacement failure can restore the previous remote bytes. The
+    complete remote/local mutation is drained across caller cancellation before
+    either reservation is released. Under ``authorization.enabled``, a caller
+    denied ``sandbox:execute`` skips sandbox sync and updates only the host file.
     """
     virtual_path = _normalize_editable_artifact_path(path)
     raw_owner_user_id = get_trusted_internal_owner_user_id(request)
     effective_user_id = make_safe_user_id(raw_owner_user_id) if raw_owner_user_id else get_effective_user_id()
 
-    sandbox_provider = None
-    sandbox_id: str | None = None
+    sandbox_lease: SandboxRequestLease | None = None
     sandbox = None
     try:
         async with reserve_artifact_write(request, thread_id, user_id=effective_user_id):
             actual_path = await asyncio.to_thread(
-                resolve_thread_virtual_path,
+                resolve_outputs_confined_path,
                 thread_id,
                 virtual_path,
                 user_id=effective_user_id,
@@ -536,31 +665,32 @@ async def update_artifact(
                 # role skips the sandbox sync; the host-side artifact update
                 # still completes (the agent cannot consume the sandbox copy
                 # anyway when sandbox execution is denied).
-                sandbox, sandbox_id, sandbox_denied = await try_acquire_sandbox_for_request(
+                sandbox_lease = await try_acquire_sandbox_for_request(
                     request,
                     sandbox_provider,
                     thread_id,
                     user_id=effective_user_id,
                     app_config=safe_app_config(),
+                    owner_prefix="gateway:artifact",
                 )
-                if not sandbox_denied and sandbox is None:
+                sandbox = sandbox_lease.sandbox
+                if not sandbox_lease.denied and sandbox is None:
                     raise RuntimeError("Failed to acquire sandbox for artifact update")
 
-            try:
-                if sandbox is not None:
-                    await asyncio.to_thread(_sync_artifact_to_sandbox, sandbox, virtual_path, updated)
-                await asyncio.to_thread(_replace_artifact_atomically, actual_path, updated, file_stat)
-                # Invalidate any cached digest for this path so a subsequent GET
-                # serves the fresh SHA-256. The (path, mtime_ns, size) LRU key can
-                # collide on a same-size, sub-nanosecond re-write (review nit).
-                _sha256_of_file_cached.cache_clear()
-            except Exception:
-                if sandbox is not None:
-                    try:
-                        await asyncio.to_thread(_sync_artifact_to_sandbox, sandbox, virtual_path, current)
-                    except Exception:
-                        logger.exception("Failed to roll back remote artifact after artifact update failure: %s", virtual_path)
-                raise
+            # A cancelled request must not release the thread-operation reservation
+            # or sandbox request lease while either mutation is still running in a
+            # worker thread. Drain the complete remote/local transaction so it
+            # reaches a coherent commit or rollback before cancellation propagates.
+            await await_drained(
+                _commit_artifact_update(
+                    sandbox=sandbox,
+                    virtual_path=virtual_path,
+                    actual_path=actual_path,
+                    current=current,
+                    updated=updated,
+                    file_stat=file_stat,
+                )
+            )
     except ConflictError:
         raise HTTPException(status_code=409, detail="Thread has a run in flight. Save after the run finishes.") from None
     except HTTPException:
@@ -569,11 +699,15 @@ async def update_artifact(
         logger.exception("Failed to update artifact %s for thread %s", path, thread_id)
         raise HTTPException(status_code=500, detail="Failed to update artifact") from None
     finally:
-        if sandbox_id is not None and sandbox_provider is not None:
+        if sandbox_lease is not None:
             try:
-                await asyncio.to_thread(sandbox_provider.release, sandbox_id)
+                await sandbox_lease.release()
             except Exception:
-                logger.warning("Failed to release sandbox after artifact update: %s", sandbox_id, exc_info=True)
+                logger.warning(
+                    "Failed to release sandbox request lease after artifact update: %s",
+                    sandbox_lease.sandbox_id,
+                    exc_info=True,
+                )
 
     content_sha256 = hashlib.sha256(updated).hexdigest()
     return ArtifactUpdateResponse(

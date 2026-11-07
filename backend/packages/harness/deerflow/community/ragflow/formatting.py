@@ -2,16 +2,35 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import math
+from collections.abc import Callable, Mapping
 from typing import Any
 
+from deerflow.knowledge import KnowledgeCapabilities, KnowledgeSource, RetrievalHit, RetrievalResult
+from deerflow.knowledge.sources import truncate as _truncate
 
-def _truncate(value: str, max_chars: int, *, marker: str = "…") -> str:
-    if len(value) <= max_chars:
-        return value
-    if max_chars <= len(marker):
-        return marker[:max_chars]
-    return f"{value[: max_chars - len(marker)].rstrip()}{marker}"
+CAPABILITIES = KnowledgeCapabilities(operations=frozenset({"search", "sources", "catalog", "documents", "dataset_filter", "document_filter"}))
+
+
+def normalize_retrieval_result(result: Mapping[str, Any], *, dataset_names_by_id: Mapping[str, str]) -> RetrievalResult:
+    """Map public retrieval fields to attributable evidence, without locators."""
+    aggregates = _document_aggregates(result.get("doc_aggs"))
+    names = {str(item["doc_id"]): item["doc_name"] for item in aggregates if item.get("doc_id") and isinstance(item.get("doc_name"), str)}
+    hits = []
+    chunks = result.get("chunks")
+    for chunk in chunks if isinstance(chunks, list) else []:
+        if not isinstance(chunk, Mapping) or not isinstance(chunk.get("content"), str):
+            continue
+        content = chunk["content"].strip()
+        if not content:
+            continue
+        title = chunk.get("document_keyword") or names.get(str(chunk.get("document_id")))
+        source = None
+        if isinstance(title, str) and title.strip():
+            source = KnowledgeSource(provider="ragflow", title=title.strip()[:500], excerpt=content[:100_000], dataset_name=dataset_names_by_id.get(str(chunk.get("dataset_id"))))
+        score = _score(chunk.get("similarity"))
+        hits.append(RetrievalHit(content=content[:100_000], source=source, score=score if score is not None and math.isfinite(score) else None))
+    return RetrievalResult(hits=hits)
 
 
 def _document_aggregates(value: object) -> list[Mapping[str, Any]]:
@@ -94,3 +113,78 @@ def format_retrieval_result(
         return truncation_marker[:max_total_chars]
     prefix_length = max_total_chars - len(truncation_marker)
     return f"{formatted[:prefix_length].rstrip()}{truncation_marker}"
+
+
+def format_retrieval_sources(
+    result: Mapping[str, Any],
+    *,
+    dataset_names_by_id: Mapping[str, str],
+    max_chars_per_chunk: int = 800,
+    max_total_chars: int = 8000,
+    redact: Callable[[object], str] = str,
+) -> tuple[str, dict[str, Any] | None]:
+    """Pair model-visible citations with bounded, immutable retrieval snapshots.
+
+    Citation identifiers are independent of provider IDs and unique per call.
+    Only entries actually included in the text receive a source record; the
+    artifact retains the same excerpt the model saw, never an unbounded payload.
+    """
+    from uuid import uuid4
+
+    chunks = result.get("chunks")
+    if not isinstance(chunks, list):
+        return "No relevant content found.", None
+    call_id = uuid4().hex
+    aggregates = _document_aggregates(result.get("doc_aggs"))
+    names = {str(item["doc_id"]): str(item["doc_name"]) for item in aggregates if item.get("doc_id") and item.get("doc_name")}
+    entries: list[str] = []
+    sources: list[dict[str, Any]] = []
+    remaining = max_total_chars
+    for chunk in chunks[:100]:
+        if not isinstance(chunk, Mapping):
+            continue
+        dataset_id = chunk.get("dataset_id")
+        document_id = chunk.get("document_id")
+        chunk_id = chunk.get("id")
+        # Incomplete or out-of-scope locators must not become verified sources.
+        if not all(isinstance(value, str) and value and len(value) <= 256 for value in (dataset_id, document_id, chunk_id)):
+            continue
+        if dataset_id not in dataset_names_by_id:
+            continue
+        source_id = f"{call_id}-{len(sources) + 1}"
+        dataset_name = redact(dataset_names_by_id[dataset_id])[:512]
+        document_name = redact(str(chunk.get("document_keyword") or names.get(document_id) or "Unknown document"))[:512]
+        # Keep untrusted names outside the Markdown label to avoid link injection.
+        header = f"[citation:{len(sources) + 1}](#knowledge-{source_id}) {dataset_name} / {document_name}\n"
+        text = redact(str(chunk.get("content") or "").strip())
+        allowance = min(max_chars_per_chunk, remaining - len(header) - (2 if entries else 0))
+        if allowance < 1:
+            break
+        excerpt = _truncate(text, allowance)
+        entry = header + excerpt
+        entries.append(entry)
+        remaining -= len(entry) + (2 if len(entries) > 1 else 0)
+        positions = chunk.get("positions")
+        pages = (
+            sorted({position[0] for position in positions[:100] if isinstance(position, (list, tuple)) and position and isinstance(position[0], int) and not isinstance(position[0], bool) and 1 <= position[0] <= 1_000_000})
+            if isinstance(positions, list)
+            else []
+        )
+        sources.append(
+            {
+                "id": source_id,
+                "provider": "ragflow",
+                "dataset_id": redact(dataset_id),
+                "document_id": redact(document_id),
+                "chunk_id": redact(chunk_id),
+                "dataset_name": dataset_name,
+                "document_name": document_name,
+                "text": excerpt,
+                "truncated": len(excerpt) < len(text),
+                "pages": pages,
+            }
+        )
+    if not sources:
+        # Legacy/incomplete provider responses still yield useful readable text.
+        return redact(format_retrieval_result(result, dataset_names_by_id=dataset_names_by_id, max_chars_per_chunk=max_chars_per_chunk, max_total_chars=max_total_chars)), None
+    return "\n\n".join(entries), {"knowledge_sources": {"version": 1, "sources": sources}}

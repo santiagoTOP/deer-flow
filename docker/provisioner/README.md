@@ -20,12 +20,13 @@ The **Sandbox Provisioner** is a FastAPI service that dynamically manages sandbo
 
 ### How It Works
 
-1. **Backend Request**: When the backend needs to execute code, it sends a `POST /api/sandboxes` request with a `sandbox_id`, `thread_id`, and optional `user_id`.
+1. **Backend Request**: When the backend needs to execute code, it sends a `POST /api/sandboxes` request with a `sandbox_id`, `thread_id`, optional `user_id`, and the configured `skills_container_path` (default: `/mnt/skills`).
 
 2. **Pod Creation**: The provisioner creates a dedicated Pod in the `deer-flow` namespace with:
    - The sandbox container image (all-in-one-sandbox)
    - HostPath volumes mounted for:
-     - `/mnt/skills/{public,custom,legacy}` → Read-only enabled-only skill projections
+     - `{skills_container_path}/{public,custom,legacy}` → Default read-only skill projections
+     - `{skills_container_path}/integrations` → Optional read-only managed-integration projection supplied by the Gateway
      - `/mnt/user-data` → Read-write access to thread-specific data
    - Resource limits (CPU, memory, ephemeral storage)
    - Readiness/liveness probes
@@ -145,6 +146,17 @@ List all sandboxes currently managed.
 
 ## Configuration
 
+When `USERDATA_PVC_NAME` is set, user-data and extra mounts share the `user-data` volume.
+User data, extra mounts and Lark broker credentials use separate `subPath` mounts
+on that volume. Read-only flags remain per mount; broker credentials are mounted
+only in the broker container. This avoids repeated claim publication on NFS CSI
+drivers that cannot handle multiple volume declarations for one claim. Without
+`USERDATA_PVC_NAME`, each hostPath keeps its own volume.
+
+If `SKILLS_PVC_NAME` is also configured, use a different claim name from
+`USERDATA_PVC_NAME`: unrestricted threads still declare a separate `skills`
+volume, so using the same claim for both can reintroduce duplicate publication.
+
 The provisioner is configured via environment variables (set in [docker-compose-dev.yaml](../docker-compose-dev.yaml)):
 
 | Variable | Default | Description |
@@ -162,6 +174,17 @@ The provisioner is configured via environment variables (set in [docker-compose-
 | `SANDBOX_SERVICE_TYPE` | `NodePort` | Service type for sandbox access. Use `ClusterIP` when backend and provisioner run inside the same Kubernetes cluster |
 | `NODE_HOST` | `host.docker.internal` | Hostname that backend containers use to reach host NodePorts; ignored when `SANDBOX_SERVICE_TYPE=ClusterIP` |
 | `K8S_API_SERVER` | (from kubeconfig) | Override K8s API server URL (e.g., `https://host.docker.internal:26443`) |
+
+For new sandbox requests, the Gateway also sends the effective AIO shell-session
+capacity derived from `subagent_runtime.max_running`. The provisioner writes it
+to the sandbox Pod as `MAX_SHELL_SESSIONS`; requests from older Gateways omit the
+field and retain the image default. Discovery responses report the effective
+capacity. The Gateway replaces a lower-capacity Pod through its ownership-fenced
+replacement path once the previous owner and recovery grace permit it. A create
+request for an existing Pod with insufficient capacity returns HTTP 409; the
+provisioner does not delete an existing Pod to upgrade its capacity, including
+after a transient Gateway discovery failure. If the old Pod has already gone
+but its Service remains, create can safely provision the missing Pod.
 
 ### Custom sandbox image
 
@@ -206,9 +229,17 @@ PYTHONPATH=. python scripts/migrate_user_isolation.py --dry-run
 PYTHONPATH=. python scripts/migrate_user_isolation.py --user-id <target-user-id>
 ```
 
-This moves legacy `threads/{thread_id}/user-data` data under `users/<target-user-id>/threads/{thread_id}/user-data`, which matches the new provisioner PVC subPath when the gateway base directory is mounted at `deer-flow/` on the PVC. Use `default` as the target user only when the legacy data should remain in the default no-auth user namespace. Run the migration while no gateway or sandbox Pods are writing to those paths.
+This moves legacy `threads/{thread_id}/user-data` data under `users/<owner>/threads/{thread_id}/user-data`, which matches the new provisioner PVC subPath when the gateway base directory is mounted at `deer-flow/` on the PVC. `<owner>` is the thread's `user_id` in the `threads_meta` table of the gateway's configured database (`default` when none is recorded), so run the script with the gateway's `config.yaml` and database settings; if that table cannot be read, it stops without moving anything. Pass `--allow-missing-thread-owners` only when the install never recorded thread owners. `--user-id` picks who inherits un-owned global data (memory, `USER.md`, legacy custom agents). Run the migration while no gateway or sandbox Pods are writing to those paths.
 
-In hostPath mode, the gateway materializes enabled-only views under `skills_view/public` and `users/{user_id}/skills_view/{custom,legacy}` beneath `DEER_FLOW_HOST_BASE_DIR`; the provisioner mounts those stable directories. When skills are materialized per thread on the same PVC, set `SKILLS_PVC_NAME` to that PVC and configure `SKILLS_PVC_SUBPATH_TEMPLATE=deer-flow/users/{user_id}/threads/{thread_id}/skills`. Leaving the template empty preserves the legacy behavior of mounting the skills PVC root at `/mnt/skills`. The gateway does not yet populate that PVC layout dynamically, so PVC-backed skills do not receive hostPath projection updates.
+Before this fix, the script never found the database and moved every legacy thread to `users/default/threads/`. Re-running it does nothing then, because `threads/` is gone. To recover, stop the gateway and list the threads with a real owner:
+
+```sql
+SELECT thread_id, user_id FROM threads_meta WHERE user_id IS NOT NULL AND user_id <> 'default';
+```
+
+Move each listed `users/default/threads/{thread_id}` that exists back to `threads/{thread_id}`, then run the script again (dry run first). Threads whose owner is `default` or not recorded stay where they are. If an owner has used the thread since, `users/<owner>/threads/{thread_id}` already exists; the script never overwrites it and sets the old copy aside in `migration-conflicts/{thread_id}` for you to merge by hand.
+
+In hostPath mode, the gateway materializes enabled-only views under `skills_view/public` and `users/{user_id}/skills_view/{custom,legacy}` beneath `DEER_FLOW_HOST_BASE_DIR`; the provisioner mounts those stable directories. A lead Agent with an explicit skills policy supplies all four category mounts from `users/{user_id}/threads/{thread_id}/skills_view`; those overrides replace the default hostPath or root skills-PVC mount. When `USERDATA_PVC_NAME` is configured, the provisioner mounts these thread categories from that PVC using `deer-flow/users/{user_id}/threads/{thread_id}/skills_view/{category}` subpaths. For unrestricted threads, operators can still set `SKILLS_PVC_NAME` and optionally configure `SKILLS_PVC_SUBPATH_TEMPLATE`; leaving the template empty mounts the skills PVC root unchanged. The gateway does not populate the unrestricted `SKILLS_PVC_SUBPATH_TEMPLATE` layout dynamically.
 
 **hostPath skills volumes require the gateway and the K8s node to see the same `DEER_FLOW_HOST_BASE_DIR`** (single-node deployment, or NFS/shared storage mounted at that path on every node). The gateway writes the projection there before every sandbox acquire, so as long as that path is shared, the directory the provisioner mounts always exists by the time the Pod is scheduled — even a boot-time rebuild failure for one user self-heals on their next acquire, before the provisioner is called. `skills-custom` and `skills-legacy` use hostPath type `Directory` (not `DirectoryOrCreate`): if the shared-storage assumption is violated — the gateway wrote to a different node than the one the Pod lands on — Pod creation now fails visibly instead of silently mounting an empty directory. Use `SKILLS_PVC_NAME` instead of hostPath for genuinely multi-node clusters without shared storage.
 
@@ -377,6 +408,37 @@ docker exec deer-flow-gateway curl -s $SANDBOX_URL/v1/sandbox
 - In NodePort mode, test from the backend container: `curl http://$NODE_HOST:NODE_PORT/v1/sandbox`
 - In ClusterIP mode, test from the backend Pod: `curl http://sandbox-XXX-svc.deer-flow.svc.cluster.local:8080/v1/sandbox`
 - Check `NODE_HOST` for NodePort deployments, or cluster DNS / NetworkPolicy / service mesh rules for ClusterIP deployments
+
+## Running several replicas
+
+The provisioner keeps no state of its own between requests, so several
+replicas can serve the same backend behind one load-balanced Service (the Helm
+chart's `provisioner.replicas`; compose runs a single container):
+
+- The sandbox Pods and Services it creates carry the labels it later queries
+  (`app=deer-flow-sandbox`, `sandbox-id`). They are the only registry: create,
+  status, list and delete all read the Kubernetes API, never a process-local
+  table, so any replica can answer for a sandbox another replica created.
+- `POST /api/sandboxes` is idempotent across replicas. Two creates for the same
+  `sandbox_id` that race on different replicas both succeed: the loser's Pod
+  and Service creates return `409 AlreadyExists`, which the handler treats like
+  its own success before reading the winner's objects back (including
+  `MAX_SHELL_SESSIONS`, so a lower-capacity winner is still reported to the
+  Gateway as `409`). Several Gateway Pods already run this race against a
+  single provisioner.
+- `DELETE /api/sandboxes/{sandbox_id}` tolerates `404`, so two replicas
+  deleting the same sandbox both return success.
+- NodePorts are allocated by the API server when the Service is created; the
+  provisioner only reads the assigned port back.
+- No replica runs a background loop (there is no reaper or cache), and
+  `/api/capabilities` is derived from environment variables every replica of
+  one Deployment shares.
+
+The one startup write is `_ensure_namespace()`: when `K8S_NAMESPACE` does not
+exist yet, two replicas starting together can both see `404` and race to create
+it; the loser's `409 AlreadyExists` is treated as "the namespace exists", so
+both replicas start. Under the Helm chart the provisioner runs inside the
+namespace it manages, so this path never runs there.
 
 ## Security Considerations
 

@@ -8,11 +8,14 @@ import math
 import re
 import threading
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, cast
 
 import yaml
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+
+from .relevance import iter_diversify, score_facts
 
 logger = logging.getLogger(__name__)
 
@@ -329,7 +332,7 @@ def _coerce_confidence(value: Any, default: float = 0.0) -> float:
     """
     try:
         confidence = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return max(0.0, min(1.0, default))
     if not math.isfinite(confidence):
         return max(0.0, min(1.0, default))
@@ -383,7 +386,7 @@ def _escape_summary(value: Any) -> str:
 
 
 def _select_fact_lines(
-    ranked_facts: list[dict[str, Any]],
+    ranked_facts: Iterable[dict[str, Any]],
     *,
     token_budget: int,
     use_tiktoken: bool,
@@ -470,6 +473,10 @@ def format_memory_for_injection(
     use_tiktoken: bool = True,
     guaranteed_categories: list[str] | None = None,
     guaranteed_token_budget: int = 500,
+    query: str | None = None,
+    relevance_weight: float | None = None,
+    diversity_weight: float | None = None,
+    idf: dict[str, float] | None = None,
 ) -> str:
     """Format memory data for injection into system prompt.
 
@@ -491,6 +498,20 @@ def format_memory_for_injection(
             point the safety-truncation ceiling is raised to
             ``max_tokens + guaranteed_actual_usage`` to protect them.
             Ignored when *guaranteed_categories* is ``None`` or empty.
+        query: Optional current-turn query. When provided together with
+            ``relevance_weight``, facts are first ranked by deterministic
+            lexical relevance combined with confidence (issue #4495) before
+            the guaranteed/regular partition and budget selection. ``None``
+            preserves the legacy confidence-only ordering.
+        relevance_weight: Weight of lexical relevance vs confidence for the
+            query-aware ranking (0.0 = confidence only). Ignored when
+            ``query`` is ``None``.
+        diversity_weight: Optional greedy-MMR similarity penalty that demotes
+            near-duplicate facts during query-aware ranking. Ignored when
+            ``query`` is ``None``.
+        idf: Optional scope-wide query-term weights, shared by both budget
+            pools. DeerMem supplies the same corpus IDF as unfiltered search;
+            direct callers that omit it retain uniform term weights.
 
     Returns:
         Formatted memory string for system prompt injection.
@@ -525,6 +546,10 @@ def format_memory_for_injection(
         top_of_mind = user_data.get("topOfMind", {})
         if top_of_mind.get("summary"):
             user_sections.append(f"Current Focus: {_escape_summary(top_of_mind['summary'])}")
+
+        cognitive_style = user_data.get("cognitiveStyle", {})
+        if cognitive_style.get("summary"):
+            user_sections.append(f"Thinking Style: {_escape_summary(cognitive_style['summary'])}")
 
         if user_sections:
             sections.append("User Context:\n" + "\n".join(f"- {s}" for s in user_sections))
@@ -586,6 +611,19 @@ def format_memory_for_injection(
         valid_facts = [f for f in facts_data if isinstance(f, dict) and isinstance(f.get("content"), str) and f.get("content", "").strip()]
 
         try:
+            # Score once, then lazily diversify each budget pool. Do not run
+            # full-scope MMR before the token-budget consumer can stop it.
+            relevance_ordered = bool(query and query.strip() and relevance_weight is not None)
+            scores = {}
+            if relevance_ordered:
+                scores = {id(fact): score for score, fact in score_facts(valid_facts, query, relevance_weight=relevance_weight, idf=idf)}
+
+            def _rank_pool(pool: list[dict[str, Any]]) -> Iterable[dict[str, Any]]:
+                if not relevance_ordered:
+                    return sorted(pool, key=_confidence_key, reverse=True)
+                scored = sorted(((scores[id(fact)], fact) for fact in pool), key=lambda pair: pair[0], reverse=True)
+                return iter_diversify(scored, similarity_weight=diversity_weight or 0.0)
+
             # Partition valid facts into guaranteed vs regular groups.
             # Use the *raw* category field (no ``or "context"`` default) so
             # a category-less legacy fact is never silently promoted into
@@ -604,19 +642,12 @@ def format_memory_for_injection(
                     cat = raw.strip()
                     return bool(cat) and cat in effective_guaranteed
 
-                guaranteed = sorted(
-                    [f for f in valid_facts if _category_match(f)],
-                    key=_confidence_key,
-                    reverse=True,
-                )
-                regular = sorted(
-                    [f for f in valid_facts if not _category_match(f)],
-                    key=_confidence_key,
-                    reverse=True,
-                )
+                guaranteed_pool = [f for f in valid_facts if _category_match(f)]
+                regular_pool = [f for f in valid_facts if not _category_match(f)]
+                guaranteed, regular = _rank_pool(guaranteed_pool), _rank_pool(regular_pool)
             else:
                 guaranteed = []
-                regular = sorted(valid_facts, key=_confidence_key, reverse=True)
+                regular = _rank_pool(valid_facts)
 
             # ── Phase 1: select guaranteed lines ──────────────────────────
             header_cost = _count_tokens(facts_header, use_tiktoken=use_tiktoken)
@@ -703,27 +734,27 @@ def format_memory_for_injection(
         # equation collapses to the original prefix-truncation against
         # ``max_tokens``, so backward compatibility is preserved.
         facts_block = (facts_header + "\n".join(all_fact_lines)) if all_fact_lines else ""
-        facts_block_tokens = _count_tokens(facts_block, use_tiktoken=use_tiktoken)
-        separator_tokens = _count_tokens("\n\n", use_tiktoken=use_tiktoken)
-        budget_for_non_facts = max(
-            0,
-            effective_limit - facts_block_tokens - (separator_tokens if facts_block else 0),
-        )
-
         # Build the preceding (non-facts) portion from *sections* excluding
         # the trailing Facts block.
         preceding_sections = sections[:-1] if all_fact_lines else sections
         preceding = "\n\n".join(preceding_sections)
 
+        result = facts_block
         if preceding:
-            preceding_tokens = _count_tokens(preceding, use_tiktoken=use_tiktoken)
-            if preceding_tokens > budget_for_non_facts:
-                char_per_token = len(preceding) / max(preceding_tokens, 1)
-                target_chars = int(budget_for_non_facts * char_per_token * 0.95)
-                preceding = preceding[:target_chars].rstrip() + "\n..."
-            result = (preceding + "\n\n" + facts_block) if facts_block else preceding
-        else:
-            result = facts_block
+            # Average density does not bound a prefix's cost, and BPE counts
+            # need not be monotone. Count each assembled candidate and retain
+            # only fitting prefixes; this need not find the longest one.
+            low, high = 0, len(preceding)
+            while low <= high:
+                middle = (low + high) // 2
+                candidate = preceding[:middle].rstrip() + "\n..."
+                if facts_block:
+                    candidate += "\n\n" + facts_block
+                if _count_tokens(candidate, use_tiktoken=use_tiktoken) <= effective_limit:
+                    result = candidate
+                    low = middle + 1
+                else:
+                    high = middle - 1
 
     return result
 
@@ -754,11 +785,11 @@ def format_conversation_for_update(messages: list[Any]) -> str:
                         text_parts.append(text_val)
             content = " ".join(text_parts) if text_parts else str(content)
 
-        # Strip uploaded_files tags from human messages to avoid persisting
+        # Strip the upload-context tag from human messages to avoid persisting
         # ephemeral file path info into long-term memory.  Skip the turn entirely
         # when nothing remains after stripping (upload-only message).
         if role == "human":
-            content = re.sub(r"<(?P<tag>uploaded_files|current_uploads)>[\s\S]*?</(?P=tag)>\n*", "", str(content)).strip()
+            content = re.sub(r"<current_uploads>[\s\S]*?</current_uploads>\n*", "", str(content)).strip()
             if not content:
                 continue
 

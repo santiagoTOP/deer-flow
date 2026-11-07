@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, ValidationError
 
 from app.gateway.deps import is_admin_user, require_admin_user
+from app.gateway.persistent_writes import run_drained_write
 from deerflow.config.app_config import get_app_config
 from deerflow.persistence.managed_subagents import (
     ManagedSubagentDefinition,
@@ -34,6 +35,8 @@ class SubagentResponse(BaseModel):
     disallowed_tools: list[str] | None = None
     skills: list[str] | None = None
     model: str = "inherit"
+    thinking_enabled: bool | None = None
+    reasoning_effort: str | None = None
     max_turns: int = 50
     timeout_seconds: int = 900
     enabled: bool = True
@@ -56,6 +59,8 @@ class ManagedSubagentCreateRequest(BaseModel):
     disallowed_tools: list[str] | None = None
     skills: list[str] | None = None
     model: str = "inherit"
+    thinking_enabled: bool | None = None
+    reasoning_effort: str | None = None
     max_turns: int = Field(default=50, ge=1)
     timeout_seconds: int = Field(default=900, ge=1)
     enabled: bool = True
@@ -69,6 +74,8 @@ class ManagedSubagentUpdateRequest(BaseModel):
     disallowed_tools: list[str] | None = None
     skills: list[str] | None = None
     model: str | None = None
+    thinking_enabled: bool | None = None
+    reasoning_effort: str | None = None
     max_turns: int | None = Field(default=None, ge=1)
     timeout_seconds: int | None = Field(default=None, ge=1)
     enabled: bool | None = None
@@ -93,7 +100,7 @@ def _explicit_overrides(name: str, app_config) -> dict[str, Any]:
     if override is None:
         return {}
     result: dict[str, Any] = {}
-    for field in ("timeout_seconds", "max_turns", "model", "skills"):
+    for field in ("timeout_seconds", "max_turns", "model", "thinking_enabled", "reasoning_effort", "skills"):
         if field not in override.model_fields_set:
             continue
         value = getattr(override, field)
@@ -118,6 +125,8 @@ def _catalog(include_system_prompt: bool) -> SubagentsListResponse:
                 disallowed_tools=definition.disallowed_tools,
                 skills=definition.skills,
                 model=definition.model,
+                thinking_enabled=definition.thinking_enabled,
+                reasoning_effort=definition.reasoning_effort,
                 max_turns=definition.max_turns,
                 timeout_seconds=definition.timeout_seconds,
                 source="builtin",
@@ -135,6 +144,8 @@ def _catalog(include_system_prompt: bool) -> SubagentsListResponse:
                 disallowed_tools=definition.disallowed_tools,
                 skills=definition.skills,
                 model=definition.model,
+                thinking_enabled=definition.thinking_enabled,
+                reasoning_effort=definition.reasoning_effort,
                 max_turns=definition.max_turns,
                 timeout_seconds=definition.timeout_seconds,
                 source="config",
@@ -180,7 +191,7 @@ async def create_managed_subagent(request: Request, body: ManagedSubagentCreateR
         raise HTTPException(status_code=409, detail=f"Subagent name '{definition.name}' is reserved by a built-in or config.yaml definition.")
     store = get_managed_subagent_store(app_config)
     try:
-        await asyncio.to_thread(store.create, definition)
+        await run_drained_write("Create managed subagent", store.create, (ManagedSubagentExistsError,), definition)
     except ManagedSubagentExistsError:
         raise HTTPException(status_code=409, detail=f"Managed subagent '{definition.name}' already exists")
     return SubagentResponse(
@@ -211,7 +222,7 @@ async def update_managed_subagent(name: str, request: Request, body: ManagedSuba
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
     _validate_model(updated.model, app_config)
     try:
-        await asyncio.to_thread(store.update, updated)
+        await run_drained_write("Update managed subagent", store.update, (FileNotFoundError,), updated)
     except FileNotFoundError:
         # The definition may be deleted by another administrator after the
         # read above. Preserve the endpoint's not-found contract instead of
@@ -234,5 +245,5 @@ async def delete_managed_subagent(name: str, request: Request) -> None:
     name = _validate_path_name(name)
     app_config = await asyncio.to_thread(get_app_config)
     store = get_managed_subagent_store(app_config)
-    if not await asyncio.to_thread(store.delete, name):
+    if not await run_drained_write("Delete managed subagent", store.delete, (), name):
         raise HTTPException(status_code=404, detail=f"Managed subagent '{name}' not found")

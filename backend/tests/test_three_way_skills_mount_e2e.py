@@ -15,19 +15,24 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from _host_path_helpers import posix_path
 
 from deerflow.config.extensions_config import ExtensionsConfig, SkillStateConfig
 from deerflow.config.paths import Paths
 from deerflow.sandbox.local.local_sandbox import PathMapping
 from deerflow.sandbox.local.local_sandbox_provider import LocalSandboxProvider
 from deerflow.sandbox.tools import read_file_tool
-from deerflow.skills.projection import rebuild_skill_projections
+from deerflow.skills.projection import (
+    ensure_thread_skill_projection,
+    rebuild_skill_projections,
+)
 from deerflow.skills.storage import reset_user_skill_storage
 from deerflow.skills.storage.user_scoped_skill_storage import UserScopedSkillStorage
 from deerflow.skills.types import SKILL_MD_FILE, Skill, SkillCategory
 
 _AIO_MODULE = "deerflow.community.aio_sandbox.aio_sandbox_provider"
 _AIO_GET_CONFIG = f"{_AIO_MODULE}.get_app_config"
+_LOCAL_HOST_BASH_ALLOWED = "deerflow.sandbox.local.local_sandbox_provider.is_host_bash_allowed"
 
 
 def _write_skill(base: Path, name: str, description: str = "test skill") -> Path:
@@ -375,6 +380,205 @@ class TestThreeWayMountEndToEnd:
             assert "SECRET_PROCEDURE" not in structured_disabled_again
             assert "disabled" in structured_disabled_again.lower()
 
+    def test_local_agent_allowlist_is_enforced_by_every_filesystem_path(
+        self,
+        tmp_path,
+    ):
+        skills_root = tmp_path / "skills"
+        _write_skill(skills_root / "public", "allowed-skill", "ALLOWED_MARKER")
+        _write_skill(skills_root / "public", "excluded-skill", "EXCLUDED_MARKER")
+        (skills_root / "custom").mkdir(parents=True)
+        paths = Paths(base_dir=tmp_path)
+        cfg = _build_config(skills_root)
+        extensions = ExtensionsConfig()
+
+        with (
+            patch("deerflow.config.get_app_config", return_value=cfg),
+            patch("deerflow.config.paths.get_paths", return_value=paths),
+            patch(
+                "deerflow.config.extensions_config.ExtensionsConfig.from_file",
+                return_value=extensions,
+            ),
+            patch(
+                "deerflow.config.extensions_config.get_extensions_config",
+                return_value=extensions,
+            ),
+            # The provider enforces a thread view only while host bash is off.
+            patch(_LOCAL_HOST_BASH_ALLOWED, return_value=False),
+        ):
+            storage = UserScopedSkillStorage(
+                "user-1",
+                host_path=str(skills_root),
+                app_config=cfg,
+            )
+            projection = ensure_thread_skill_projection(
+                storage,
+                "thread-policy",
+                {"allowed-skill"},
+            )
+            assert projection is not None
+            provider = LocalSandboxProvider()
+            sandbox_id = provider.acquire("thread-policy", user_id="user-1")
+            sandbox = provider.get(sandbox_id)
+            assert sandbox is not None
+
+            mappings = {mapping.container_path: mapping for mapping in sandbox.path_mappings}
+            assert set(path for path in mappings if path.startswith("/mnt/skills")) == {"/mnt/skills"}
+            assert Path(mappings["/mnt/skills"].local_path) == projection.public.parent
+
+            listing = "\n".join(sandbox.list_dir("/mnt/skills", max_depth=4))
+            assert "allowed-skill" in listing
+            assert "excluded-skill" not in listing
+            assert "EXCLUDED_MARKER" not in sandbox.execute_command("find /mnt/skills -name SKILL.md -print -exec cat {} \\;")
+
+            excluded_path = "/mnt/skills/public/excluded-skill/SKILL.md"
+            with pytest.raises(FileNotFoundError):
+                sandbox.read_file(excluded_path)
+            globbed, _ = sandbox.glob("/mnt/skills", "**/SKILL.md")
+            assert any("allowed-skill" in path for path in globbed)
+            assert all("excluded-skill" not in path for path in globbed)
+            grepped, _ = sandbox.grep(
+                "/mnt/skills",
+                "EXCLUDED_MARKER",
+                literal=True,
+            )
+            assert grepped == []
+
+            absolute_read = sandbox.execute_command(f"cat {excluded_path}")
+            relative_read = sandbox.execute_command("cd /mnt/skills/public && cat excluded-skill/SKILL.md")
+            python_read = sandbox.execute_command("python3 -c \"from pathlib import Path; print(Path('/mnt/skills/public/excluded-skill/SKILL.md').read_text())\"")
+            symlink_read = sandbox.execute_command("ln -s /mnt/skills/public/excluded-skill /mnt/skills/public/excluded-link && cat /mnt/skills/public/excluded-link/SKILL.md")
+            for result in (
+                absolute_read,
+                relative_read,
+                python_read,
+                symlink_read,
+            ):
+                assert "EXCLUDED_MARKER" not in result
+                assert "Exit Code:" in result
+
+    def test_local_empty_agent_allowlist_exposes_no_business_skill(
+        self,
+        tmp_path,
+    ):
+        skills_root = tmp_path / "skills"
+        _write_skill(skills_root / "public", "public-skill", "PUBLIC_MARKER")
+        (skills_root / "custom").mkdir(parents=True)
+        paths = Paths(base_dir=tmp_path)
+        cfg = _build_config(skills_root)
+        extensions = ExtensionsConfig()
+
+        with (
+            patch("deerflow.config.get_app_config", return_value=cfg),
+            patch("deerflow.config.paths.get_paths", return_value=paths),
+            patch(
+                "deerflow.config.extensions_config.ExtensionsConfig.from_file",
+                return_value=extensions,
+            ),
+            patch(
+                "deerflow.config.extensions_config.get_extensions_config",
+                return_value=extensions,
+            ),
+            # The provider enforces a thread view only while host bash is off.
+            patch(_LOCAL_HOST_BASH_ALLOWED, return_value=False),
+        ):
+            storage = UserScopedSkillStorage(
+                "user-1",
+                host_path=str(skills_root),
+                app_config=cfg,
+            )
+            storage.write_custom_skill(
+                "custom-skill",
+                "SKILL.md",
+                "---\nname: custom-skill\ndescription: CUSTOM_MARKER\n---\n",
+            )
+            projection = ensure_thread_skill_projection(
+                storage,
+                "thread-empty-policy",
+                set(),
+            )
+            assert projection is not None
+            provider = LocalSandboxProvider()
+            sandbox_id = provider.acquire(
+                "thread-empty-policy",
+                user_id="user-1",
+            )
+            sandbox = provider.get(sandbox_id)
+            assert sandbox is not None
+
+            listing = "\n".join(sandbox.list_dir("/mnt/skills", max_depth=4))
+            assert "public-skill" not in listing
+            assert "custom-skill" not in listing
+            shell_listing = sandbox.execute_command("ls -R /mnt/skills")
+            assert "public-skill" not in shell_listing
+            assert "custom-skill" not in shell_listing
+            assert "MARKER" not in sandbox.execute_command("find /mnt/skills -name SKILL.md -print -exec cat {} \\;")
+            with pytest.raises(FileNotFoundError):
+                sandbox.read_file("/mnt/skills/public/public-skill/SKILL.md")
+            globbed, _ = sandbox.glob("/mnt/skills", "**/SKILL.md")
+            assert globbed == []
+            grepped, _ = sandbox.grep(
+                "/mnt/skills",
+                "MARKER",
+                literal=True,
+            )
+            assert grepped == []
+
+    def test_local_host_bash_run_does_not_inherit_a_stale_agent_view(self, tmp_path):
+        """A restricted run leaves a thread view behind. Once host bash is
+        allowed, SandboxMiddleware no longer refreshes that view, so the
+        provider must not mount it: later unrestricted runs on the thread would
+        otherwise keep the old allowlist and never see newly added skills."""
+        from deerflow.sandbox.middleware import SandboxMiddleware
+
+        skills_root = tmp_path / "skills"
+        _write_skill(skills_root / "public", "allowed-skill", "ALLOWED_MARKER")
+        _write_skill(skills_root / "public", "excluded-skill", "EXCLUDED_MARKER")
+        (skills_root / "custom").mkdir(parents=True)
+        paths = Paths(base_dir=tmp_path)
+        cfg = _build_config(skills_root)
+        extensions = ExtensionsConfig()
+
+        with (
+            patch("deerflow.config.get_app_config", return_value=cfg),
+            patch("deerflow.config.paths.get_paths", return_value=paths),
+            patch("deerflow.config.extensions_config.ExtensionsConfig.from_file", return_value=extensions),
+            patch("deerflow.config.extensions_config.get_extensions_config", return_value=extensions),
+        ):
+            storage = UserScopedSkillStorage("user-1", host_path=str(skills_root), app_config=cfg)
+            provider = LocalSandboxProvider()
+
+            def run(available_skills, *, host_bash: bool):
+                with (
+                    patch(_LOCAL_HOST_BASH_ALLOWED, return_value=host_bash),
+                    patch("deerflow.sandbox.middleware.get_sandbox_provider", return_value=provider),
+                    patch("deerflow.skills.storage.get_or_new_user_skill_storage", return_value=storage),
+                ):
+                    SandboxMiddleware(available_skills=available_skills)._prepare_agent_skill_projection("thread-switch", user_id="user-1")
+                    sandbox = provider.get(provider.acquire("thread-switch", user_id="user-1"))
+                assert sandbox is not None
+                return sandbox
+
+            def readable(sandbox, name: str) -> bool:
+                try:
+                    sandbox.read_file(f"/mnt/skills/public/{name}/SKILL.md")
+                except FileNotFoundError:
+                    return False
+                return True
+
+            restricted = run({"allowed-skill"}, host_bash=False)
+            assert (readable(restricted, "allowed-skill"), readable(restricted, "excluded-skill")) == (True, False)
+
+            _write_skill(skills_root / "public", "added-skill", "ADDED_MARKER")
+            unrestricted = run(None, host_bash=True)
+            assert all(readable(unrestricted, name) for name in ("allowed-skill", "excluded-skill", "added-skill"))
+            assert "/mnt/skills" not in {mapping.container_path for mapping in unrestricted.path_mappings}
+
+            # The view was left in place, so the allowlist is enforced again
+            # as soon as host bash is turned back off.
+            restricted_again = run({"allowed-skill"}, host_bash=False)
+            assert [readable(restricted_again, name) for name in ("allowed-skill", "excluded-skill", "added-skill")] == [True, False, False]
+
     # ── AioSandboxProvider ──────────────────────────────────────────────
 
     def test_aio_public_skill_mount(self, skills_fs, aio_mod):
@@ -459,11 +663,11 @@ class TestThreeWayMountEndToEnd:
 
         assert "/mnt/skills/custom" in mount_entries
         assert "dst=/mnt/skills/custom" in mount_entries["/mnt/skills/custom"]
-        assert "users/noob/skills_view/custom" in mount_entries["/mnt/skills/custom"]
+        assert "users/noob/skills_view/custom" in posix_path(mount_entries["/mnt/skills/custom"])
 
         assert "/mnt/skills/integrations" in mount_entries
         assert "dst=/mnt/skills/integrations" in mount_entries["/mnt/skills/integrations"]
-        assert "users/noob/skills_view/integrations" in mount_entries["/mnt/skills/integrations"]
+        assert "users/noob/skills_view/integrations" in posix_path(mount_entries["/mnt/skills/integrations"])
 
         # noob has no per-user custom → legacy is mounted
         assert "/mnt/skills/legacy" in mount_entries

@@ -1,9 +1,24 @@
-import type { AnchorHTMLAttributes } from "react";
+import {
+  type AnchorHTMLAttributes,
+  type ComponentProps,
+  createContext,
+  useContext,
+} from "react";
 
-import { resolveMarkdownArtifactURL } from "@/core/artifacts/utils";
+import {
+  isPotentialRelativeArtifactReference,
+  resolveMarkdownArtifactURL,
+  resolveRelativeArtifactURL,
+} from "@/core/artifacts/utils";
+import {
+  retrievalSourceId,
+  type RetrievalSource,
+} from "@/core/citations/sources";
+import { knowledgeSourceId } from "@/core/knowledge/sources";
 import { cn } from "@/lib/utils";
 
 import { CitationLink, extractReactNodeText } from "../citations/citation-link";
+import { KnowledgeCitation } from "../citations/knowledge-citation";
 
 /**
  * Schemes we are willing to render as a navigable ``<a href=...>``.
@@ -49,6 +64,30 @@ export function isSafeHref(href: string | undefined): boolean {
   }
 }
 
+/**
+ * Inert stand-in for a link whose href failed `isSafeHref`. It keeps the
+ * visible label and marks the omission on hover and for assistive tech, so
+ * every surface that applies the allowlist degrades the same way. Extra props
+ * pass through for wrappers such as Radix `asChild` triggers.
+ */
+export function UnsafeLink({
+  href,
+  className,
+  ...props
+}: ComponentProps<"span"> & { href: string }) {
+  return (
+    <span
+      {...props}
+      className={cn(
+        "text-muted-foreground cursor-not-allowed underline decoration-dotted underline-offset-2",
+        className,
+      )}
+      aria-label="Unsafe link omitted"
+      title={`Unsafe link scheme in ${href}`}
+    />
+  );
+}
+
 function isExternalUrl(href: string | undefined): boolean {
   if (typeof href !== "string") {
     return false;
@@ -57,15 +96,43 @@ function isExternalUrl(href: string | undefined): boolean {
 }
 
 /**
+ * The current thread's artifact paths, provided by the message list. Inside
+ * it, a link rendered with a `threadId` resolves relative destinations
+ * (`report.md`, `./out/a.md`) to the artifact they name.
+ *
+ * This is a context rather than a factory argument because Streamdown
+ * memoizes its root without comparing `components`: a link renderer created
+ * before the artifact list arrives would keep the stale list, while a context
+ * change still reaches it.
+ */
+export const MessageArtifactPathsContext = createContext<
+  readonly string[] | null
+>(null);
+
+/**
  * Builds the `a` renderer shared by message content and generic markdown.
- * Passing a `threadId` also resolves `/mnt/` artifact links; without it those
+ * Passing a `threadId` also resolves `/mnt/` artifact links, plus relative
+ * artifact links inside a `MessageArtifactPathsContext`; without it those
  * links fall through to the default external-link handling.
  */
-export function createMarkdownLinkComponent(threadId?: string) {
+export function createMarkdownLinkComponent(
+  threadId?: string,
+  knowledgeSources: readonly RetrievalSource[] = [],
+) {
   return function MarkdownLink({
     href,
     ...props
   }: AnchorHTMLAttributes<HTMLAnchorElement>) {
+    const artifactPaths = useContext(MessageArtifactPathsContext);
+    if (/^#(?:user-content-)?knowledge-source-/.test(href ?? "")) {
+      const id = retrievalSourceId(href);
+      const source = knowledgeSources.find((item) => item.id === id);
+      return source ? (
+        <KnowledgeCitation source={source} />
+      ) : (
+        <span>{props.children}</span>
+      );
+    }
     // Reject unsafe schemes up front so a prompt-injected / pasted href can
     // never reach the rendered anchor — including through the citation
     // branch (which renders <a href={href}> directly). Check before the
@@ -78,17 +145,14 @@ export function createMarkdownLinkComponent(threadId?: string) {
       // <span> and would trigger React DOM warnings.
       const { className, children } = props;
       return (
-        <span
-          className={cn(
-            "text-muted-foreground cursor-not-allowed underline decoration-dotted underline-offset-2",
-            className,
-          )}
-          aria-label="Unsafe link omitted"
-          title={`Unsafe link scheme in ${href}`}
-        >
+        <UnsafeLink href={href} className={className}>
           {children}
-        </span>
+        </UnsafeLink>
       );
+    }
+    // Knowledge destinations also appear as ordinary [Title](URL) Sources links.
+    if (knowledgeSourceId(href)) {
+      return <CitationLink {...props} href={href} />;
     }
     // Safe-href check passed — citation links now route through CitationLink.
     const childrenText = extractReactNodeText(props.children);
@@ -103,28 +167,55 @@ export function createMarkdownLinkComponent(threadId?: string) {
         );
       }
     }
+    // Artifact links (`/mnt/…`, or relative inside the message list) open in a
+    // new tab, styled like any other link so they read as clickable.
+    let resolvedHref = href;
+    let opensArtifact = false;
     if (threadId && href?.startsWith("/mnt/")) {
-      return (
-        <a
-          {...props}
-          href={resolveMarkdownArtifactURL(href, threadId)}
-          target="_blank"
-          rel="noopener noreferrer"
-        />
+      resolvedHref = resolveMarkdownArtifactURL(href, threadId);
+      opensArtifact = true;
+    } else if (
+      threadId &&
+      artifactPaths &&
+      href &&
+      isPotentialRelativeArtifactReference(href)
+    ) {
+      const artifactURL = resolveRelativeArtifactURL(
+        href,
+        threadId,
+        artifactPaths,
       );
+      if (!artifactURL) {
+        // Left as-is, the browser would resolve the href against the chat
+        // route (/workspace/chats/<file>) and open a broken "thread".
+        const { className, children } = props;
+        return (
+          <span
+            className={cn(
+              "text-muted-foreground underline decoration-dotted underline-offset-2",
+              className,
+            )}
+            title={`No single artifact in this conversation matches ${href}`}
+          >
+            {children}
+          </span>
+        );
+      }
+      resolvedHref = artifactURL;
+      opensArtifact = true;
     }
     const { className, target, rel, ...rest } = props;
-    const external = isExternalUrl(href);
+    const opensNewTab = opensArtifact || isExternalUrl(href);
     return (
       <a
         {...rest}
-        href={href}
+        href={resolvedHref}
         className={cn(
           "text-primary decoration-primary/30 hover:decoration-primary/60 underline underline-offset-2 transition-colors",
           className,
         )}
-        target={target ?? (external ? "_blank" : undefined)}
-        rel={rel ?? (external ? "noopener noreferrer" : undefined)}
+        target={target ?? (opensNewTab ? "_blank" : undefined)}
+        rel={rel ?? (opensNewTab ? "noopener noreferrer" : undefined)}
       />
     );
   };

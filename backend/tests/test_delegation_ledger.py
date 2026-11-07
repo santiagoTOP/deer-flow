@@ -69,6 +69,26 @@ class TestMergeDelegations:
 
         assert out[0]["run_id"] == "run-1"
 
+    def test_same_tool_call_id_in_different_runs_keeps_both_delegations(self):
+        existing = [{**_entry("call_1", "completed", "old task"), "run_id": "run-old"}]
+        new = [{**_entry("call_1", "in_progress", "new task"), "run_id": "run-new"}]
+
+        merged = merge_delegations(existing, new)
+
+        assert [(entry["run_id"], entry["description"], entry["status"]) for entry in merged] == [
+            ("run-old", "old task", "completed"),
+            ("run-new", "new task", "in_progress"),
+        ]
+
+    def test_same_tool_call_id_in_one_run_still_updates_one_delegation(self):
+        existing = [{**_entry("call_1", "in_progress"), "run_id": "run-1"}]
+        new = [{**_entry("call_1", "completed"), "run_id": "run-1"}]
+
+        merged = merge_delegations(existing, new)
+
+        assert len(merged) == 1
+        assert merged[0]["status"] == "completed"
+
     def test_over_cap_keeps_most_recent_entries(self):
         from deerflow.agents import thread_state as thread_state_module
 
@@ -359,7 +379,7 @@ class TestRenderDelegationLedger:
 
         out = render_delegation_ledger(entries)
 
-        assert "do NOT delegate" in out
+        assert "inspect self-report before reuse" in out
         assert "research auth" in out
         assert "general-purpose" in out
         assert "auth uses JWT" in out
@@ -535,3 +555,53 @@ class TestReceiptVerdictRendering:
 
         assert "write report" in rendered
         assert "citations:" not in rendered
+
+
+def _acceptance_verdict() -> dict:
+    return {
+        "source": "acceptance_checklist",
+        "requirement": "delegation_acceptance_criteria",
+        "leaves": [
+            {"criterion": "file:../outputs/r.md exists", "family": "file_exists", "checked": True, "holds": True, "detail": "exists, 5 bytes"},
+            {"criterion": "tests_passed:make test", "family": "tests_passed", "checked": True, "holds": False, "detail": "latest matching run recorded status=error"},
+            {"criterion": "open ended", "family": "undecidable", "checked": False, "holds": False, "detail": "not deterministically checkable"},
+        ],
+        "unchecked": ["open ended"],
+        "all_hold": False,
+    }
+
+
+class TestAcceptanceVerdictRendering:
+    def test_entry_carries_verdict_and_renders_segment(self):
+        from deerflow.subagents.status_contract import make_subagent_additional_kwargs
+
+        messages = [
+            _ai_task_call("c1", "write report"),
+            ToolMessage(
+                content="Task Succeeded. Result: done",
+                tool_call_id="c1",
+                name="task",
+                additional_kwargs=make_subagent_additional_kwargs("completed", result="done", acceptance_verdict=_acceptance_verdict()),
+            ),
+        ]
+        entries = extract_delegations(messages)
+        assert entries[0]["acceptance_verdict"]["all_hold"] is False
+
+        rendered = render_delegation_ledger(entries)
+        assert "acceptance: 1 hold, 1 does not hold, 1 UNVERIFIED — execution evidence only, does not validate claim correctness" in rendered
+
+    def test_legacy_entries_without_verdict_render_unchanged(self):
+        messages = [_ai_task_call("c1", "write report"), _completed_task_message("c1", None)]
+        rendered = render_delegation_ledger(extract_delegations(messages))
+        assert "acceptance:" not in rendered
+
+    def test_malformed_persisted_acceptance_verdict_is_ignored(self):
+        entry = {
+            **_entry("c1", "completed", description="write report"),
+            "acceptance_verdict": {"all_hold": True},
+        }
+
+        rendered = render_delegation_ledger([entry])
+
+        assert "write report" in rendered
+        assert "acceptance:" not in rendered

@@ -10,7 +10,7 @@ change at runtime.
 
 The registry covers two kinds of entries:
 
-- Top-level ``AppConfig`` fields (``database``, ``checkpointer``,
+- ``AppConfig`` fields and explicitly registered nested fields (``database``, ``checkpointer``,
   ``run_events``, ``stream_bridge``, ``sandbox``, ``log_level``). For
   these, :func:`format_field_description` produces the standardised
   ``"startup-only: ..."`` prefix that the matching Pydantic
@@ -50,25 +50,34 @@ STARTUP_ONLY_FIELDS: dict[str, str] = {
     "agent_storage": ("langgraph_runtime() validates agent_storage.backend against database.backend once at startup, and the db backend's synchronous SQLAlchemy engine is process-cached on first use; switching backend needs a restart."),
     "stream_bridge": ("make_stream_bridge() constructs the stream-bridge singleton once during startup."),
     "sandbox": ("get_sandbox_provider() caches the provider singleton (``_default_sandbox_provider``); a different ``sandbox.use`` class path only takes effect on next process start."),
+    "skills.container_path": (
+        "AioSandboxProvider and E2BSandboxProvider normalize and capture the skills mount root when their provider singleton starts; "
+        "sandbox identity, mounts, remote metadata, and skill synchronization must keep using that one root until the Gateway restarts."
+    ),
     "log_level": (
         "apply_logging_level() runs only during app.py startup; it sets the deerflow/app logger levels and may lower root handler thresholds so configured messages can propagate. A freshly reloaded AppConfig does not retrigger it."
     ),
     "logging": (
         "configure_logging() runs only during app.py startup; it installs/removes the trace-context filter and the enhanced formatter on root handlers, "
-        "and TraceMiddleware captures logging.enhance.enabled once at startup so response X-Trace-Id headers, log trace_id fields, and Langfuse "
-        "deerflow_trace_id stay coherent. A freshly reloaded AppConfig does not retrigger any of this."
+        "and a freshly reloaded AppConfig does not retrigger it, so a runtime edit to logging.enhance.* needs a Gateway restart. Only log output is "
+        "affected: trace ids are issued unconditionally and always returned in the X-Trace-Id response header, whatever this setting says."
     ),
     # Not part of the AppConfig Pydantic schema — channel credentials are
     # consumed directly by ``start_channel_service()`` once at lifespan
     # startup and the live channel clients are not rebuilt on
     # config.yaml edits.
     "channels": ("start_channel_service() is invoked once during startup; the live IM channel clients (Feishu, Slack, Telegram, DingTalk) are not rebuilt when channels.* changes."),
+    "channels.leader_lease": (
+        "the multi-process startup gate (_enforce_postgres_for_multi_worker) evaluates channels.leader_lease once at startup, and ChannelService captures enabled / lease_seconds / grace_seconds "
+        "when it is constructed by start_channel_service(); the lease is not re-read on config.yaml edits, so changing it needs a restart of every Gateway instance together."
+    ),
     "channel_connections": (
-        "start_channel_service() wires the connection repository and channel workers once at startup, and the channel-connections router caches the merged provider config on app.state; channel_connections.* edits need a restart."
+        "start_channel_service() wires the connection repository and channel workers once at startup, and the channel-connections router caches the merged provider config on app.state; "
+        "the scheduled-task notification delivery worker and ChannelService (for the IM /connect and /goal replies) capture channel_connections.notification_locale when they start. channel_connections.* edits need a restart."
     ),
     "scheduler": (
         "ScheduledTaskService is constructed and started once during Gateway lifespan startup; enabled, poll_interval_seconds, lease_seconds, "
-        "max_concurrent_runs, queue_timeout_seconds, and multi_instance are captured into the service instance and the background poller task is not rebuilt on config.yaml edits. "
+        "max_concurrent_runs, max_concurrent_runs_per_user, queue_timeout_seconds, and multi_instance are captured into the service instance and the background poller task is not rebuilt on config.yaml edits. "
         "Changing multi-instance recovery prerequisites or lease behavior requires restarting every Gateway Pod together. "
         "scheduler.recursion_limit is not captured there: launch_scheduled_thread_run reads it from get_app_config() on each dispatch, so a YAML edit applies to the next scheduled run without a Gateway restart."
     ),
@@ -78,6 +87,10 @@ STARTUP_ONLY_FIELDS: dict[str, str] = {
     ),
     "subagent_runtime": ("the shared native-subagent admission controller and isolated execution loop are configured once during Gateway lifespan startup; changing process slots, queue policy, or queue bounds requires a restart."),
     "subagent_batches": ("the durable subagent batch service is constructed and started once during Gateway lifespan startup; scheduler limits, leases, and recovery behavior are captured by that service instance."),
+    "deployment": (
+        "langgraph_runtime() evaluates deployment.multi_instance once at startup inside the multi-process safety gate (_enforce_postgres_for_multi_worker); "
+        "the gate never re-runs on config.yaml edits, so declaring or withdrawing a multi-instance topology needs a Gateway restart on every instance."
+    ),
     "run_ownership": (
         "RunOwnershipConfig is captured once into RunManager at langgraph_runtime() startup; the lease heartbeat background task is created and "
         "started there, and heartbeat_enabled / lease_seconds / grace_seconds are not re-read on config.yaml edits."
@@ -85,6 +98,29 @@ STARTUP_ONLY_FIELDS: dict[str, str] = {
     "dedupe_storage": (
         "make_inbound_dedupe_store() resolves the inbound dedupe store once when ChannelService is constructed at startup; the store "
         "(in-process memory or shared Postgres) is captured onto ChannelManager and is not rebuilt on config.yaml edits."
+    ),
+    "auth.local.throttle_storage": (
+        "langgraph_runtime() resolves the login throttle store once at startup from this selector and the persistence engine "
+        "(app.gateway.auth.login_throttle); the store (in-process counter or the shared login_throttle table) is not rebuilt on "
+        "config.yaml edits, so switching it needs a Gateway restart. auth.local.max_login_attempts and lockout_seconds stay live-read."
+    ),
+    "projects.summaries_enabled": (
+        "SummaryGenerator is constructed and its worker pool started once during Gateway lifespan startup; the enable switch, queue shape and model settings are captured into the instance and are not re-read on config.yaml edits."
+    ),
+    "projects.summary_max_bytes": (
+        "SummaryGenerator is constructed and its worker pool started once during Gateway lifespan startup; the enable switch, queue shape and model settings are captured into the instance and are not re-read on config.yaml edits."
+    ),
+    "projects.summary_model_name": (
+        "SummaryGenerator is constructed and its worker pool started once during Gateway lifespan startup; the enable switch, queue shape and model settings are captured into the instance and are not re-read on config.yaml edits."
+    ),
+    "projects.summary_concurrency": (
+        "SummaryGenerator is constructed and its worker pool started once during Gateway lifespan startup; the enable switch, queue shape and model settings are captured into the instance and are not re-read on config.yaml edits."
+    ),
+    "projects.summary_queue_size": (
+        "SummaryGenerator is constructed and its worker pool started once during Gateway lifespan startup; the enable switch, queue shape and model settings are captured into the instance and are not re-read on config.yaml edits."
+    ),
+    "projects.summary_timeout_seconds": (
+        "SummaryGenerator is constructed and its worker pool started once during Gateway lifespan startup; the enable switch, queue shape and model settings are captured into the instance and are not re-read on config.yaml edits."
     ),
 }
 
@@ -97,9 +133,9 @@ def iter_startup_only_field_paths() -> Iterator[str]:
 def is_startup_only_field(field_path: str) -> bool:
     """Return ``True`` when *field_path* is registered as restart-required.
 
-    Accepts only top-level paths (``"database"``, ``"sandbox"`` etc.);
-    nested keys like ``"database.url"`` are not modelled here because the
-    boundary is per-section, not per-leaf.
+    Most entries are top-level paths (``"database"``, ``"sandbox"`` etc.).
+    A nested path is registered only when one leaf has a different reload
+    boundary from the rest of its section, such as ``skills.container_path``.
     """
     return field_path in STARTUP_ONLY_FIELDS
 
@@ -112,7 +148,8 @@ def format_field_description(field_path: str, *, field_doc: str | None = None) -
     side against the other.
 
     Args:
-        field_path: A registered top-level field path (e.g. ``"log_level"``).
+        field_path: A registered field path (e.g. ``"log_level"`` or
+            ``"skills.container_path"``).
         field_doc: Optional human-facing description for the field itself
             (allowed values, semantics, etc.). When supplied, it is
             appended after the ``startup-only:`` marker block separated by

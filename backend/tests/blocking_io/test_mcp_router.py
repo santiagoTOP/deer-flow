@@ -1,9 +1,9 @@
-"""Regression anchor: updating MCP config must not block the event loop.
+"""Regression anchor: reading or updating MCP config must not block the event loop.
 
-The PUT and PATCH handlers resolve the extensions config path, probe its
-existence, read raw JSON, atomically write it, and reload it — all blocking
-filesystem IO. They offload the whole read-modify-write via
-``asyncio.to_thread``; if either regresses back onto the event loop, the strict
+The GET handler resolves the extensions config path and reads raw JSON. PUT
+and PATCH also atomically write and reload it. All of that is blocking
+filesystem IO, so the handlers offload the read or whole read-modify-write via
+``asyncio.to_thread``. If one regresses back onto the event loop, the strict
 Blockbuster gate raises ``BlockingError`` and this test fails.
 
 The admin check is patched to a no-op so the anchor exercises the handler's own
@@ -14,6 +14,7 @@ IO runs at collection, outside the gate.
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 from pathlib import Path
@@ -26,11 +27,34 @@ from app.gateway.routers.mcp import (
     McpConfigUpdateRequest,
     McpServerConfigResponse,
     McpServerStateUpdateRequest,
+    create_mcp_servers,
+    get_mcp_configuration,
     update_mcp_configuration,
     update_mcp_server_state,
 )
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_get_mcp_configuration_does_not_block_or_expand_placeholders(tmp_path: Path, monkeypatch) -> None:
+    config_path = tmp_path / "extensions_config.json"
+    placeholder = "$CODEX_PR_5022_BLOCKING_TOKEN"
+    await asyncio.to_thread(
+        config_path.write_text,
+        '{"mcpServers":{"stdio":{"type":"stdio","command":"npx","args":["--token","' + placeholder + '"]}},"skills":{}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEER_FLOW_EXTENSIONS_CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("CODEX_PR_5022_BLOCKING_TOKEN", "must-not-reach-the-editor")
+
+    async def _noop_admin(_request, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(mcp_router, "require_admin_user", _noop_admin)
+
+    response = await get_mcp_configuration(request=None)
+
+    assert response.mcp_servers["stdio"].args == ["--token", placeholder]
 
 
 async def test_update_mcp_configuration_does_not_block_event_loop(tmp_path: Path, monkeypatch) -> None:
@@ -140,3 +164,74 @@ async def test_concurrent_mcp_put_and_patch_updates_are_serialized(tmp_path: Pat
     )
 
     assert counters["max"] == 1, f"config updates were not serialized (max concurrency {counters['max']})"
+
+
+async def test_update_mcp_configuration_drains_write_across_cancellation(tmp_path: Path, monkeypatch) -> None:
+    """A cancelled PUT drains the committed handoff and finishes teardown outside locks."""
+    config_path = tmp_path / "extensions_config.json"
+    await asyncio.to_thread(config_path.write_text, '{"mcpServers": {}, "skills": {}}', encoding="utf-8")
+    monkeypatch.setenv("DEER_FLOW_EXTENSIONS_CONFIG_PATH", str(config_path))
+
+    async def _noop_admin(_request, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(mcp_router, "require_admin_user", _noop_admin)
+
+    prepared: list[object] = []
+    finished: list[object] = []
+    finish_started = threading.Event()
+    finish_release = threading.Event()
+
+    def fake_prepare(config, *, config_path):
+        prepared.append(config)
+        return len(prepared)
+
+    def fake_finish(pending):
+        finished.append(pending)
+        if pending == 1:
+            finish_started.set()
+            assert finish_release.wait(timeout=5)
+
+    monkeypatch.setattr(mcp_router, "prepare_mcp_reconciliation", fake_prepare)
+    monkeypatch.setattr(mcp_router, "finish_mcp_reconciliation", fake_finish)
+
+    first = asyncio.create_task(
+        update_mcp_configuration(
+            request=None,
+            body=McpConfigUpdateRequest(
+                mcp_servers={"A": McpServerConfigResponse(type="http", url="https://a.example/mcp")},
+            ),
+        )
+    )
+
+    try:
+        assert await asyncio.to_thread(finish_started.wait, 5)
+        first.cancel()
+        await asyncio.sleep(0.05)
+        assert not first.done(), "cancellation released ownership before teardown drained"
+
+        # The first request has released the extensions-config locks even though
+        # its teardown is still blocked. A second legal writer must proceed.
+        second = asyncio.create_task(
+            create_mcp_servers(
+                request=None,
+                body=McpConfigUpdateRequest(
+                    mcp_servers={"B": McpServerConfigResponse(type="http", url="https://b.example/mcp")},
+                ),
+            )
+        )
+        await asyncio.wait_for(second, timeout=5)
+        assert len(prepared) == 2
+        assert finished == [1, 2]
+
+        written = json.loads(await asyncio.to_thread(config_path.read_text, encoding="utf-8"))
+        assert set(written["mcpServers"]) == {"A", "B"}
+
+        finish_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+    finally:
+        finish_release.set()
+        if not first.done():
+            first.cancel()
+            await asyncio.gather(first, return_exceptions=True)

@@ -1,27 +1,30 @@
-"""Surface provider length-capped model responses as run stop reasons.
+"""Surface provider length-capped responses and block truncated tool calls.
 
 Background — see issue bytedance/deer-flow#4271.
 
 Some providers stop generation because the output budget is exhausted and
 surface that through ``finish_reason='length'`` while still returning assistant
-content. DeerFlow should preserve that content for audit, but it should not
-silently treat the run as an uncapped clean completion when the provider has
-explicitly signaled truncation.
+content. DeerFlow preserves visible content, adds a deterministic notice
+whenever tool calls were suppressed (even when partial text survived), and
+drops tool calls that may have been truncated at the output boundary before
+they can execute. The stamped ``model_length_termination`` marker tells
+downstream guards (notably ``TodoMiddleware``) to stand down rather than
+re-engage a capped turn.
 
-This middleware keeps that boundary narrow:
-- it only marks a run-level stop reason when the final AIMessage is capped
-  by a provider length signal and still has visible content;
-- it never rewrites the assistant content or reparses XML-like text into a
-  tool call;
-- it ignores any response that still carries tool-call intent, malformed
-  tool-call metadata, or no visible content, so only terminal assistant
-  responses with visible content can be marked capped.
-
+Stop-reason surfacing for subagents:
+  The lead worker reads ``stop_reason`` from ``runtime.context``. The subagent
+  executor cannot, so each detected cap is also recorded per context
+  ``run_id`` (``None`` included, exactly as the executor passes it back) and
+  exposed via :meth:`consume_stop_reason`, the same duck-typed channel
+  ``TokenBudgetMiddleware`` and ``LoopDetectionMiddleware`` use. A capped
+  subagent then reaches the lead as ``completed`` +
+  ``stop_reason=model_length_capped`` instead of a clean ``completed``.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, override
 
 from langchain.agents import AgentState
@@ -29,48 +32,80 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage
 from langgraph.runtime import Runtime
 
+from deerflow.agents.middlewares._bounded_dict import BoundedDict
 from deerflow.agents.middlewares.model_length_termination_detectors import (
     ModelLengthTermination,
     ModelLengthTerminationDetector,
     default_detectors,
 )
+from deerflow.agents.middlewares.model_response import append_visible_text, has_tool_call_intent, has_visible_content
+from deerflow.agents.middlewares.tool_call_metadata import clone_ai_message_with_tool_calls
 
 MODEL_LENGTH_CAPPED_STOP_REASON = "model_length_capped"
+_MODEL_LENGTH_CAPPED_CONTENT = "The model reached its output limit before producing a complete final response. Please continue the conversation to resume."
 logger = logging.getLogger(__name__)
 
 
-def _has_tool_call_intent_or_error(message: AIMessage) -> bool:
-    if message.tool_calls or getattr(message, "invalid_tool_calls", None):
-        return True
+def _tool_call_summary(message: AIMessage, cleaned_content: Any) -> tuple[int, list[str]]:
+    """Count suppressed tool calls and return their deduplicated names."""
+    names: list[str] = []
+    structured_calls: list[Any] = [*(message.tool_calls or []), *(getattr(message, "invalid_tool_calls", None) or [])]
     additional_kwargs = message.additional_kwargs or {}
-    return bool(additional_kwargs.get("tool_calls") or additional_kwargs.get("function_call"))
+    if structured_calls:
+        # LangChain commonly keeps both parsed calls and their raw provider copy.
+        calls = structured_calls
+    else:
+        calls = list(additional_kwargs.get("tool_calls") or [])
+        function_call = additional_kwargs.get("function_call")
+        if not calls and isinstance(function_call, dict):
+            calls.append(function_call)
+        if not calls and isinstance(message.content, list) and isinstance(cleaned_content, list):
+            # The shared cleanup keeps non-call blocks by identity. Summarize
+            # the removed blocks without duplicating its provider type list.
+            kept_blocks = {id(block) for block in cleaned_content}
+            calls = [block for block in message.content if id(block) not in kept_blocks]
 
-
-def _has_visible_content(message: AIMessage) -> bool:
-    content = message.content
-    if isinstance(content, str):
-        return bool(content.strip())
-    if isinstance(content, list):
-        for block in content:
-            if isinstance(block, str) and block.strip():
-                return True
-            if isinstance(block, dict) and block.get("type") in {"text", "output_text"}:
-                text = block.get("text")
-                if isinstance(text, str) and text.strip():
-                    return True
-    return False
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        name = call.get("name")
+        function = call.get("function")
+        if not isinstance(name, str) and isinstance(function, dict):
+            name = function.get("name")
+        if isinstance(name, str) and name and name not in names:
+            names.append(name)
+    return len(calls), names
 
 
 class ModelLengthFinishReasonMiddleware(AgentMiddleware[AgentState]):
-    """Record provider length caps for terminal assistant responses with content.
-
-    If the last AIMessage still carries tool-call intent, this middleware
-    leaves it alone and lets the normal tool-handling path decide what to do.
-    """
+    """Record provider length termination and block truncated tool calls."""
 
     def __init__(self, detectors: list[ModelLengthTerminationDetector] | None = None) -> None:
         super().__init__()
         self._detectors: list[ModelLengthTerminationDetector] = list(detectors) if detectors else default_detectors()
+        # Consumed by the subagent executor after the run returns; bounded
+        # because the lead chain's shared instance never consumes it.
+        self._lock = threading.Lock()
+        self._stop_reason: BoundedDict[str | None, str] = BoundedDict(1000)
+
+    def consume_stop_reason(self, run_id: str | None) -> str | None:
+        """Pop and return ``"model_length_capped"`` if a cap was detected for this run.
+
+        The subagent executor calls this after the run returns, alongside the
+        token-budget and loop-detection guards, so a length-capped completion
+        carries the cap to the lead.
+        """
+        with self._lock:
+            return self._stop_reason.pop(run_id, None)
+
+    def release_policy_parameters(self) -> dict[str, object]:
+        from deerflow_extension_api import canonical_hash
+
+        return {
+            "suppress_truncated_tool_calls": True,
+            "mark_text_only_length_termination": True,
+            "length_notice_hash": canonical_hash(_MODEL_LENGTH_CAPPED_CONTENT),
+        }
 
     def _detect(self, message: AIMessage) -> ModelLengthTermination | None:
         for detector in self._detectors:
@@ -89,11 +124,6 @@ class ModelLengthFinishReasonMiddleware(AgentMiddleware[AgentState]):
             return None
 
         last = messages[-1]
-        if _has_tool_call_intent_or_error(last):
-            return None
-        if not _has_visible_content(last):
-            return None
-
         termination = self._detect(last)
         if termination is None:
             return None
@@ -102,6 +132,9 @@ class ModelLengthFinishReasonMiddleware(AgentMiddleware[AgentState]):
         thread_id = ctx.get("thread_id") if isinstance(ctx, dict) else None
         run_id = ctx.get("run_id") if isinstance(ctx, dict) else None
         stamped_stop_reason = False
+        if isinstance(ctx, dict) and "run_id" in ctx:
+            with self._lock:
+                self._stop_reason[run_id] = MODEL_LENGTH_CAPPED_STOP_REASON
         if isinstance(ctx, dict):
             # Preserve any earlier cap reason carried across hidden continuation turns.
             if "stop_reason" not in ctx:
@@ -119,7 +152,41 @@ class ModelLengthFinishReasonMiddleware(AgentMiddleware[AgentState]):
                 "stamped_stop_reason": stamped_stop_reason,
             },
         )
-        return None
+
+        # Unlike dangling-call repair, a length stop must also suppress invalid
+        # calls, so clear them before syncing the native provider content.
+        content_source = clone_ai_message_with_tool_calls(last.model_copy(update={"invalid_tool_calls": []}), [])
+        contains_tool_call = has_tool_call_intent(last) or content_source.content is not last.content
+        contains_visible_content = has_visible_content(content_source)
+        if not contains_tool_call and contains_visible_content and (last.additional_kwargs or {}).get("model_length_termination"):
+            return None
+
+        additional_kwargs = dict(last.additional_kwargs or {})
+        suppressed_count, suppressed_names = _tool_call_summary(last, content_source.content) if contains_tool_call else (0, [])
+        if contains_tool_call:
+            # Tool arguments may be incomplete at a max-token boundary.
+            additional_kwargs.pop("tool_calls", None)
+            additional_kwargs.pop("function_call", None)
+        additional_kwargs["model_length_termination"] = {
+            "detector": termination.detector,
+            "reason_field": termination.reason_field,
+            "reason_value": termination.reason_value,
+            "suppressed_tool_call_count": suppressed_count,
+            "suppressed_tool_call_names": suppressed_names,
+        }
+        replacement = content_source.model_copy(
+            update={
+                # Text-only caps still need the terminal marker for downstream
+                # guards, but preserve their visible response without a notice.
+                "content": append_visible_text(content_source, _MODEL_LENGTH_CAPPED_CONTENT) if contains_tool_call or not contains_visible_content else content_source.content,
+                "tool_calls": [],
+                "invalid_tool_calls": [],
+                "additional_kwargs": additional_kwargs,
+                # Keep the provider's termination evidence unchanged.
+                "response_metadata": last.response_metadata,
+            }
+        )
+        return {"messages": [replacement]}
 
     @override
     def after_model(self, state: AgentState, runtime: Runtime) -> dict[str, Any] | None:

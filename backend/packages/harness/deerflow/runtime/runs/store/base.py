@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
+
+from deerflow.utils.time import coerce_iso
 
 
 @dataclass(frozen=True)
@@ -49,7 +52,114 @@ class RunIdempotencyConflict(RuntimeError):
         self.existing = existing
 
 
+def normalize_run_created_at_iso(value: str) -> str:
+    """Make a run timestamp parseable as ISO-8601.
+
+    ``Z`` becomes ``+00:00``. An unencoded ``+`` in a query string arrives as a
+    space (``...T00:00:00 00:00``); restore the offset ``+``.
+    """
+    value = value.strip().replace("Z", "+00:00")
+    if "T" in value and " " in value and "+" not in value.split("T", 1)[1]:
+        date, _, rest = value.partition("T")
+        time_part, sep, offset = rest.rpartition(" ")
+        if sep and offset.replace(":", "").isdigit():
+            value = f"{date}T{time_part}+{offset}"
+    return value
+
+
+def canonical_run_created_at(value: str) -> str:
+    """Canonical UTC microseconds for durable goal-instance matching."""
+    parsed = datetime.fromisoformat(normalize_run_created_at_iso(value))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat(timespec="microseconds")
+
+
+def format_run_cursor_created_at(value: str) -> str:
+    """UTC keyset cursor using ``Z`` so ``+`` is not decoded as space in query strings."""
+    dt = datetime.fromisoformat(normalize_run_created_at_iso(value))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    else:
+        dt = dt.astimezone(UTC)
+    return dt.isoformat().replace("+00:00", "Z")
+
+
+def parse_run_created_at(value: object) -> datetime:
+    """Parse a stored run timestamp into an aware UTC datetime for keyset order."""
+    iso = coerce_iso(value)
+    if not iso:
+        return datetime.min.replace(tzinfo=UTC)
+    try:
+        dt = datetime.fromisoformat(normalize_run_created_at_iso(iso))
+    except ValueError:
+        return datetime.min.replace(tzinfo=UTC)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
+
+
+def run_sort_key(created_at: object, run_id: str) -> tuple[datetime, str]:
+    """Total order for newest-first run listings: ``created_at`` then ``run_id``."""
+    return (parse_run_created_at(created_at), run_id)
+
+
+def run_is_before_cursor(
+    created_at: object,
+    run_id: str,
+    *,
+    before_created_at: str | None,
+    before_run_id: str | None,
+) -> bool:
+    """Return True when ``(created_at, run_id)`` is older than the keyset cursor."""
+    if not before_created_at or not before_run_id:
+        return True
+    return run_sort_key(created_at, run_id) < run_sort_key(before_created_at, before_run_id)
+
+
 class RunStore(abc.ABC):
+    supports_run_inputs = False
+
+    async def mutate_run_inputs(self, run_id, change, *, user_id=None, owner_worker_id=None):
+        """Atomically mutate a bounded input state with the current run row.
+
+        ``change`` is a synchronous host callback, never client-supplied code.
+        Serialize against status/cancellation; reject a foreign or expired owner.
+        """
+        raise NotImplementedError("Run inputs are unavailable in this store")
+
+    async def list_input_runs(self, thread_id, *, user_id=None, limit=10):
+        raise NotImplementedError("Run inputs are unavailable in this store")
+
+    async def active_input_run(self, thread_id, *, user_id=None):
+        raise NotImplementedError("Run inputs are unavailable in this store")
+
+    # Explicit idempotency_key / idempotency_request keyword parameters each
+    # declare support for that field. An override accepting them only through
+    # **kwargs must opt in below and persist both the key and resume identity.
+    # The flag must be declared on the class that literally defines
+    # create_thread_operation_atomic: a flag-only child or mixin cannot opt in
+    # another class's method, and a new override cannot inherit a parent's opt-in.
+    # Inheriting the opted-in method unchanged preserves its capability.
+    supports_idempotency_request_kwargs = False
+
+    # Strict completion requires explicit require_terminal and owner_worker_id
+    # keywords, or this opt-in on the class defining update_run_completion.
+    # Inheriting that method preserves support; overriding it must opt in again.
+    # Accepting **kwargs alone never promises the atomic terminal/owner guards.
+    supports_terminal_completion_kwargs = False
+
+    async def list_changed(
+        self,
+        *,
+        after_change_seq: int,
+        after_run_id: str,
+        user_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List public run-record changes in stable ascending cursor order."""
+        raise NotImplementedError
+
     @abc.abstractmethod
     async def put(
         self,
@@ -67,9 +177,13 @@ class RunStore(abc.ABC):
         error: str | None = None,
         stop_reason: str | None = None,
         created_at: str | None = None,
+        goal_verdict: dict[str, Any] | None = None,
         owner_worker_id: str | None = None,
         lease_expires_at: str | None = None,
         idempotency_key: str | None = None,
+        evidence_origin: str = "unknown",
+        evidence_agent_id: str | None = None,
+        idempotency_request: dict[str, Any] | None = None,
     ) -> None:
         pass
 
@@ -89,8 +203,18 @@ class RunStore(abc.ABC):
         *,
         user_id: str | None = None,
         limit: int = 100,
+        before_created_at: str | None = None,
+        before_run_id: str | None = None,
     ) -> list[dict[str, Any]]:
         pass
+
+    async def list_by_thread_created_at(self, thread_id: str, *, user_id: str, created_at: str) -> list[dict[str, Any]]:
+        """Return all exact owner/thread/timestamp matches, without pagination.
+
+        Used to identify a worker-installed scheduled goal after a restart.
+        Missing support must fail closed rather than guess from bounded history.
+        """
+        raise NotImplementedError
 
     async def list_successful_regenerate_sources(
         self,
@@ -132,11 +256,14 @@ class RunStore(abc.ABC):
         *,
         error: str | None = None,
         stop_reason: str | None = None,
+        goal_verdict: dict[str, Any] | None = None,
+        owner_worker_id: str | None = None,
     ) -> bool | None:
         """Update a run status.
 
-        Returns ``False`` when the store can prove no row was updated. Older or
-        lightweight stores may return ``None`` when they cannot report rowcount.
+        With ``owner_worker_id``, atomically require that owner and an unexpired
+        lease. Return True only after this operation commits. False means no
+        update; None from legacy stores is unconfirmed in heartbeat mode.
         """
         pass
 
@@ -176,6 +303,8 @@ class RunStore(abc.ABC):
         run_id: str,
         *,
         status: str,
+        require_terminal: bool = False,
+        owner_worker_id: str | None = None,
         total_input_tokens: int = 0,
         total_output_tokens: int = 0,
         total_tokens: int = 0,
@@ -188,12 +317,15 @@ class RunStore(abc.ABC):
         last_ai_message: str | None = None,
         first_human_message: str | None = None,
         error: str | None = None,
+        goal_verdict: dict[str, Any] | None = None,
     ) -> bool | None:
         """Persist final completion fields.
 
         Implementations must not replace a different terminal status. Returns
         ``False`` when the row is missing or already has a conflicting terminal
-        outcome.
+        outcome. With ``require_terminal``, require the exact requested terminal
+        status and owner atomically: metadata must not transition active rows or
+        change error/goal_verdict. Unsupported strict calls must fail closed.
         """
         pass
 
@@ -226,7 +358,7 @@ class RunStore(abc.ABC):
         pass
 
     @abc.abstractmethod
-    async def aggregate_tokens_by_thread(self, thread_id: str, *, include_active: bool = False) -> dict[str, Any]:
+    async def aggregate_tokens_by_thread(self, thread_id: str, *, include_active: bool = False, user_id: str | None = None) -> dict[str, Any]:
         """Aggregate token usage for completed runs in a thread.
 
         Returns a dict with keys: total_tokens, total_input_tokens,
@@ -242,8 +374,14 @@ class RunStore(abc.ABC):
         *,
         owner_worker_id: str,
         lease_expires_at: str,
+        allow_interrupted: bool = False,
     ) -> bool:
-        """Renew the lease on an active run. Returns ``False`` when no row matched."""
+        """Renew only an active, owned, unexpired lease to a future deadline.
+
+        The explicit allow_interrupted option also permits an interrupted row
+        while its owning Worker finishes rollback. Never renew success/error.
+        Return False when no row satisfies these atomic conditions.
+        """
         pass
 
     async def renew_lease(
@@ -252,6 +390,7 @@ class RunStore(abc.ABC):
         *,
         owner_worker_id: str,
         lease_expires_at: str,
+        allow_interrupted: bool = False,
     ) -> LeaseRenewal:
         """Renew ownership and return any durable cancellation request.
 
@@ -259,12 +398,15 @@ class RunStore(abc.ABC):
         cancellation action, so third-party stores remain source-compatible
         without adding a background read. Stores that support multi-process
         cancellation must override this method to renew and observe the
-        request atomically.
+        request atomically, retaining the live-lease/owner conditions. The
+        allow_interrupted option must retain those predicates; unsupported
+        implementations fail closed rather than silently relaxing status guards.
         """
         renewed = await self.update_lease(
             run_id,
             owner_worker_id=owner_worker_id,
             lease_expires_at=lease_expires_at,
+            **({"allow_interrupted": True} if allow_interrupted else {}),
         )
         return LeaseRenewal(renewed=renewed)
 
@@ -283,19 +425,26 @@ class RunStore(abc.ABC):
         status: str,
         error: str | None = None,
         stop_reason: str | None = None,
+        goal_verdict: dict[str, Any] | None = None,
+        owner_worker_id: str | None = None,
     ) -> StatusFinalization:
         """Atomically finalize an active run unless cancellation won.
 
-        The compatibility default is safe for stores that do not implement
-        durable cancellation.
+        With an owner, atomically require a live owner lease and return an
+        explicit commit acknowledgment. Rejection without cancel_action is final,
+        not permission to retry a weaker write. Exceptions/cancellation are unknown.
+        The legacy default cannot enforce this and rejects owned calls.
         """
+        if owner_worker_id is not None:
+            raise NotImplementedError("Store must implement owner/lease-fenced finalization")
         updated = await self.update_status(
             run_id,
             status,
             error=error,
             stop_reason=stop_reason,
+            **({"goal_verdict": goal_verdict} if goal_verdict is not None else {}),
         )
-        return StatusFinalization(finalized=updated is not False)
+        return StatusFinalization(finalized=updated is True)
 
     @abc.abstractmethod
     async def claim_for_takeover(
@@ -348,6 +497,9 @@ class RunStore(abc.ABC):
         created_at: str | None = None,
         grace_seconds: int = 10,
         idempotency_key: str | None = None,
+        evidence_origin: str = "unknown",
+        evidence_agent_id: str | None = None,
+        idempotency_request: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         """Atomically create an active thread operation with cross-process uniqueness.
 
@@ -364,7 +516,7 @@ class RunStore(abc.ABC):
             raise NotImplementedError("RunStore must implement create_thread_operation_atomic() or create_run_atomic()")
         if operation_kind != "run":
             raise NotImplementedError("Legacy RunStore.create_run_atomic() cannot create non-run thread operations")
-        if idempotency_key is not None:
+        if idempotency_key is not None or idempotency_request is not None:
             raise NotImplementedError("Legacy RunStore.create_run_atomic() cannot guarantee idempotent admission")
         return await self.create_run_atomic(
             run_id,

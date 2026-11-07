@@ -1,6 +1,9 @@
 import asyncio
 import copy
+import json
+import logging
 import threading
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,6 +19,7 @@ from deerflow.agents.memory.backends.deermem.deermem.core.updater import (
     _build_staleness_section,
     _coerce_source_confidence,
     _extract_text,
+    _normalize_memory_update_fact,
     _parse_memory_update_response,
 )
 from deerflow.agents.memory.manager import LangfuseMemoryCallbacks
@@ -31,6 +35,7 @@ def _make_memory(facts: list[dict[str, object]] | None = None) -> dict[str, obje
             "workContext": {"summary": "", "updatedAt": ""},
             "personalContext": {"summary": "", "updatedAt": ""},
             "topOfMind": {"summary": "", "updatedAt": ""},
+            "cognitiveStyle": {"summary": "", "updatedAt": ""},
         },
         "history": {
             "recentMonths": {"summary": "", "updatedAt": ""},
@@ -266,6 +271,9 @@ def test_automatic_update_uses_hybrid_capacity_policy() -> None:
             fact_confidence_threshold=0.7,
         )
     )
+    now = datetime.now(UTC)
+    recent_timestamp = now.isoformat().replace("+00:00", "Z")
+    stale_timestamp = (now - timedelta(days=365)).isoformat().replace("+00:00", "Z")
     current_memory = _make_memory(
         facts=[
             *[
@@ -274,7 +282,7 @@ def test_automatic_update_uses_hybrid_capacity_policy() -> None:
                     "content": f"high {index}",
                     "category": "preference",
                     "confidence": 0.99,
-                    "createdAt": "2026-08-12T00:00:00Z",
+                    "createdAt": recent_timestamp,
                 }
                 for index in range(8)
             ],
@@ -283,15 +291,15 @@ def test_automatic_update_uses_hybrid_capacity_policy() -> None:
                 "content": "stale high confidence",
                 "category": "preference",
                 "confidence": 0.9,
-                "createdAt": "2025-01-01T00:00:00Z",
+                "createdAt": stale_timestamp,
             },
             {
                 "id": "confirmed_recently",
                 "content": "recently confirmed preference",
                 "category": "preference",
                 "confidence": 0.7,
-                "createdAt": "2025-01-01T00:00:00Z",
-                "lastConfirmedAt": "2026-08-12T00:00:00Z",
+                "createdAt": stale_timestamp,
+                "lastConfirmedAt": recent_timestamp,
             },
         ]
     )
@@ -1716,6 +1724,8 @@ class TestUserIdForwarding:
         assert result is True
         invoke_config = model.invoke.call_args.kwargs["config"]
         metadata = invoke_config["metadata"]
+        # The update runs on a Timer thread that inherits no ContextVars, so the
+        # id captured at enqueue time is what keeps this trace correlated.
         assert metadata["deerflow_trace_id"] == "memory-trace-1"
         assert metadata["langfuse_session_id"] == "thread-memory"
         assert metadata["langfuse_user_id"] == "user-42"
@@ -1884,6 +1894,86 @@ class TestNullConfidenceDoesNotBlockUpdates:
         assert _coerce_source_confidence({"confidence": None}) == 0.5
         assert _coerce_source_confidence({}) == 0.5
         assert _coerce_source_confidence({"confidence": 0.83}) == 0.83
+
+    def test_coerce_source_confidence_tolerates_an_unbounded_int(self) -> None:
+        # A stored fact can carry a JSON integer such as 10**400; float() raises
+        # OverflowError, which must fall back like any other unusable value.
+        assert _coerce_source_confidence({"confidence": 10**400}) == 0.5
+
+
+class TestOutOfRangeExtractionConfidenceDoesNotBlockUpdates:
+    """A model-emitted confidence outside [0, 1] must not fail the whole update.
+
+    Storage rejects an out-of-range confidence, so an unchecked proposal made
+    the whole extraction batch fail on every turn (the watermark never
+    advanced and the same paid call repeated). The extraction normalizer now
+    treats the range like every other malformed shape: the item is dropped with
+    a warning and the rest of the update still applies — except when the same
+    batch proposes ``factsToRemove``, where dropping a fact invalidates
+    ``replacementFactIndex`` positions and the parse still fails closed
+    (pinned below).
+    """
+
+    @pytest.mark.parametrize("confidence", [1.5, 95, -0.1, 10**400], ids=["above-one", "percent", "negative", "unbounded-int"])
+    def test_normalize_rule_drops_out_of_range_confidence(self, confidence: object) -> None:
+        normalized = _normalize_memory_update_fact({**_DURABLE_USER_FACT, "content": "User lives in Berlin", "confidence": confidence})
+        assert normalized is None
+
+    @pytest.mark.parametrize("confidence", [0.0, 0.5, 1.0])
+    def test_normalize_rule_keeps_in_range_confidence(self, confidence: float) -> None:
+        normalized = _normalize_memory_update_fact({**_DURABLE_USER_FACT, "content": "User lives in Berlin", "confidence": confidence})
+        assert normalized is not None
+        assert normalized["confidence"] == confidence
+
+    def test_update_memory_drops_the_bad_fact_and_keeps_the_rest(self, tmp_path) -> None:
+        from deerflow.agents.memory.backends.deermem.deermem.core.storage import FileMemoryStorage
+
+        response = {
+            "user": {},
+            "history": {},
+            "newFacts": [
+                {**_DURABLE_USER_FACT, "content": "User prefers dark mode", "category": "preference", "confidence": 0.9},
+                {**_DURABLE_USER_FACT, "content": "User lives in Berlin", "category": "context", "confidence": 1.5},
+            ],
+            "factsToRemove": [],
+        }
+        storage = FileMemoryStorage(DeerMemConfig(storage_path=str(tmp_path)))
+        synthesized = MagicMock()
+        synthesized.content = json.dumps(response)
+        model = MagicMock()
+        model.invoke = MagicMock(return_value=synthesized)
+        model.ainvoke = AsyncMock(return_value=synthesized)
+        updater = _make_updater(
+            config=_memory_config(fact_confidence_threshold=0.7, max_facts=100),
+            storage=storage,
+            llm=model,
+        )
+        msg = MagicMock(type="human", content="Hello")
+        ai_msg = MagicMock(type="ai", content="Hi", tool_calls=[])
+
+        assert updater.update_memory([msg, ai_msg], thread_id="thread-confidence", agent_name="__default__") is True
+
+        stored = storage.load(agent_name="__default__")
+        assert [fact["content"] for fact in stored["facts"]] == ["User prefers dark mode"]
+
+    def test_out_of_range_drop_logs_the_raw_confidence(self, caplog) -> None:
+        with caplog.at_level(logging.WARNING, logger="deerflow.agents.memory.backends.deermem.deermem.core.updater"):
+            normalized = _normalize_memory_update_fact({**_DURABLE_USER_FACT, "content": "User lives in Berlin", "confidence": 95})
+        assert normalized is None
+        assert any("out-of-range confidence" in message and "95" in message for message in caplog.messages)
+
+    def test_removal_batch_still_fails_closed_when_a_fact_is_dropped(self) -> None:
+        payload = {
+            "user": {},
+            "history": {},
+            "factsToRemove": [{"id": "fact_old", "scope": "user", "reason": "Retracted by the user"}],
+            "newFacts": [
+                {**_DURABLE_USER_FACT, "content": "User prefers dark mode", "confidence": 0.9},
+                {**_DURABLE_USER_FACT, "content": "User lives in Berlin", "confidence": 1.5},
+            ],
+        }
+        with pytest.raises(json.JSONDecodeError, match="Unsafe partial"):
+            _parse_memory_update_response(json.dumps(payload))
 
 
 class TestParseMemoryUpdateFactsToRemoveGate:

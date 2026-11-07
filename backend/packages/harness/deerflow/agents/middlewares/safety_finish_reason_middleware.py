@@ -190,7 +190,7 @@ class SafetyFinishReasonMiddleware(AgentMiddleware[AgentState]):
         message: AIMessage,
         termination: SafetyTermination,
     ) -> AIMessage:
-        tool_calls = message.tool_calls or []
+        tool_calls = [*(message.tool_calls or []), *(message.invalid_tool_calls or [])]
         suppressed_names = [tc.get("name") or "unknown" for tc in tool_calls]
         template = _USER_FACING_MESSAGE if tool_calls else _USER_FACING_EMPTY_MESSAGE
         explanation = template.format(
@@ -201,11 +201,15 @@ class SafetyFinishReasonMiddleware(AgentMiddleware[AgentState]):
         new_content = self._append_user_message(message.content, explanation)
 
         # clone_ai_message_with_tool_calls handles structured tool_calls,
-        # raw additional_kwargs.tool_calls, and function_call in one shot.
+        # raw additional_kwargs.tool_calls, function_call, and provider
+        # tool-call content blocks in one shot.
         # It only rewrites finish_reason when the old value was "tool_calls",
         # which is not our case — content_filter / refusal / SAFETY stay put
         # so downstream SSE / converters keep seeing the real provider reason.
-        cleared = clone_ai_message_with_tool_calls(message, [], content=new_content)
+        # Invalid calls must also be suppressed: the shared helper otherwise
+        # retains their native content blocks for dangling-call recovery.
+        source = message.model_copy(update={"invalid_tool_calls": []})
+        cleared = clone_ai_message_with_tool_calls(source, [], content=new_content)
 
         # Re-clone additional_kwargs so we don't accidentally mutate the
         # dict returned by clone_ai_message_with_tool_calls (which already
@@ -372,13 +376,10 @@ class SafetyFinishReasonMiddleware(AgentMiddleware[AgentState]):
         #      'assistant' must not be empty", #4393), which poisons the whole
         #      thread until a new chat is started. Backfill an explanation so
         #      the persisted message is non-empty.
-        tool_calls = list(last.tool_calls or [])
-        # ``or ""`` normalizes every "no visible content" shape to blank:
-        # None, "", [] and whitespace all count. None is reachable via
-        # ``model_copy(update={"content": None})`` (a rewrite path that skips
-        # validation); without the guard message_content_to_text stringifies
-        # it to "None" and the backfill would be skipped, re-poisoning the
-        # thread this fix is meant to protect.
+        tool_calls = [*(last.tool_calls or []), *(last.invalid_tool_calls or [])]
+        # Keep local falsey-content normalization as a defensive guard; the
+        # shared helper also handles None from validation-skipping rewrites.
+        # The trailing strip() makes whitespace-only content blank as well.
         content_is_blank = not message_content_to_text(last.content or "").strip()
         if not tool_calls and not content_is_blank:
             return None

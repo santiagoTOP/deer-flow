@@ -17,27 +17,39 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import gc
 import inspect
 import logging
 import os
 import sys
 import threading
+import time
 import weakref
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import Callable, Coroutine, Mapping
+from contextlib import AbstractAsyncContextManager
+from contextvars import Context
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import lru_cache
-from typing import Any, Literal, cast
+from typing import Any, Final, Literal, cast
 
+from deerflow_extension_api.agent_runs import AGENT_RUNS_CONTEXT_KEY
+from langchain_core.messages import AIMessage, AIMessageChunk
 from langgraph.checkpoint.base import empty_checkpoint
-from langgraph.types import Overwrite
+from langgraph.errors import GraphRecursionError
+from langgraph.types import Command, Overwrite
 
 from deerflow.agents.goal_state import GoalEvaluation, GoalState
+from deerflow.agents.interaction_policy import RunInteractionPolicy, resolve_run_interaction_policy
 from deerflow.agents.middlewares.input_sanitization_middleware import neutralize_untrusted_tags
 from deerflow.config.app_config import AppConfig
 from deerflow.config.database_config import CheckpointChannelMode
-from deerflow.constants import TOOL_RESULTS_DIRNAME
+from deerflow.constants import CONVERSATION_READER_CONTEXT_KEY, TOOL_RESULTS_DIRNAME
+from deerflow.knowledge_scope import KNOWLEDGE_SCOPE_RUNTIME_KEY, execution_scope
+from deerflow.mcp_scope import (
+    THREAD_INCARNATION_CONTEXT_KEY,
+    THREAD_INCARNATION_METADATA_GUARD_KEY,
+)
 from deerflow.runtime.checkpoint_mode import (
     aensure_checkpoint_mode_compatible,
     inject_checkpoint_mode,
@@ -49,66 +61,232 @@ from deerflow.runtime.checkpoint_state import (
     graph_state_schema,
     graph_writable_channels,
 )
-from deerflow.runtime.context_keys import CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY
+from deerflow.runtime.context_keys import (
+    CHECKPOINT_AGENT_NAME_METADATA_KEY,
+    CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY,
+    DEFAULT_AGENT_NAME_METADATA_VALUE,
+    PROJECT_CONTEXT_KEY,
+    checkpoint_agent_binding_metadata,
+)
+from deerflow.runtime.events.message_identity import attach_message_seq, message_identity
+from deerflow.runtime.events.producer import current_producer, publisher_scope, run_producer_context
 from deerflow.runtime.goal import (
     DEFAULT_MAX_GOAL_CONTINUATIONS,
     DEFAULT_MAX_NO_PROGRESS_CONTINUATIONS,
+    GoalEvaluationFormatError,
     GoalWriteConflict,
     _call_checkpointer_method,
     _is_visible_message,
     _message_type,
     attach_goal_evaluation,
+    build_goal_outcome,
+    build_goal_state,
     compute_no_progress_count,
     create_goal_evaluator_model,
     evaluate_goal_completion,
     goal_thread_lock,
+    latest_visible_assistant_message_id,
     latest_visible_assistant_signature,
     make_goal_continuation_message,
     read_thread_goal,
     should_continue_goal,
     visible_conversation_signature,
+    wake_goal_after_external_wait,
     write_thread_goal,
 )
+from deerflow.runtime.goal_progress import observe_goal_operations
+from deerflow.runtime.keyed_lock import AsyncKeyedLockTable
+from deerflow.runtime.run_origin import origin_kind_of
+from deerflow.runtime.runs.schemas import GOAL_RUN_HARD_STOP_REASONS
+from deerflow.runtime.runs.stream_cleanup import close_agent_stream
 from deerflow.runtime.serialization import serialize
 from deerflow.runtime.stream_bridge import StreamBridge
 from deerflow.runtime.stream_modes import normalize_stream_modes, to_langgraph_stream_modes
-from deerflow.runtime.user_context import get_effective_user_id, resolve_runtime_user_id
-from deerflow.trace_context import (
-    DEERFLOW_TRACE_METADATA_KEY,
-    is_trace_id_from_request_header,
-    resolve_deerflow_trace_id,
-)
+from deerflow.runtime.user_context import get_current_user, get_effective_user_id, resolve_runtime_user_id
+from deerflow.sandbox.lease import SANDBOX_SERVER_OWNED_CONTEXT_KEYS, register_sandbox_prewarm_cleanup
+from deerflow.scheduler.runtime import SCHEDULER_CAPABILITY_CONTEXT_KEY, SchedulerRunCapability
+from deerflow.trace_context import DEERFLOW_TRACE_METADATA_KEY, ensure_trace_id
 from deerflow.tracing import inject_langfuse_metadata
+from deerflow.utils.assembly_io import run_assembly
 from deerflow.utils.messages import message_to_text
 from deerflow.workspace_changes import capture_workspace_snapshot, get_changed_output_paths, record_workspace_changes
 from deerflow.workspace_changes.types import WorkspaceSnapshot
 
-from .manager import RunManager, RunRecord, RunStartOutcome
+from .manager import ConflictError, RunManager, RunRecord, RunStartOutcome
 from .naming import resolve_root_run_name
-from .schemas import RunStatus
+from .schemas import GOAL_RUN_HARD_STOP_REASONS as _GOAL_RUN_HARD_STOP_REASONS
+from .schemas import RunStatus, ThreadOperationKind
+from .store.base import canonical_run_created_at
 
 logger = logging.getLogger(__name__)
+_THREAD_INCARNATION_UNSET = object()
+_MISSING_BRIDGE_METHOD = object()
 
-_checkpoint_locks_guard = threading.Lock()
-_checkpoint_locks_by_loop: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Lock]] = weakref.WeakKeyDictionary()
+
+def _declared_bridge_method(bridge: Any, name: str) -> Any | None:
+    """Return a real bridge method without triggering dynamic mock attributes."""
+    if inspect.getattr_static(bridge, name, _MISSING_BRIDGE_METHOD) is _MISSING_BRIDGE_METHOD:
+        return None
+    method = getattr(bridge, name, None)
+    return method if callable(method) else None
 
 
-@asynccontextmanager
-async def _checkpoint_thread_lock(thread_id: str) -> AsyncIterator[None]:
-    """Serialize checkpoint mutations for one thread without blocking goal commands."""
+def _log_cancelled_stream_close_failure(
+    exc: asyncio.CancelledError,
+    *,
+    run_id: str,
+    abort_requested: bool,
+) -> None:
+    close_failure = exc.__cause__
+    if not isinstance(close_failure, Exception):
+        return
+    log = logger.warning if abort_requested else logger.debug
+    message = "Could not close aborted agent stream for run %s" if abort_requested else "Could not close agent stream for run %s"
+    log(
+        message,
+        run_id,
+        exc_info=(type(close_failure), close_failure, close_failure.__traceback__),
+    )
+
+
+_checkpoint_locks = AsyncKeyedLockTable[str]()
+
+# Completed LangGraph runs can leave callback Contexts and AsyncPregelLoop
+# instances in unreachable reference cycles. They are collectable, but a busy
+# Gateway may promote those cycles into older GC generations faster than the
+# automatic collector revisits them, producing a rising post-GC heap floor.
+# Coalesce terminal full collections so the cycles have a bounded lifetime
+# without paying for a stop-the-world collection on every run.
+_TERMINAL_CYCLE_COLLECTION_INTERVAL_SECONDS = 10.0
+_TERMINAL_CYCLE_COLLECTION_INFO_THRESHOLD_SECONDS = 0.1
+_terminal_cycle_collection_guard = threading.Lock()
+_terminal_cycle_collection_last_at = time.monotonic()
+_terminal_cycle_collection_scheduled_loops: weakref.WeakSet[asyncio.AbstractEventLoop] = weakref.WeakSet()
+
+
+def _create_contextless_task(coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+    """Schedule terminal housekeeping without retaining the run's ContextVars."""
+    return asyncio.create_task(coro, context=Context())
+
+
+def _schedule_terminal_cycle_collection() -> None:
+    """Coalesce full cyclic-GC passes after completed LangGraph runs."""
     loop = asyncio.get_running_loop()
-    with _checkpoint_locks_guard:
-        locks = _checkpoint_locks_by_loop.get(loop)
-        if locks is None:
-            locks = {}
-            _checkpoint_locks_by_loop[loop] = locks
-        lock = locks.get(thread_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            locks[thread_id] = lock
+    with _terminal_cycle_collection_guard:
+        if loop in _terminal_cycle_collection_scheduled_loops:
+            return
+        elapsed = time.monotonic() - _terminal_cycle_collection_last_at
+        delay = max(0.0, _TERMINAL_CYCLE_COLLECTION_INTERVAL_SECONDS - elapsed)
+        _terminal_cycle_collection_scheduled_loops.add(loop)
 
-    async with lock:
-        yield
+    async def _collect() -> None:
+        global _terminal_cycle_collection_last_at
+
+        try:
+            with _terminal_cycle_collection_guard:
+                now = time.monotonic()
+                if now - _terminal_cycle_collection_last_at < _TERMINAL_CYCLE_COLLECTION_INTERVAL_SECONDS:
+                    return
+                _terminal_cycle_collection_last_at = now
+
+            started_at = time.perf_counter()
+            # Do not run a heap walk synchronously from the event-loop timer.
+            # CPython's collector can still contend for the GIL, so surface slow
+            # passes below rather than claiming this removes every pause.
+            collected = await loop.run_in_executor(None, gc.collect)
+            duration = time.perf_counter() - started_at
+            if duration >= _TERMINAL_CYCLE_COLLECTION_INFO_THRESHOLD_SECONDS:
+                logger.info(
+                    "Terminal cyclic GC collected %d object(s) in %.3f seconds",
+                    collected,
+                    duration,
+                )
+            else:
+                logger.debug(
+                    "Terminal cyclic GC collected %d object(s) in %.3f seconds",
+                    collected,
+                    duration,
+                )
+        finally:
+            with _terminal_cycle_collection_guard:
+                _terminal_cycle_collection_scheduled_loops.discard(loop)
+
+    def _start_collection() -> None:
+        _create_contextless_task(_collect())
+
+    # A blank Context prevents the timer itself from retaining the completed
+    # run. The loop owns the TimerHandle; the WeakSet never keeps a test or
+    # short-lived embedded-client event loop alive.
+    loop.call_later(delay, _start_collection, context=Context())
+
+
+def _remove_callback(config: dict[str, Any], handler: Any) -> None:
+    callbacks = config.get("callbacks")
+    if isinstance(callbacks, list):
+        callbacks[:] = [callback for callback in callbacks if callback is not handler]
+        return
+    remove_handler = getattr(callbacks, "remove_handler", None)
+    if callable(remove_handler):
+        try:
+            remove_handler(handler)
+        except Exception:
+            logger.debug("could not detach terminal callback", exc_info=True)
+
+
+def _release_run_scoped_references(
+    configs: list[dict[str, Any]],
+    runtime_context: dict[str, Any] | None,
+    journal: Any | None,
+) -> None:
+    """Remove worker-owned graph references once durable finalization is done."""
+    internal_context_keys = {
+        "__run_journal",
+        "__run_input_control",
+        CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY,
+        CONVERSATION_READER_CONTEXT_KEY,
+        SCHEDULER_CAPABILITY_CONTEXT_KEY,
+        AGENT_RUNS_CONTEXT_KEY,
+    }
+    try:
+        from deerflow.extensions import EXTENSION_SNAPSHOT_CONTEXT_KEY
+
+        internal_context_keys.add(EXTENSION_SNAPSHOT_CONTEXT_KEY)
+    except Exception:
+        pass
+    try:
+        from deerflow_extension_api import EXTENSION_TASK_STORE_KEY
+
+        internal_context_keys.add(EXTENSION_TASK_STORE_KEY)
+    except Exception:
+        pass
+
+    seen_configs: set[int] = set()
+    handlers = [journal] if journal is not None else []
+    for runnable_config in configs:
+        if not isinstance(runnable_config, dict) or id(runnable_config) in seen_configs:
+            continue
+        seen_configs.add(id(runnable_config))
+        configurable = runnable_config.get("configurable")
+        if isinstance(configurable, dict):
+            configurable.pop("__pregel_runtime", None)
+            configurable.pop(CONVERSATION_READER_CONTEXT_KEY, None)
+            configurable.pop(SCHEDULER_CAPABILITY_CONTEXT_KEY, None)
+            configurable.pop(AGENT_RUNS_CONTEXT_KEY, None)
+        context = runnable_config.get("context")
+        if isinstance(context, dict):
+            for key in internal_context_keys:
+                context.pop(key, None)
+        for handler in handlers:
+            _remove_callback(runnable_config, handler)
+
+    if isinstance(runtime_context, dict):
+        for key in internal_context_keys:
+            runtime_context.pop(key, None)
+
+
+def _checkpoint_thread_lock(thread_id: str) -> AbstractAsyncContextManager[None]:
+    """Serialize checkpoint mutations for one thread without blocking goal commands."""
+    return _checkpoint_locks.hold(thread_id)
 
 
 _DELIVERY_RECEIPT_RETRY_DELAYS_SECONDS = (0.1, 0.5)
@@ -145,13 +323,14 @@ async def _persist_delivery_receipt(
     attempts = len(_DELIVERY_RECEIPT_RETRY_DELAYS_SECONDS) + 1
     for attempt in range(attempts):
         try:
-            await event_store.put_if_absent(
-                thread_id=thread_id,
-                run_id=run_id,
-                event_type="run.delivery",
-                category="outputs",
-                content=content,
-            )
+            with publisher_scope("run.delivery"):
+                await event_store.put_if_absent(
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    event_type="run.delivery",
+                    category="outputs",
+                    content=content,
+                )
             return True
         except Exception:
             if attempt == attempts - 1:
@@ -178,6 +357,26 @@ async def _persist_delivery_receipt(
 
 _DELIVERY_INCOMPLETE_ERROR = "Artifact delivery incomplete: no produced output artifact was presented"
 _DELIVERY_RECEIPT_FAILED_ERROR = "Artifact delivery verification failed: terminal delivery receipt could not be persisted"
+_RECURSION_CAPPED_STOP_REASON = "recursion_capped"
+_RECURSION_CAPPED_LISTED_OUTPUTS = 5
+
+
+def _recursion_capped_message(recursion_limit: object, delivery_content: dict[str, Any] | None) -> str:
+    """Say a run hit its step budget, listing outputs it created but never presented.
+
+    LangGraph's own text points at a config key and a troubleshooting URL; users
+    see it as an unexplained failure and assume the files they waited for are lost.
+    """
+    limit = f" (recursion_limit={recursion_limit})" if isinstance(recursion_limit, int) and not isinstance(recursion_limit, bool) else ""
+    message = f"The run stopped at its step limit{limit} before finishing."
+    content = delivery_content or {}
+    presented = set(content.get("matched_paths") or [])
+    unpresented = [path for path in content.get("produced_paths") or [] if path not in presented]
+    if unpresented:
+        listed = ", ".join(unpresented[:_RECURSION_CAPPED_LISTED_OUTPUTS])
+        more = len(unpresented) - _RECURSION_CAPPED_LISTED_OUTPUTS
+        message += f" Created but not presented: {listed}{f' and {more} more' if more > 0 else ''}."
+    return f"{message} Send a message to continue."
 
 
 def _empty_delivery_content() -> dict[str, Any]:
@@ -192,9 +391,13 @@ def _presented_path_covers_output(presented_path: str, produced_path: str) -> bo
 def _delivery_content_with_outputs(
     content: dict[str, Any],
     produced_paths: list[str],
+    *,
+    pre_run_snapshot: WorkspaceSnapshot | None = None,
 ) -> dict[str, Any]:
-    """Attach a delivery verdict when this run created or modified outputs."""
+    """Attach a delivery verdict or explain why a truncated scan skipped it."""
     if not produced_paths:
+        if pre_run_snapshot is not None and pre_run_snapshot.truncated:
+            return {**content, "verification_skipped": "truncated_pre_run_snapshot"}
         return content
 
     presented_paths = content.get("by_tool", {}).get("present_files", [])
@@ -260,6 +463,33 @@ async def _produced_output_paths(
 # Keep this streaming policy separate from middleware write-authorization sets.
 _LARGE_FILE_TOOL_NAMES = frozenset({"str_replace", "write_file"})
 _LARGE_FILE_TOOL_BATCH_SIZE = 32
+
+
+@dataclass
+class _PartialAssistantResponseAccumulator:
+    """Collect root assistant text that was successfully streamed to clients."""
+
+    text_by_id: dict[str, str] = field(default_factory=dict)
+
+    def observe(self, chunk: Any) -> None:
+        if not isinstance(chunk, tuple) or len(chunk) != 2:
+            return
+        message, _metadata = chunk
+        if not isinstance(message, (AIMessage, AIMessageChunk)):
+            return
+        additional_kwargs = getattr(message, "additional_kwargs", None)
+        if isinstance(additional_kwargs, Mapping) and additional_kwargs.get("hide_from_ui") is True:
+            return
+        message_id = getattr(message, "id", None)
+        if not isinstance(message_id, str) or not message_id:
+            return
+        text = message_to_text(message, text_attribute_fallback=True)
+        if not text:
+            return
+        self.text_by_id[message_id] = self.text_by_id.get(message_id, "") + text
+
+    def messages(self) -> list[AIMessage]:
+        return [AIMessage(id=message_id, content=text) for message_id, text in self.text_by_id.items() if text.strip()]
 
 
 @dataclass
@@ -379,6 +609,38 @@ class _LargeFileToolChunkBatcher:
         return chunks
 
 
+# Runtime-context keys the worker owns outright. A same-named key in the
+# caller's ``config['context']`` is dropped rather than merged: the Gateway
+# strips ``__``-prefixed keys in build_run_config, but embedded harness callers
+# have no such filter and ``deerflow_trace_id`` carries no prefix to be caught
+# by it anyway.
+_SERVER_OWNED_RUNTIME_CONTEXT_KEYS: Final[frozenset[str]] = (
+    frozenset(
+        {
+            CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY,
+            DEERFLOW_TRACE_METADATA_KEY,
+            CONVERSATION_READER_CONTEXT_KEY,
+            SCHEDULER_CAPABILITY_CONTEXT_KEY,
+            AGENT_RUNS_CONTEXT_KEY,
+            "__run_input_control",
+            THREAD_INCARNATION_CONTEXT_KEY,
+            THREAD_INCARNATION_METADATA_GUARD_KEY,
+            "is_subagent",
+            "agent_id",
+            "__run_loop_detection_recorder",
+            "__run_tool_promotion_recorder",
+            "__run_tool_progress_recorder",
+            # The Gateway pins the run's project snapshot under this key at
+            # admission (spec §7.1); a caller-supplied value in
+            # ``config['context']`` must never be merged (§12).
+            PROJECT_CONTEXT_KEY,
+            KNOWLEDGE_SCOPE_RUNTIME_KEY,
+        }
+    )
+    | SANDBOX_SERVER_OWNED_CONTEXT_KEYS
+)
+
+
 def _build_runtime_context(
     thread_id: str,
     run_id: str,
@@ -386,27 +648,40 @@ def _build_runtime_context(
     app_config: AppConfig | None = None,
     task_store: Any | None = None,
     extensions: Any | None = None,
+    conversation_reader: Any | None = None,
+    agent_runs: Any | None = None,
+    *,
+    thread_incarnation: str | None | object = _THREAD_INCARNATION_UNSET,
+    scheduler_capability: SchedulerRunCapability | None = None,
 ) -> dict[str, Any]:
     """Build the dict that becomes ``ToolRuntime.context`` for the run.
 
     Always includes ``thread_id`` and ``run_id``. Additional keys from the caller's
     ``config['context']`` (e.g. ``agent_name`` for the bootstrap flow — issue #2677)
-    are merged in but never override ``thread_id``/``run_id``. The resolved
-    ``AppConfig`` is added by the worker so tools can consume it without ambient
-    global lookups.
+    are merged in but never override ``thread_id``/``run_id`` or the server-owned
+    keys in ``_SERVER_OWNED_RUNTIME_CONTEXT_KEYS``. The resolved ``AppConfig`` is
+    added by the worker so tools can consume it without ambient global lookups.
 
     langgraph 1.1+ surfaces this as ``runtime.context`` via the parent runtime stored
     under ``config['configurable']['__pregel_runtime']`` — see
     ``langgraph.pregel.main`` where ``parent_runtime.merge(...)`` is invoked.
     """
     runtime_ctx: dict[str, Any] = {"thread_id": thread_id, "run_id": run_id}
+    if thread_incarnation is not _THREAD_INCARNATION_UNSET:
+        runtime_ctx[THREAD_INCARNATION_CONTEXT_KEY] = thread_incarnation
     if isinstance(caller_context, dict):
         for key, value in caller_context.items():
-            if key == CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY:
+            if key in _SERVER_OWNED_RUNTIME_CONTEXT_KEYS:
                 continue
             runtime_ctx.setdefault(key, value)
     if app_config is not None:
         runtime_ctx["app_config"] = app_config
+    if agent_runs is not None:
+        runtime_ctx[AGENT_RUNS_CONTEXT_KEY] = agent_runs
+    if conversation_reader is not None:
+        runtime_ctx[CONVERSATION_READER_CONTEXT_KEY] = conversation_reader
+    if scheduler_capability is not None:
+        runtime_ctx[SCHEDULER_CAPABILITY_CONTEXT_KEY] = scheduler_capability
     if task_store is not None:
         from deerflow_extension_api import EXTENSION_TASK_STORE_KEY
 
@@ -423,6 +698,23 @@ def _build_runtime_context(
     else:
         runtime_ctx.pop(EXTENSION_SNAPSHOT_CONTEXT_KEY, None)
     return runtime_ctx
+
+
+def _pin_admission_project_context(config: dict, runtime_context: dict[str, Any]) -> None:
+    """Re-inject the admission-pinned project snapshot into the runtime context.
+
+    The Gateway resolves and stamps ``config['context'][PROJECT_CONTEXT_KEY]``
+    after stripping client-supplied values at admission (``build_run_config``
+    drops ``__``-prefixed context keys; the services pop-set covers both
+    sections), so a value surviving to this point is server-authoritative.
+    ``_build_runtime_context`` refuses server-owned keys from the caller
+    merge, and ``_install_runtime_context`` treats the runtime context as the
+    authoritative view — hoisting here is what lets middleware and tools read
+    exactly the snapshot admission pinned.
+    """
+    caller_context = config.get("context")
+    if isinstance(caller_context, dict) and PROJECT_CONTEXT_KEY in caller_context:
+        runtime_context[PROJECT_CONTEXT_KEY] = caller_context[PROJECT_CONTEXT_KEY]
 
 
 @dataclass(frozen=True)
@@ -446,20 +738,43 @@ class RunContext:
     # Delta snapshot cadence frozen at startup; ``None`` means "not frozen in
     # this process" (embedded/tests) and resolves to the config default.
     checkpoint_snapshot_frequency: int | None = None
+    # Called after durable same-thread admission is active and before the first
+    # checkpoint read. Failures are isolated from the run outcome.
+    on_run_admitted: Any | None = field(default=None)
     on_run_completed: Any | None = field(default=None)
+    # The host binds this capability to one run's authenticated reader and references.
+    conversation_reader: Any | None = field(default=None)
+    agent_runs: Any | None = field(default=None)
+    scheduler_capability: SchedulerRunCapability | None = field(default=None)
+    # Server-selected occurrence identity. Metadata alone never activates a goal.
+    scheduled_task_runtime: Mapping[str, Any] | None = field(default=None)
+    # Host-only preflight under durable run ownership; failures reject execution.
+    verify_artifacts: Any | None = field(default=None)
 
 
 def _install_runtime_context(config: dict, runtime_context: dict[str, Any]) -> None:
+    # Configurable participates in lead-agent option merging and checkpoint
+    # persistence; the reader capability belongs only to host-owned context.
+    configurable = config.get("configurable")
+    if isinstance(configurable, dict):
+        configurable.pop(CONVERSATION_READER_CONTEXT_KEY, None)
+        configurable.pop(SCHEDULER_CAPABILITY_CONTEXT_KEY, None)
+        configurable.pop(AGENT_RUNS_CONTEXT_KEY, None)
     existing_context = config.get("context")
     if isinstance(existing_context, dict):
         existing_context.setdefault("thread_id", runtime_context["thread_id"])
         existing_context.setdefault("run_id", runtime_context["run_id"])
-        if DEERFLOW_TRACE_METADATA_KEY in runtime_context:
-            existing_context.setdefault(DEERFLOW_TRACE_METADATA_KEY, runtime_context[DEERFLOW_TRACE_METADATA_KEY])
+        # Keep both context views authoritative. A server-owned value is
+        # assigned from the runtime context when present and removed otherwise,
+        # so an embedded caller cannot preserve a forged lifecycle identity in
+        # ``config['context']`` after it was rejected by _build_runtime_context.
+        for key in _SERVER_OWNED_RUNTIME_CONTEXT_KEYS:
+            if key in runtime_context:
+                existing_context[key] = runtime_context[key]
+            else:
+                existing_context.pop(key, None)
         if "app_config" in runtime_context:
             existing_context["app_config"] = runtime_context["app_config"]
-        if CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY in runtime_context:
-            existing_context[CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY] = runtime_context[CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY]
         return
 
     config["context"] = dict(runtime_context)
@@ -494,6 +809,17 @@ def _agent_graph(agent_result: Any) -> Any:
         # assembly type fails.
         return agent_result
     return unwrap_agent_graph(agent_result)
+
+
+def _assembled_model_name(agent_result: Any) -> str | None:
+    """Return the selected model only for the trusted lead assembly result."""
+    try:
+        from deerflow.agents.lead_agent.agent import LeadAgentAssembly
+    except Exception:
+        return None
+    if isinstance(agent_result, LeadAgentAssembly):
+        return agent_result.effective_model
+    return None
 
 
 class _SubagentEventBuffer:
@@ -549,15 +875,128 @@ class _SubagentEventBuffer:
             return
         batch = self._pending
         self._pending = []
-        try:
-            await self._event_store.put_batch(batch)
-        except Exception:
+        write_task = asyncio.create_task(self._event_store.put_batch(batch))
+        cancellation: asyncio.CancelledError | None = None
+        failure: Exception | None = None
+        while True:
+            try:
+                await asyncio.shield(write_task)
+                break
+            except asyncio.CancelledError as exc:
+                host_task = asyncio.current_task()
+                if host_task is None or not host_task.cancelling():
+                    # The store task itself was cancelled. It did not confirm
+                    # durability, so retain the batch for a later flush.
+                    self._pending = batch + self._pending
+                    raise
+                if cancellation is None:
+                    cancellation = exc
+                while host_task.cancelling():
+                    host_task.uncancel()
+            except Exception as exc:
+                failure = exc
+                break
+
+        if failure is not None:
             # Re-buffer the failed batch (ahead of any events queued since) so a
             # transient store error does not silently drop subagent step events.
             self._pending = batch + self._pending
-            logger.warning("Run %s: failed to persist %d subagent step event(s)", self._run_id, len(batch), exc_info=True)
+            logger.warning(
+                "Run %s: failed to persist %d subagent step event(s)",
+                self._run_id,
+                len(batch),
+                exc_info=(type(failure), failure, failure.__traceback__),
+            )
+        if cancellation is not None:
+            raise cancellation
 
 
+def _bind_trace_id(config: dict[str, Any], runtime_ctx: dict[str, Any]) -> str:
+    """Record the current request trace id on the runtime context and metadata.
+
+    The ContextVar is the only source. A ``deerflow_trace_id`` the caller sent
+    in ``config["metadata"]`` is overwritten rather than read: honouring it
+    would let the persisted run disagree with the ``X-Trace-Id`` and the log
+    lines the same request already produced, which is the correlation the id
+    exists to provide in the first place.
+
+    The two destinations serve different purposes. ``runtime_ctx`` is the
+    carrier across boundaries the ContextVar does not cross -- subagent
+    delegation, the memory update running on a Timer/executor thread -- while
+    ``config["metadata"]`` is persisted with the checkpoint and is what makes a
+    finished run traceable after the fact.
+    """
+    trace_id = ensure_trace_id()
+    runtime_ctx[DEERFLOW_TRACE_METADATA_KEY] = trace_id
+    incoming_metadata = config.get("metadata")
+    # Replaced rather than mutated through: this mapping can be shared with the
+    # caller's request body.
+    merged_metadata = dict(incoming_metadata) if isinstance(incoming_metadata, dict) else {}
+    merged_metadata[DEERFLOW_TRACE_METADATA_KEY] = trace_id
+    config["metadata"] = merged_metadata
+    return trace_id
+
+
+def _defer_finalization_interrupt(
+    deferred: BaseException | None,
+    interrupt: BaseException,
+) -> BaseException:
+    """Preserve the first interrupt while allowing terminal awaits to finish."""
+    if isinstance(interrupt, asyncio.CancelledError):
+        task = asyncio.current_task()
+        if task is not None:
+            while task.cancelling():
+                task.uncancel()
+    return deferred if deferred is not None else interrupt
+
+
+async def _await_task_stop_after_host_cancellation(
+    task: asyncio.Task[None],
+    deferred: BaseException | None,
+) -> BaseException | None:
+    """Wait for one task-stop fan-out despite repeated host cancellation."""
+    while True:
+        try:
+            await asyncio.shield(task)
+            return deferred
+        except asyncio.CancelledError as exc:
+            host = asyncio.current_task()
+            if host is None or not host.cancelling():
+                # The fan-out task itself was cancelled rather than the host.
+                raise
+            deferred = _defer_finalization_interrupt(deferred, exc)
+
+
+async def _drain_run_finalization(task: asyncio.Task[None], *, on_host_cancel: Callable[[], None] | None = None) -> None:
+    """Retain ownership through repeated cancellation, including failed cleanup.
+
+    The registered worker stays alive until its finalizer settles, keeping it
+    visible to shutdown. There is deliberately no timeout: abandoning an owned
+    write would let resource teardown race it. Backends must bound their own I/O.
+    """
+    deferred: BaseException | None = None
+    while True:
+        try:
+            await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:
+            host = asyncio.current_task()
+            if host is None or not host.cancelling():
+                if deferred is not None:
+                    raise deferred from exc
+                raise
+            deferred = _defer_finalization_interrupt(deferred, exc)
+            if on_host_cancel is not None:
+                on_host_cancel()
+        except BaseException as exc:
+            if deferred is not None:
+                raise deferred from exc
+            raise
+    if deferred is not None:
+        raise deferred
+
+
+@run_producer_context
 async def run_agent(
     bridge: StreamBridge,
     run_manager: RunManager,
@@ -565,12 +1004,14 @@ async def run_agent(
     *,
     ctx: RunContext,
     agent_factory: Any,
-    graph_input: dict,
+    graph_input: dict[str, Any] | Command | None,
     config: dict,
+    thread_incarnation: str | None | object = _THREAD_INCARNATION_UNSET,
     stream_modes: list[str] | None = None,
     stream_subgraphs: bool = False,
     interrupt_before: list[str] | Literal["*"] | None = None,
     interrupt_after: list[str] | Literal["*"] | None = None,
+    knowledge_scope: dict[str, Any] | None = None,
 ) -> None:
     """Execute an agent in the background, publishing events to *bridge*."""
 
@@ -581,6 +1022,9 @@ async def run_agent(
     run_events_config = ctx.run_events_config
     thread_store = ctx.thread_store
     terminal_status_kwargs = {"persist": False} if event_store is not None else {}
+    # Staged terminal statuses commit only after receipt and duration writes;
+    # keep the still-active durable row's lease renewed until then.
+    record.terminal_commit_pending = event_store is not None
 
     run_id = record.run_id
     thread_id = record.thread_id
@@ -598,12 +1042,16 @@ async def run_agent(
     extensions = ctx.extensions if ctx.extensions is not None else get_loaded_extensions()
     task_store: ExtensionData | None = None
     task_info: TaskInfo | None = None
-    deferred_stop_interrupt: BaseException | None = None
+    deferred_finalization_interrupt: BaseException | None = None
     pre_run_checkpoint_id: str | None = None
     pre_run_workspace_snapshot: WorkspaceSnapshot | None = None
     workspace_changes_user_id: str | None = None
     workspace_excluded_dir_names: frozenset[str] | None = None
-    snapshot_capture_failed = False
+    # Fail closed until a pre-run capture completes: a cancellation delivered
+    # before or during capture leaves no rollback point, and treating that as
+    # "the thread had no pre-run checkpoint" would delete a live thread's
+    # checkpoints on a rollback cancel.
+    snapshot_capture_failed = True
     llm_error_fallback_message: str | None = None
     checkpoint_rollback_completed = False
     # Message ids checkpointed *before* this run started. The stream loop uses
@@ -617,35 +1065,53 @@ async def run_agent(
     # checkpoint lineage (see below).
     accessor: CheckpointStateAccessor | None = None
     rollback_point: RollbackPoint | None = None
+    checkpoint_resume_rejected = False
     journal = None
+    partial_assistant_response: _PartialAssistantResponseAccumulator | None = None
+    seq_stamper: _MessageSeqStamper | None = None
+    runtime_ctx: dict[str, Any] | None = None
+    runtime: Any | None = None
+    agent: Any | None = None
+    runnable_configs: list[dict[str, Any]] = [config]
+    goal_evaluator_model: Any | None = None
     delivery_content: dict[str, Any] | None = None
+    goal_completion: _GoalCompletionCandidate | None = None
+    input_control = None
+    scheduled_goal: GoalState | None = None
+    final_goal_verdict: dict[str, Any] | None = None
     produced_output_paths: list[str] | None = None
+    terminal_error_frame: dict[str, str] | None = None
     # Journal construction moved ahead of preflight so every terminal run can
     # emit a receipt. Completion persistence keeps its prior boundary: before
     # #4272 the journal did not exist until preflight had succeeded, so early
     # checkpoint failures / cancellation while waiting did not write an empty
     # completion snapshot into RunStore.
     persist_completion = False
+    evidence_execution_started = False
     completion_data: dict[str, Any] | None = None
     # Buffers subagent step events for batched persistence (#3779); assigned once
     # streaming starts and flushed in the finally block. Pre-bound to None so the
     # finally is safe even if an exception fires before streaming begins.
     subagent_events: _SubagentEventBuffer | None = None
     started = False
+    stream_producer_lease_started = False
 
-    if ctx.mcp_task_repo is not None and record.user_id is not None:
-        try:
-            task_rows = await ctx.mcp_task_repo.list_by_thread(
-                thread_id,
-                user_id=record.user_id,
-                limit=20,
-            )
-            graph_input = {
-                **graph_input,
-                "background_tasks": _project_background_tasks(task_rows),
-            }
-        except Exception:
-            logger.warning("Run %s: failed to project MCP task state", run_id, exc_info=True)
+    async def _ensure_stream_producer_lease() -> None:
+        nonlocal stream_producer_lease_started
+        if stream_producer_lease_started:
+            return
+        start_producer_lease = _declared_bridge_method(
+            bridge,
+            "start_producer_lease",
+        )
+        if start_producer_lease is None:
+            return
+        tracked = await start_producer_lease(run_id)
+        if not tracked:
+            # A registration failure whose marker rollback was confirmed keeps
+            # the historical conservative recovery behavior.
+            return
+        stream_producer_lease_started = True
 
     async def _finish_cancellation(
         action: str,
@@ -653,14 +1119,30 @@ async def run_agent(
         restore_checkpoint: bool = True,
     ) -> None:
         nonlocal checkpoint_rollback_completed
+        if record.ownership_lost:
+            return
+        from deerflow.sandbox.lease import cancel_sandbox_execution_lease_async
+
+        cleanup_error = None
+        try:
+            await cancel_sandbox_execution_lease_async(runtime_ctx)
+        except Exception:
+            cleanup_error = "Sandbox process cleanup could not be confirmed"
+            logger.warning("Run %s: %s", run_id, cleanup_error, exc_info=True)
+        await _ensure_stream_producer_lease()
         await run_manager.set_finalizing(run_id, True)
+        if record.ownership_lost:
+            return
         if action == "rollback":
+            record.rollback_finalization_pending = run_manager.heartbeat_enabled and run_manager._store is not None
             await run_manager.set_status(
                 run_id,
                 RunStatus.error,
-                error="Rolled back by user",
-                **terminal_status_kwargs,
+                error=f"Rolled back by user; {cleanup_error}" if cleanup_error else "Rolled back by user",
+                **({"persist": False} if record.rollback_finalization_pending else terminal_status_kwargs),
             )
+            if record.ownership_lost:
+                return
             if not restore_checkpoint:
                 return
             try:
@@ -687,6 +1169,7 @@ async def run_agent(
             await run_manager.set_status(
                 run_id,
                 RunStatus.interrupted,
+                error=cleanup_error,
                 **terminal_status_kwargs,
             )
             logger.info("Run %s was cancelled", run_id)
@@ -708,8 +1191,32 @@ async def run_agent(
                 thread_id=thread_id,
                 event_store=event_store,
                 track_token_usage=getattr(run_events_config, "track_token_usage", True),
+                user_id=record.user_id,
                 progress_reporter=lambda snapshot: run_manager.update_run_progress(run_id, **snapshot),
             )
+            if "messages-tuple" in requested_modes:
+                partial_assistant_response = _PartialAssistantResponseAccumulator()
+
+        # Keep cancellable preflight work under the worker's terminal guard so
+        # cancellation cannot strand a pending RunRecord or stream subscriber.
+        # Continuations keep their checkpointed projection and control input.
+        if isinstance(graph_input, dict) and ctx.mcp_task_repo is not None and record.user_id is not None:
+            try:
+                if thread_incarnation is _THREAD_INCARNATION_UNSET:
+                    raise RuntimeError("MCP task projection requires a server-owned thread incarnation")
+                assert thread_incarnation is None or isinstance(thread_incarnation, str)
+                task_rows = await ctx.mcp_task_repo.list_by_thread(
+                    thread_id,
+                    user_id=record.user_id,
+                    thread_incarnation=thread_incarnation,
+                    limit=20,
+                )
+                graph_input = {
+                    **graph_input,
+                    "background_tasks": _project_background_tasks(task_rows),
+                }
+            except Exception:
+                logger.warning("Run %s: failed to project MCP task state", run_id, exc_info=True)
 
         await run_manager.wait_for_prior_finalizing(
             thread_id,
@@ -727,25 +1234,42 @@ async def run_agent(
             return
         started = True
 
+        goal_wakeup = (record.metadata or {}).get("batch_goal_wakeup") if origin_kind_of(record.metadata) == "subagent_batch" else None
+        if goal_wakeup is not None:
+            if not await wake_goal_after_external_wait(checkpointer, thread_id, run_id, goal_wakeup):
+                await run_manager.set_status(run_id, RunStatus.interrupted, stop_reason="goal_wakeup_superseded")
+                return
+        if ctx.verify_artifacts is not None:
+            await ctx.verify_artifacts()
+
+        if ctx.on_run_admitted is not None:
+            try:
+                await ctx.on_run_admitted(record, config)
+            except Exception:
+                logger.warning("Run admission hook failed for %s (non-fatal)", run_id, exc_info=True)
+
         task_id = lead_task_id(run_id)
         if extensions.needs_task_store:
-            task_store = ExtensionData(task_id)
-
-        if extensions.has_task_lifecycle:
-            task_info = TaskInfo(
+            identity = TaskInfo(
                 task_id=task_id,
                 run_id=run_id,
                 thread_id=thread_id,
                 kind="lead",
                 agent_name=record.assistant_id,
             )
-            assert task_store is not None
-            await notify_task_start(
-                extensions,
-                task_store,
-                task_info,
-                timeout=_EXTENSION_TASK_NOTIFY_TIMEOUT_SECONDS,
-            )
+            task_store = ExtensionData(task_id)
+            # Seed the identity for every hook handed this store, not only
+            # lifecycle contributors: compaction events are named from it.
+            task_store.set(identity)
+            # A lifecycle contributor always implies a task store.
+            if extensions.has_task_lifecycle:
+                task_info = identity
+                await notify_task_start(
+                    extensions,
+                    task_store,
+                    task_info,
+                    timeout=_EXTENSION_TASK_NOTIFY_TIMEOUT_SECONDS,
+                )
 
         if not record.ownership_lost and thread_store is not None:
             try:
@@ -826,21 +1350,58 @@ async def run_agent(
             ctx.app_config,
             task_store,
             extensions,
+            ctx.conversation_reader,
+            ctx.agent_runs,
+            thread_incarnation=thread_incarnation,
+            scheduler_capability=ctx.scheduler_capability,
         )
-        incoming_metadata = config.get("metadata") if isinstance(config.get("metadata"), dict) else {}
-        deerflow_trace_id = resolve_deerflow_trace_id(incoming_metadata.get(DEERFLOW_TRACE_METADATA_KEY))
-        if deerflow_trace_id:
-            runtime_ctx[DEERFLOW_TRACE_METADATA_KEY] = deerflow_trace_id
-            if is_trace_id_from_request_header():
-                merged_metadata = dict(incoming_metadata)
-                merged_metadata[DEERFLOW_TRACE_METADATA_KEY] = deerflow_trace_id
-                config["metadata"] = merged_metadata
+        register_sandbox_prewarm_cleanup(runtime_ctx)
+        # Bind every checkpoint produced by this run to the effective agent
+        # identity that produced its state. Manual compaction uses only this
+        # server-overwritten value for memory policy; request metadata cannot
+        # forge it, and an explicit default sentinel distinguishes new default
+        # checkpoints from unbound legacy state.
+        if "agent_name" in runtime_ctx:
+            checkpoint_agent_name = runtime_ctx["agent_name"]
+        else:
+            configurable = config.get("configurable")
+            checkpoint_agent_name = configurable.get("agent_name") if isinstance(configurable, dict) else None
+        checkpoint_metadata = config.get("metadata")
+        if not isinstance(checkpoint_metadata, dict):
+            checkpoint_metadata = {}
+            config["metadata"] = checkpoint_metadata
+        checkpoint_metadata[CHECKPOINT_AGENT_NAME_METADATA_KEY] = DEFAULT_AGENT_NAME_METADATA_VALUE if checkpoint_agent_name is None else checkpoint_agent_name
+        _pin_admission_project_context(config, runtime_ctx)
+        if knowledge_scope is not None:
+            runtime_ctx[KNOWLEDGE_SCOPE_RUNTIME_KEY] = execution_scope(knowledge_scope)
+        deerflow_trace_id = _bind_trace_id(config, runtime_ctx)
         # Expose the run-scoped journal under a sentinel key so middleware can
         # write audit events (e.g. SafetyFinishReasonMiddleware recording
         # suppressed tool calls). Double-underscore prefix marks it as a
         # runtime-internal channel; user code must not depend on the key name.
         if journal is not None:
             runtime_ctx["__run_journal"] = journal
+        if ctx.agent_runs is not None and run_manager.input_store is not None and not runtime_ctx.get("non_interactive"):
+            from .input_control import RunInputControl
+            from .inputs import INPUT_CONTEXT_KEY, RunInputs
+
+            def record_deferred_result(message):
+                if journal is not None and not record.ownership_lost:
+                    journal.record_deferred_task_result(message)
+
+            def record_steered_response(message):
+                if journal is not None and not record.ownership_lost:
+                    journal.record_steered_response(message)
+
+            input_control = RunInputControl(
+                RunInputs(run_manager.input_store, run_id, record.user_id, run_manager.worker_id),
+                agent_runs=ctx.agent_runs,
+                thread_id=thread_id,
+                checkpointer=checkpointer,
+                on_result=record_deferred_result,
+                on_replan=record_steered_response,
+            )
+            runtime_ctx[INPUT_CONTEXT_KEY] = input_control
         _install_runtime_context(config, runtime_ctx)
         runtime = Runtime(context=cast(Any, runtime_ctx), store=store)
         config.setdefault("configurable", {})["__pregel_runtime"] = runtime
@@ -850,24 +1411,11 @@ async def run_agent(
         if journal is not None:
             config.setdefault("callbacks", []).append(journal)
 
-        # Inject Langfuse trace-attribute metadata so the langchain CallbackHandler
-        # can lift session_id / user_id / trace_name / tags onto the root trace.
-        # Shared helper with ``DeerFlowClient.stream`` so both entry points stay
-        # in sync; caller-provided metadata wins via setdefault inside the helper.
-        inject_langfuse_metadata(
-            config,
-            thread_id=thread_id,
-            user_id=resolve_runtime_user_id(runtime),
-            assistant_id=record.assistant_id,
-            model_name=record.model_name,
-            environment=os.environ.get("DEER_FLOW_ENV") or os.environ.get("ENVIRONMENT"),
-            deerflow_trace_id=deerflow_trace_id,
-        )
-
         # Resolve after runtime context installation so context/configurable reflect
         # the agent name that this run will actually execute.
         config.setdefault("run_name", resolve_root_run_name(config, record.assistant_id))
         initial_runnable_config = RunnableConfig(**config)
+        runnable_configs.append(initial_runnable_config)
 
         def _continuation_runnable_config() -> RunnableConfig:
             continuation_config = dict(config)
@@ -876,15 +1424,43 @@ async def run_agent(
             configurable.pop("checkpoint_id", None)
             configurable.pop("checkpoint_map", None)
             continuation_config["configurable"] = configurable
-            return RunnableConfig(**continuation_config)
+            continuation = RunnableConfig(**continuation_config)
+            runnable_configs.append(continuation)
+            return continuation
 
         agent_factory_kwargs: dict[str, Any] = {"config": initial_runnable_config}
         if ctx.app_config is not None and _agent_factory_supports_app_config(agent_factory):
             agent_factory_kwargs["app_config"] = ctx.app_config
         from deerflow.extensions import bind_agent_build_extensions
+        from deerflow.runtime.assembly_evidence import capture_assembly, project_assembly_evidence
 
-        with bind_agent_build_extensions(extensions):
-            agent = _agent_graph(agent_factory(**agent_factory_kwargs))
+        with bind_agent_build_extensions(extensions), capture_assembly():
+            # Assemble off-loop: agent construction re-enters
+            # get_available_tools(), which may block on MCP cache
+            # initialization — it must not stall the calling event loop
+            # (issue #5172).
+            agent_result = await run_assembly(agent_factory, **agent_factory_kwargs)
+            agent = _agent_graph(agent_result)
+        from deerflow.agents.lead_agent.agent import LeadAgentAssembly
+
+        if isinstance(agent_result, LeadAgentAssembly):
+            evidence = project_assembly_evidence(agent_result.descriptor, thread_id=thread_id, run_id=run_id)
+            if evidence is not None:
+                await run_manager.record_assembly_evidence(run_id, evidence)
+
+        # Assembly resolves request, agent, and authorization fallbacks. Trace the
+        # model that will run, rather than the model name originally requested.
+        effective_model = _assembled_model_name(agent_result) or record.model_name
+        for trace_config in (config, initial_runnable_config):
+            inject_langfuse_metadata(
+                trace_config,
+                thread_id=thread_id,
+                user_id=resolve_runtime_user_id(runtime),
+                assistant_id=record.assistant_id,
+                model_name=effective_model,
+                environment=os.environ.get("DEER_FLOW_ENV") or os.environ.get("ENVIRONMENT"),
+                deerflow_trace_id=deerflow_trace_id,
+            )
 
         accessor = CheckpointStateAccessor.bind(
             agent,
@@ -909,8 +1485,12 @@ async def run_agent(
                 try:
                     rollback_point = await _capture_rollback_point(accessor, checkpointer, checkpoint_config)
                 except Exception:
-                    snapshot_capture_failed = True
                     logger.warning("Could not capture pre-run checkpoint snapshot for run %s", run_id, exc_info=True)
+                else:
+                    # Only a completed capture proves what the pre-run state was.
+                    # ``None`` now unambiguously means the thread had no
+                    # checkpoint, so rollback may safely reset it to empty.
+                    snapshot_capture_failed = False
                 if rollback_point is not None:
                     pre_run_checkpoint_id = rollback_point.config.get("configurable", {}).get("checkpoint_id")
                     pre_existing_message_ids = _collect_pre_existing_message_ids({"messages": list(rollback_point.messages)})
@@ -926,6 +1506,7 @@ async def run_agent(
                     config=config,
                     thread_id=thread_id,
                     run_id=run_id,
+                    resume_command=graph_input is None or _is_resume_command_input(graph_input),
                 )
             if resumed_messages is not None:
                 # The graph now starts from the selected state, so the
@@ -933,20 +1514,54 @@ async def run_agent(
                 # captured for rollback.
                 pre_existing_message_ids = _collect_pre_existing_message_ids({"messages": list(resumed_messages)})
                 initial_runnable_config = RunnableConfig(**config)
+                runnable_configs.append(initial_runnable_config)
 
         runtime_ctx[CURRENT_RUN_PRE_EXISTING_MESSAGE_IDS_KEY] = frozenset(pre_existing_message_ids)
         _install_runtime_context(config, runtime_ctx)
 
-        # Capture the effective (resolved) model name from the agent's metadata.
-        # _resolve_model_name in agent.py may return the default model if the
-        # requested name is not in the allowlist — this update ensures the
-        # persisted model_name reflects the actual model used.
-        if record.model_name is not None:
-            resolved = getattr(agent, "metadata", {}) or {}
-            if isinstance(resolved, dict):
-                effective = resolved.get("model_name")
-                if effective and effective != record.model_name:
-                    await run_manager.update_model_name(record.run_id, effective)
+        scheduled_objective = _scheduled_goal_objective(record, ctx.scheduled_task_runtime)
+        if scheduled_objective is not None:
+            # Track the instance before admitting the write: synchronous saver
+            # commits are drained even if host cancellation arrives mid-write.
+            scheduled_goal = build_goal_state(scheduled_objective, now=canonical_run_created_at(record.created_at))
+            record.scheduled_goal_cleanup_pending = True
+            terminal_status_kwargs["persist"] = False
+            try:
+                await _install_scheduled_goal(checkpointer=checkpointer, accessor=accessor, thread_id=thread_id, goal=scheduled_goal)
+            except GoalWriteConflict:
+                # Rejected before the write was admitted. Even an equal goal
+                # snapshot belongs to its original writer, never this run.
+                scheduled_goal = None
+                record.scheduled_goal_cleanup_pending = False
+                if event_store is None:
+                    terminal_status_kwargs.pop("persist", None)
+                raise
+
+        if scheduled_goal is None:
+            await _clear_stale_scheduled_goal(record=record, run_manager=run_manager, bridge=bridge, checkpointer=checkpointer)
+
+        # Full-mode replay keeps its historical message fork, but the owner's
+        # current goal and budget must win. Read after scheduled-goal preflight
+        # so a cleaned-up occurrence goal cannot be reintroduced by the input.
+        configurable = config.get("configurable", {})
+        selected_checkpoint_id = configurable.get("checkpoint_id")
+        if checkpointer is not None and mode == "full" and isinstance(graph_input, dict) and isinstance(selected_checkpoint_id, str) and selected_checkpoint_id and not configurable.get("checkpoint_ns"):
+            async with _checkpoint_thread_lock(thread_id):
+                current = await accessor.aget(checkpoint_config)
+                if _checkpoint_id(current) != selected_checkpoint_id:
+                    current_values = getattr(current, "values", None) or {}
+                    graph_input = dict(graph_input)
+                    if graph_input.get("goal") is None:
+                        # merge_goal ignores plain None, including a goal that
+                        # the user cleared or completed after the selected turn.
+                        graph_input["goal"] = Overwrite(copy.deepcopy(current_values.get("goal")))
+                    graph_input["goal_outcome"] = None
+
+        # Persist the model assembly resolved — the default when the request
+        # named none, or a fallback when the requested model is unavailable —
+        # so the stored model_name reflects the actual model used (#3109).
+        if effective_model and effective_model != record.model_name:
+            await run_manager.update_model_name(record.run_id, effective_model)
 
         # 4. Attach checkpointer and store
         if checkpointer is not None:
@@ -967,8 +1582,6 @@ async def run_agent(
         # the finally block so buffered steps survive abort/exception paths too.
         subagent_events = _SubagentEventBuffer(event_store, thread_id, run_id)
 
-        goal_evaluator_model: Any | None = None
-
         def _get_goal_evaluator_model() -> Any:
             nonlocal goal_evaluator_model
             if goal_evaluator_model is None:
@@ -978,53 +1591,118 @@ async def run_agent(
                 )
             return goal_evaluator_model
 
+        # Built once per run, not per _stream_once call: goal continuations
+        # re-enter the stream and would otherwise discard the resolved seqs.
+        seq_stamper = _build_seq_stamper(event_store, thread_id, journal) if "values" in requested_modes else None
+
         async def _stream_once(input_payload: Any, stream_config: RunnableConfig) -> None:
             nonlocal llm_error_fallback_message
-            file_tool_chunk_batcher = _LargeFileToolChunkBatcher() if "values" in requested_modes else None
+            if input_control is not None:
+                await input_control.inputs.reopen()
+            file_tool_chunk_batcher = _LargeFileToolChunkBatcher() if "messages-tuple" in requested_modes else None
             try:
                 async with _checkpoint_thread_lock(thread_id):
                     if len(lg_modes) == 1 and not stream_subgraphs:
                         # Single mode, no subgraphs: astream yields raw chunks
                         single_mode = lg_modes[0]
-                        async for chunk in agent.astream(input_payload, config=stream_config, stream_mode=single_mode):
-                            if record.abort_event.is_set():
-                                logger.info("Run %s abort requested — stopping", run_id)
-                                break
-                            llm_error_fallback_message = llm_error_fallback_message or _extract_llm_error_fallback_message(chunk, pre_existing_message_ids)
-                            sse_event = _lg_mode_to_sse_event(single_mode)
-                            await bridge.publish(run_id, sse_event, serialize(chunk, mode=single_mode))
-                            if single_mode == "custom":
-                                await subagent_events.add(chunk)
+                        stream = agent.astream(input_payload, config=stream_config, stream_mode=single_mode)
+                        broke_on_abort = False
+                        try:
+                            async for chunk in stream:
+                                if record.abort_event.is_set():
+                                    broke_on_abort = True
+                                    logger.info("Run %s abort requested — stopping", run_id)
+                                    break
+                                if single_mode != "custom":
+                                    # Custom frames carry task_* events whose payload can hold a delegated
+                                    # subagent's messages; see the multi-mode branch below.
+                                    llm_error_fallback_message = llm_error_fallback_message or _extract_llm_error_fallback_message(chunk, pre_existing_message_ids)
+                                sse_event = _lg_mode_to_sse_event(single_mode)
+                                single_payload = serialize(chunk, mode=single_mode)
+                                if single_mode == "values" and seq_stamper is not None:
+                                    single_payload = await seq_stamper.stamp(single_payload)
+                                await bridge.publish(run_id, sse_event, single_payload)
+                                if single_mode == "messages" and partial_assistant_response is not None:
+                                    partial_assistant_response.observe(chunk)
+                                if single_mode == "custom":
+                                    await subagent_events.add(chunk)
+                        finally:
+                            close_error = sys.exception()
+                            try:
+                                await close_agent_stream(stream)
+                            except asyncio.CancelledError as exc:
+                                _log_cancelled_stream_close_failure(
+                                    exc,
+                                    run_id=run_id,
+                                    abort_requested=broke_on_abort or record.abort_event.is_set(),
+                                )
+                                raise
+                            except Exception:
+                                abort_requested = broke_on_abort or record.abort_event.is_set()
+                                if close_error is None and not abort_requested:
+                                    raise
+                                if abort_requested:
+                                    logger.warning("Could not close aborted agent stream for run %s", run_id, exc_info=True)
+                                else:
+                                    logger.debug("Could not close agent stream for run %s", run_id, exc_info=True)
                         return
                     # Multiple modes or subgraphs: astream yields tuples
-                    async for item in agent.astream(
+                    stream = agent.astream(
                         input_payload,
                         config=stream_config,
                         stream_mode=lg_modes,
                         subgraphs=stream_subgraphs,
-                    ):
-                        if record.abort_event.is_set():
-                            logger.info("Run %s abort requested — stopping", run_id)
-                            break
+                    )
+                    broke_on_abort = False
+                    try:
+                        async for item in stream:
+                            if record.abort_event.is_set():
+                                broke_on_abort = True
+                                logger.info("Run %s abort requested — stopping", run_id)
+                                break
 
-                        mode, chunk, namespace = _unpack_stream_item(item, lg_modes, stream_subgraphs)
-                        if mode is None:
-                            continue
+                            mode, chunk, namespace = _unpack_stream_item(item, lg_modes, stream_subgraphs)
+                            if mode is None:
+                                continue
 
-                        if not namespace:
-                            # Only root-graph frames may decide the parent run's error
-                            # fallback: a delegated subagent's marked fallback is the
-                            # executor's to map (task_failed), not this run's.
-                            llm_error_fallback_message = llm_error_fallback_message or _extract_llm_error_fallback_message(chunk, pre_existing_message_ids)
-                        await _publish_stream_item(
-                            bridge=bridge,
-                            run_id=run_id,
-                            mode=mode,
-                            chunk=chunk,
-                            namespace=namespace,
-                            file_tool_chunk_batcher=file_tool_chunk_batcher,
-                            subagent_events=subagent_events,
-                        )
+                            if not namespace and mode != "custom":
+                                # Only root-graph frames may decide the parent run's error
+                                # fallback: a delegated subagent's marked fallback is the
+                                # executor's to map (task_failed), not this run's. That
+                                # includes the child messages task_running custom events
+                                # carry, which are root frames too.
+                                llm_error_fallback_message = llm_error_fallback_message or _extract_llm_error_fallback_message(chunk, pre_existing_message_ids)
+                            await _publish_stream_item(
+                                bridge=bridge,
+                                run_id=run_id,
+                                mode=mode,
+                                chunk=chunk,
+                                namespace=namespace,
+                                file_tool_chunk_batcher=file_tool_chunk_batcher,
+                                subagent_events=subagent_events,
+                                seq_stamper=seq_stamper,
+                            )
+                            if not namespace and mode == "messages" and partial_assistant_response is not None:
+                                partial_assistant_response.observe(chunk)
+                    finally:
+                        close_error = sys.exception()
+                        try:
+                            await close_agent_stream(stream)
+                        except asyncio.CancelledError as exc:
+                            _log_cancelled_stream_close_failure(
+                                exc,
+                                run_id=run_id,
+                                abort_requested=broke_on_abort or record.abort_event.is_set(),
+                            )
+                            raise
+                        except Exception:
+                            abort_requested = broke_on_abort or record.abort_event.is_set()
+                            if close_error is None and not abort_requested:
+                                raise
+                            if abort_requested:
+                                logger.warning("Could not close aborted agent stream for run %s", run_id, exc_info=True)
+                            else:
+                                logger.debug("Could not close agent stream for run %s", run_id, exc_info=True)
             finally:
                 stream_error = sys.exception()
                 if file_tool_chunk_batcher is not None:
@@ -1043,7 +1721,24 @@ async def run_agent(
         # turns complete cleanly afterward (#4176 review).
         if isinstance(runtime.context, dict):
             runtime.context.pop("stop_reason", None)
+
+        def capture_goal_verdict(evaluated_goal: GoalState, evaluation: GoalEvaluation, stand_down_reason: str | None) -> None:
+            nonlocal final_goal_verdict
+            if scheduled_goal is not None and not _goal_instance_matches(scheduled_goal, evaluated_goal):
+                return
+            final_goal_verdict = dict(evaluation)
+            final_goal_verdict["relied_on_assumption"] = bool(evaluation.get("relied_on_assumption", False)) if evaluation["satisfied"] else False
+            # Hidden goal turns this run took; the task page shows the count.
+            final_goal_verdict["continuations"] = int(evaluated_goal.get("continuation_count", 0))
+            if stand_down_reason:
+                final_goal_verdict["stand_down_reason"] = stand_down_reason
+                if stand_down_reason.startswith("thread_changed"):
+                    final_goal_verdict.update(satisfied=False, blocker="missing_evidence", relied_on_assumption=False)
+
+        evidence_execution_started = True
         await _stream_once(graph_input, initial_runnable_config)
+        if input_control is not None:
+            await input_control.confirm_checkpoint()
         while not record.abort_event.is_set() and not llm_error_fallback_message and (journal is None or not journal.had_llm_error_fallback):
             continuation_input = await _prepare_goal_continuation_input(
                 bridge=bridge,
@@ -1059,12 +1754,23 @@ async def run_agent(
                 deerflow_trace_id=deerflow_trace_id,
                 task_store=task_store,
                 extensions=extensions,
+                run_stop_reason=runtime.context.get("stop_reason") if isinstance(runtime.context, dict) else None,
+                interaction_policy=resolve_run_interaction_policy(config),
+                expected_goal=scheduled_goal,
+                verdict_callback=capture_goal_verdict,
+                usage_callback=journal.record_external_llm_usage_records if journal is not None else None,
             )
+            if isinstance(continuation_input, _GoalCompletionCandidate):
+                goal_completion = continuation_input
+                break
             if continuation_input is None or record.abort_event.is_set():
                 break
             await _stream_once(continuation_input, _continuation_runnable_config())
 
+        record.goal_verdict = final_goal_verdict
+
         # 8. Final status
+        await _ensure_stream_producer_lease()
         if record.abort_event.is_set():
             await _finish_cancellation(record.abort_action)
         elif llm_error_fallback_message or (journal is not None and journal.had_llm_error_fallback):
@@ -1098,6 +1804,10 @@ async def run_agent(
             # collects the most severe / first / all reasons) instead of each
             # guard writing directly to the same key.
             stop_reason = runtime_context.get("stop_reason") if runtime_context is not None else None
+            if stop_reason in GOAL_RUN_HARD_STOP_REASONS:
+                from deerflow.sandbox.lease import cancel_sandbox_execution_lease_async
+
+                await cancel_sandbox_execution_lease_async(runtime_ctx)
             produced_output_paths = await _produced_output_paths(
                 pre_run_workspace_snapshot,
                 thread_id=thread_id,
@@ -1107,6 +1817,7 @@ async def run_agent(
             delivery_content = _delivery_content_with_outputs(
                 journal.get_delivery_content() if journal is not None else _empty_delivery_content(),
                 produced_output_paths,
+                pre_run_snapshot=pre_run_workspace_snapshot,
             )
             delivery_error = _delivery_error(delivery_content)
             cancel_action = await run_manager.set_status_if_not_cancelled(
@@ -1114,6 +1825,7 @@ async def run_agent(
                 RunStatus.error if delivery_error else RunStatus.success,
                 error=delivery_error,
                 stop_reason=stop_reason,
+                goal_verdict=record.goal_verdict,
                 **terminal_status_kwargs,
             )
             if cancel_action is not None:
@@ -1123,246 +1835,723 @@ async def run_agent(
         await _finish_cancellation(record.abort_action)
 
     except Exception as exc:
+        try:
+            from deerflow.sandbox.lease import cancel_sandbox_execution_lease_async
+
+            await cancel_sandbox_execution_lease_async(runtime_ctx)
+        except Exception:
+            logger.warning("Failed to stop commands after run failure", exc_info=True)
+        checkpoint_resume_rejected = isinstance(exc, CheckpointResumeRejected)
         error_msg = f"{exc}"
-        logger.exception("Run %s failed: %s", run_id, error_msg)
+        stop_status_kwargs: dict[str, Any] = {}
+        if isinstance(exc, GraphRecursionError) and evidence_execution_started:
+            # The run used up its step budget: an expected stop, not a crash.
+            # Report it plainly with the outputs it never presented, and stand
+            # the goal down without an evaluator call.
+            logger.warning("Run %s stopped at its step limit: %s", run_id, error_msg)
+            produced_output_paths = await _produced_output_paths(
+                pre_run_workspace_snapshot,
+                thread_id=thread_id,
+                user_id=workspace_changes_user_id,
+                extra_excluded_dir_names=workspace_excluded_dir_names,
+            )
+            delivery_content = _delivery_content_with_outputs(
+                journal.get_delivery_content() if journal is not None else _empty_delivery_content(),
+                produced_output_paths,
+                pre_run_snapshot=pre_run_workspace_snapshot,
+            )
+            error_msg = _recursion_capped_message(config.get("recursion_limit"), delivery_content)
+            if not record.abort_event.is_set():
+                await _prepare_goal_continuation_input(
+                    bridge=bridge,
+                    accessor=accessor,
+                    checkpointer=checkpointer,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    model_name=record.model_name,
+                    app_config=ctx.app_config,
+                    abort_event=record.abort_event,
+                    user_id=resolve_runtime_user_id(runtime),
+                    deerflow_trace_id=deerflow_trace_id,
+                    task_store=task_store,
+                    extensions=extensions,
+                    run_stop_reason=_RECURSION_CAPPED_STOP_REASON,
+                    interaction_policy=resolve_run_interaction_policy(config),
+                    expected_goal=scheduled_goal,
+                    verdict_callback=capture_goal_verdict,
+                )
+                record.goal_verdict = final_goal_verdict
+            stop_status_kwargs = {"stop_reason": _RECURSION_CAPPED_STOP_REASON, "goal_verdict": record.goal_verdict}
+        else:
+            logger.exception("Run %s failed: %s", run_id, error_msg)
+        await _ensure_stream_producer_lease()
         await _ensure_finalizing_before_edit_failure(run_manager, record)
         cancel_action = await run_manager.set_status_if_not_cancelled(
             run_id,
             RunStatus.error,
             error=error_msg,
+            **stop_status_kwargs,
             **terminal_status_kwargs,
         )
         if cancel_action is not None:
-            await _finish_cancellation(cancel_action)
-        else:
-            await bridge.publish(
-                run_id,
-                "error",
-                {
-                    "message": error_msg,
-                    "name": type(exc).__name__,
-                },
-            )
+            await _finish_cancellation(cancel_action, restore_checkpoint=not checkpoint_resume_rejected)
+        elif not record.ownership_lost:
+            error_frame = {
+                "message": error_msg,
+                "name": type(exc).__name__,
+            }
+            if record.status not in (RunStatus.pending, RunStatus.running) and getattr(record, "terminal_status_persisted", True):
+                await bridge.publish(
+                    run_id,
+                    "error",
+                    error_frame,
+                )
+            else:
+                terminal_error_frame = error_frame
 
     finally:
-        if record.ownership_lost:
-            logger.warning(
-                "Skipping durable finalization for run %s because this worker no longer owns its lease",
-                run_id,
-            )
+        completion_hook_task: asyncio.Task[None] | None = None
+        host_interrupted = False
 
-        if not record.ownership_lost and _is_edit_replay_run(record) and record.status != RunStatus.success:
-            if not record.finalizing:
-                await run_manager.set_finalizing(run_id, True)
+        def interrupt_completion_hook() -> None:
+            nonlocal host_interrupted
+            host_interrupted = True
+            if completion_hook_task is not None:
+                completion_hook_task.cancel()
+
+        async def finalize() -> None:
+            nonlocal completion_hook_task
+            nonlocal journal, seq_stamper
+            nonlocal accessor, agent, agent_result, cancel_action, checkpoint_rollback_completed
+            nonlocal completion_data, deferred_finalization_interrupt, delivery_content, goal_completion, goal_evaluator_model
+            nonlocal graph_input, pre_run_workspace_snapshot, produced_output_paths, rollback_point, runtime
+            nonlocal runtime_ctx, subagent_events, task_info, task_store, terminal_error_frame
+
             try:
-                if not checkpoint_rollback_completed:
-                    checkpoint_rollback_completed = await _rollback_to_pre_run_checkpoint(
-                        accessor=accessor,
-                        checkpointer=checkpointer,
-                        thread_id=thread_id,
-                        run_id=run_id,
-                        rollback_point=rollback_point,
-                        snapshot_capture_failed=snapshot_capture_failed,
-                    )
-                if checkpoint_rollback_completed:
-                    await _publish_restored_checkpoint_values(
-                        bridge=bridge,
-                        run_id=run_id,
-                        accessor=accessor,
-                        thread_id=thread_id,
-                    )
-                    logger.info("Run %s edit replay restored pre-run checkpoint %s", run_id, pre_run_checkpoint_id)
-            except Exception:
-                logger.warning("Run %s edit replay rollback failed", run_id, exc_info=True)
-
-        # Persist any subagent step events still buffered (#3779) — including on
-        # abort/exception paths, where the stream loop broke before its own flush.
-        if not record.ownership_lost and subagent_events is not None:
-            await subagent_events.flush()
-
-        if not record.ownership_lost and event_store is not None and pre_run_workspace_snapshot is not None:
-            try:
-                await record_workspace_changes(
-                    event_store,
-                    thread_id,
-                    run_id,
-                    pre_run_workspace_snapshot,
-                    user_id=workspace_changes_user_id,
-                    extra_excluded_dir_names=workspace_excluded_dir_names,
-                )
-            except Exception:
-                logger.warning("Failed to record workspace changes for run %s", run_id, exc_info=True)
-
-        # Flush buffered journal events before the terminal receipt. The
-        # receipt uses a run-scoped idempotent write shared with recovery, then
-        # the staged terminal status is persisted. This ordering closes the
-        # crash window where a terminal run could otherwise outlive its receipt.
-        # A fenced worker leaves receipt recovery to the peer that claimed it.
-        if not record.ownership_lost and journal is not None:
-            try:
-                await journal.flush()
-            except Exception:
-                logger.warning("Failed to flush journal for run %s", run_id, exc_info=True)
-
-            if delivery_content is None:
-                if produced_output_paths is None:
-                    produced_output_paths = await _produced_output_paths(
-                        pre_run_workspace_snapshot,
-                        thread_id=thread_id,
-                        user_id=workspace_changes_user_id,
-                        extra_excluded_dir_names=workspace_excluded_dir_names,
-                    )
-                delivery_content = _delivery_content_with_outputs(journal.get_delivery_content(), produced_output_paths)
-            receipt_persisted = await _persist_delivery_receipt(
-                event_store,
-                thread_id=thread_id,
-                run_id=run_id,
-                content=delivery_content,
-            )
-            if produced_output_paths and record.status == RunStatus.success and not receipt_persisted:
-                await run_manager.set_status(
-                    run_id,
-                    RunStatus.error,
-                    error=_DELIVERY_RECEIPT_FAILED_ERROR,
-                    persist=False,
-                )
-
-        if not record.ownership_lost and journal is not None and persist_completion:
-            try:
-                # Advance the final completion fields and timestamp without
-                # terminalizing the durable row. That active row continues to
-                # fence peer checkpoint writers through the duration write.
-                completion_data = journal.get_completion_data()
-                await run_manager.update_finalizing_progress(run_id, **completion_data)
-            except Exception:
-                logger.warning("Failed to persist finalizing run progress for %s (non-fatal)", run_id, exc_info=True)
-
-        # Keep the durable run row active through its final duration checkpoint
-        # write. A peer Gateway admits history migration from the durable row,
-        # not this worker's staged terminal status; terminalizing first would
-        # let that migration read an unfinished lifetime and race this write.
-        if started and not record.ownership_lost and checkpointer is not None and record.status == RunStatus.success:
-            try:
-                created = datetime.fromisoformat(record.created_at.replace("Z", "+00:00"))
-                updated = datetime.fromisoformat(record.updated_at.replace("Z", "+00:00"))
-                # Match legacy history semantics: turn_duration is the whole
-                # RunRecord lifetime in integer seconds, including admission
-                # delay. Persist zero for sub-second successful turns.
-                duration = max(0, int((updated - created).total_seconds()))
-                await _persist_run_duration(
-                    checkpointer=checkpointer,
-                    thread_id=thread_id,
-                    run_id=run_id,
-                    duration_seconds=duration,
-                )
-            except Exception:
-                logger.debug("Failed to persist run duration for thread %s run %s (non-fatal)", thread_id, run_id)
-
-        if not record.ownership_lost and event_store is not None:
-            try:
-                # Even after bounded receipt retries are exhausted, persist the
-                # real worker outcome. Leaving a successful row inflight would
-                # let lease recovery rewrite it as an error with a synthetic
-                # zero receipt.
-                if record.abort_event.is_set():
-                    await run_manager.persist_current_status(run_id)
-                else:
-                    cancel_action = await run_manager.set_status_if_not_cancelled(
+                if input_control is not None:
+                    try:
+                        await input_control.close()
+                        if not record.ownership_lost:
+                            await input_control.confirm_checkpoint()
+                            if record.status != RunStatus.success or record.stop_reason:
+                                await input_control.inputs.pause()
+                    except Exception:
+                        logger.warning("Could not finalize Run input receipts for %s", run_id, exc_info=True)
+                if record.ownership_lost:
+                    logger.warning(
+                        "Skipping durable finalization for run %s because this worker no longer owns its lease",
                         run_id,
-                        record.status,
-                        error=record.error,
-                        stop_reason=record.stop_reason,
                     )
-                    if cancel_action is not None:
-                        await _finish_cancellation(cancel_action)
+
+                # A rejected resume has not written state; compensating it through
+                # the state-only graph would itself discard the pending Sends.
+                if not record.ownership_lost and _is_edit_replay_run(record) and record.status != RunStatus.success and not checkpoint_resume_rejected:
+                    if not record.finalizing:
+                        await run_manager.set_finalizing(run_id, True)
+                    try:
+                        if not checkpoint_rollback_completed:
+                            checkpoint_rollback_completed = await _rollback_to_pre_run_checkpoint(
+                                accessor=accessor,
+                                checkpointer=checkpointer,
+                                thread_id=thread_id,
+                                run_id=run_id,
+                                rollback_point=rollback_point,
+                                snapshot_capture_failed=snapshot_capture_failed,
+                            )
+                        if checkpoint_rollback_completed:
+                            await _publish_restored_checkpoint_values(
+                                bridge=bridge,
+                                run_id=run_id,
+                                accessor=accessor,
+                                thread_id=thread_id,
+                            )
+                            logger.info("Run %s edit replay restored pre-run checkpoint %s", run_id, pre_run_checkpoint_id)
+                    except Exception:
+                        logger.warning("Run %s edit replay rollback failed", run_id, exc_info=True)
+
+                # Persist any subagent step events still buffered (#3779) — including on
+                # abort/exception paths, where the stream loop broke before its own flush.
+                if not record.ownership_lost and subagent_events is not None:
+                    await subagent_events.flush()
+
+                if not record.ownership_lost and event_store is not None and pre_run_workspace_snapshot is not None:
+                    try:
+                        await record_workspace_changes(
+                            event_store,
+                            thread_id,
+                            run_id,
+                            pre_run_workspace_snapshot,
+                            user_id=workspace_changes_user_id,
+                            extra_excluded_dir_names=workspace_excluded_dir_names,
+                        )
+                    except Exception:
+                        logger.warning("Failed to record workspace changes for run %s", run_id, exc_info=True)
+
+                # Flush buffered journal events before the terminal receipt. The
+                # receipt uses a run-scoped idempotent write shared with recovery, then
+                # the staged terminal status is persisted. This ordering closes the
+                # crash window where a terminal run could otherwise outlive its receipt.
+                # A fenced worker leaves receipt recovery to the peer that claimed it.
+                if not record.ownership_lost and journal is not None:
+                    if record.status == RunStatus.interrupted and partial_assistant_response is not None:
+                        journal.record_interrupted_ai_responses(partial_assistant_response.messages())
+                    try:
+                        await journal.flush()
+                    except Exception:
+                        logger.warning("Failed to flush journal for run %s", run_id, exc_info=True)
+
+                    if delivery_content is None:
+                        if produced_output_paths is None:
+                            produced_output_paths = await _produced_output_paths(pre_run_workspace_snapshot, thread_id=thread_id, user_id=workspace_changes_user_id, extra_excluded_dir_names=workspace_excluded_dir_names)
+                        delivery_content = _delivery_content_with_outputs(journal.get_delivery_content(), produced_output_paths, pre_run_snapshot=pre_run_workspace_snapshot)
+                    receipt_persisted = await _persist_delivery_receipt(event_store, thread_id=thread_id, run_id=run_id, content=delivery_content)
+                    if produced_output_paths and record.status == RunStatus.success and not receipt_persisted:
+                        await run_manager.set_status(run_id, RunStatus.error, error=_DELIVERY_RECEIPT_FAILED_ERROR, persist=False)
+
+                if not record.ownership_lost and journal is not None and persist_completion:
+                    try:
+                        # Advance the final completion fields and timestamp without
+                        # terminalizing the durable row. That active row continues to
+                        # fence peer checkpoint writers through the duration write.
+                        completion_data = journal.get_completion_data()
+                        await run_manager.update_finalizing_progress(run_id, **completion_data)
+                    except Exception:
+                        logger.warning("Failed to persist finalizing run progress for %s (non-fatal)", run_id, exc_info=True)
+
+                # Keep the durable run row active through its final duration checkpoint
+                # write. A peer Gateway admits history migration from the durable row,
+                # not this worker's staged terminal status; terminalizing first would
+                # let that migration read an unfinished lifetime and race this write.
+                if started and not record.ownership_lost and checkpointer is not None and record.status == RunStatus.success:
+                    try:
+                        created = datetime.fromisoformat(record.created_at.replace("Z", "+00:00"))
+                        updated = datetime.fromisoformat(record.updated_at.replace("Z", "+00:00"))
+                        # Match legacy history semantics: turn_duration is the whole
+                        # RunRecord lifetime in integer seconds, including admission
+                        # delay. Persist zero for sub-second successful turns.
+                        duration = max(0, int((updated - created).total_seconds()))
+                        await _persist_run_duration(checkpointer=checkpointer, thread_id=thread_id, run_id=run_id, duration_seconds=duration)
+                    except Exception:
+                        logger.debug("Failed to persist run duration for thread %s run %s (non-fatal)", thread_id, run_id)
+
+                if scheduled_goal is not None and not record.ownership_lost and checkpointer is not None:
+                    if record.abort_event.is_set() and record.abort_action == "rollback" and not checkpoint_rollback_completed:
+                        await _finish_cancellation("rollback")
+                    # Scheduled goals are occurrence-scoped. Keep the real run slot
+                    # active through cleanup so a peer's next user turn cannot
+                    # inherit this goal. Ordinary goals retain terminal-first cleanup.
+                    cleanup_task = asyncio.create_task(
+                        _clear_scheduled_goal(goal=scheduled_goal, record=record, run_manager=run_manager, bridge=bridge, checkpointer=checkpointer, owned_admission=True),
+                        name=f"scheduled-goal-cleanup-{run_id}",
+                    )
+                    try:
+                        deferred_finalization_interrupt = await _await_task_stop_after_host_cancellation(cleanup_task, deferred_finalization_interrupt)
+                    except Exception:
+                        logger.warning("Could not remove scheduled goal for run %s", run_id, exc_info=True)
+                        await run_manager.set_status(run_id, RunStatus.error, error="Scheduled goal cleanup failed", persist=False)
+
+                if not record.ownership_lost and (event_store is not None or scheduled_goal is not None or record.rollback_finalization_pending):
+                    try:
+                        # Even after bounded receipt retries are exhausted, persist the
+                        # real worker outcome. Leaving a successful row inflight would
+                        # let lease recovery rewrite it as an error with a synthetic
+                        # zero receipt.
+                        if record.abort_event.is_set():
+                            if scheduled_goal is not None or record.status == RunStatus.success:
+                                # A cancel may arrive while receipt or scheduled
+                                # cleanup is awaiting I/O. Apply the accepted action
+                                # to a still-staged success, including
+                                # rollback, before committing any terminal outcome.
+                                await _finish_cancellation(record.abort_action, restore_checkpoint=not checkpoint_rollback_completed)
+                            await run_manager.persist_current_status(run_id)
+                        else:
+                            cancel_action = await run_manager.set_status_if_not_cancelled(run_id, record.status, error=record.error, stop_reason=record.stop_reason, goal_verdict=record.goal_verdict)
+                            if cancel_action is not None:
+                                await _finish_cancellation(cancel_action)
+                                await run_manager.persist_current_status(run_id)
+                    except Exception:
+                        logger.warning("Failed to persist terminal status for run %s after delivery receipt attempts", run_id, exc_info=True)
+                # Only a confirmed terminal write or ownership loss releases the
+                # renewal barrier in multi-worker mode. A returned/aborted call is
+                # not evidence that this worker committed its terminal outcome.
+                if record.terminal_commit_pending and run_manager.can_release_terminal_barrier(record):
+                    record.terminal_commit_pending = False
+
+                if not record.ownership_lost and journal is not None and persist_completion:
+                    try:
+                        # Persist token usage + convenience fields to RunStore
+                        completion_data = completion_data or journal.get_completion_data()
+                        await run_manager.update_run_completion(run_id, status=record.status.value, **completion_data)
+                    except Exception:
+                        logger.warning("Failed to persist run completion for %s (non-fatal)", run_id, exc_info=True)
+
+                if scheduled_goal is not None and not record.ownership_lost:
+                    status_confirmed = await run_manager.persist_current_status(run_id)
+                    if not status_confirmed:
+                        await run_manager._mark_ownership_lost(record, reason="Scheduled run terminal status could not be confirmed after goal cleanup.", require_active=False)
+                    # Late cancellation can still drain a rollback after goal
+                    # cleanup. Retain admission/heartbeat protection through that
+                    # rollback and the actual durable terminal acknowledgement.
+                    record.scheduled_goal_cleanup_pending = False
+
+                # A satisfied evaluator is only a candidate until artifact delivery,
+                # receipt persistence and durable cancellation arbitration have ended.
+                # Status writes are best-effort in single-worker mode: confirm the
+                # existing outcome before deleting recoverable goal state.
+                if scheduled_goal is None and goal_completion is not None and record.status == RunStatus.success and not record.abort_event.is_set() and not record.ownership_lost:
+                    try:
+                        status_confirmed = await run_manager.persist_current_status(run_id)
+                        if status_confirmed:
+                            await _clear_completed_goal(
+                                candidate=goal_completion,
+                                record=record,
+                                run_manager=run_manager,
+                                bridge=bridge,
+                                accessor=accessor,
+                                checkpointer=checkpointer,
+                            )
+                    except Exception:
+                        logger.warning("Could not finalize satisfied goal for thread %s", thread_id, exc_info=True)
+
+                if started and not record.ownership_lost and checkpointer is not None and record.status == RunStatus.interrupted and not _is_edit_replay_run(record):
+                    try:
+                        await run_manager.wait_for_prior_finalizing(thread_id, run_id)
+                        if not await run_manager.has_later_started_run(thread_id, run_id):
+                            await _ensure_interrupted_title(checkpointer=checkpointer, thread_id=thread_id, app_config=ctx.app_config, graph_input=graph_input)
+                    except Exception:
+                        logger.debug("Failed to generate interrupted title for thread %s (non-fatal)", thread_id)
+
+                # Sync title from checkpoint to threads_meta.display_name
+                if started and not record.ownership_lost and checkpointer is not None and thread_store is not None:
+                    try:
+                        ckpt_config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+                        ckpt_tuple = await checkpointer.aget_tuple(ckpt_config)
+                        if ckpt_tuple is not None:
+                            ckpt = getattr(ckpt_tuple, "checkpoint", {}) or {}
+                            title = ckpt.get("channel_values", {}).get("title")
+                            if title:
+                                await thread_store.update_display_name(thread_id, title)
+                    except Exception:
+                        logger.debug("Failed to sync title for thread %s (non-fatal)", thread_id)
+
+                # Update threads_meta status based on run outcome
+                if started and not record.ownership_lost and thread_store is not None:
+                    try:
+                        final_status = "idle" if record.status == RunStatus.success else record.status.value
+                        await thread_store.update_status(thread_id, final_status)
+                    except Exception:
+                        logger.debug("Failed to update thread_meta status for %s (non-fatal)", thread_id)
+
+                if started and not record.ownership_lost and accessor is not None and record.status == RunStatus.success and not record.abort_event.is_set() and record.human_input_request is None:
+                    try:
+                        from deerflow.agents.human_input import extract_unanswered_human_input_request
+
+                        record.human_input_request = extract_unanswered_human_input_request(await _materialized_checkpoint_messages(accessor, thread_id))
+                    except Exception:
+                        logger.debug("Failed to inspect trailing human_input_request for run %s (non-fatal)", run_id, exc_info=True)
+
+                if not record.ownership_lost and not getattr(record, "terminal_status_persisted", True):
+                    try:
                         await run_manager.persist_current_status(run_id)
-            except Exception:
-                logger.warning("Failed to persist terminal status for run %s after delivery receipt attempts", run_id, exc_info=True)
+                    except Exception:
+                        logger.warning("Failed to confirm terminal status for run %s before completion hook", run_id, exc_info=True)
 
-        if not record.ownership_lost and journal is not None and persist_completion:
-            try:
-                # Persist token usage + convenience fields to RunStore
-                completion_data = completion_data or journal.get_completion_data()
-                await run_manager.update_run_completion(run_id, status=record.status.value, **completion_data)
-            except Exception:
-                logger.warning("Failed to persist run completion for %s (non-fatal)", run_id, exc_info=True)
+                if not record.ownership_lost and getattr(record, "terminal_status_persisted", True) and ctx.on_run_completed is not None:
+                    try:
+                        # Preserve hook liveness without forwarding cancellation
+                        # to the finalizer's durable writes or resource cleanup.
+                        async def invoke_completion_hook() -> None:
+                            await ctx.on_run_completed(record)
 
-        if started and not record.ownership_lost and checkpointer is not None and record.status == RunStatus.interrupted and not _is_edit_replay_run(record):
-            try:
-                await run_manager.wait_for_prior_finalizing(thread_id, run_id)
-                if not await run_manager.has_later_started_run(thread_id, run_id):
-                    await _ensure_interrupted_title(checkpointer=checkpointer, thread_id=thread_id, app_config=ctx.app_config, graph_input=graph_input)
-            except Exception:
-                logger.debug("Failed to generate interrupted title for thread %s (non-fatal)", thread_id)
+                        completion_hook_task = asyncio.create_task(invoke_completion_hook(), name=f"run-completion-hook-{run_id}")
+                        if host_interrupted:
+                            await asyncio.sleep(0)
+                            completion_hook_task.cancel()
+                        await completion_hook_task
+                    except Exception:
+                        logger.warning("Run completion hook failed for %s (non-fatal)", run_id, exc_info=True)
+                    except BaseException as exc:
+                        # A terminal hook must not leave replacement runs blocked or
+                        # stream consumers waiting indefinitely.
+                        deferred_finalization_interrupt = _defer_finalization_interrupt(
+                            deferred_finalization_interrupt,
+                            exc,
+                        )
+                        logger.warning(
+                            "Run completion hook interrupted for %s; completing finalization first",
+                            run_id,
+                        )
+                    finally:
+                        completion_hook_task = None
 
-        # Sync title from checkpoint to threads_meta.display_name
-        if started and not record.ownership_lost and checkpointer is not None and thread_store is not None:
-            try:
-                ckpt_config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
-                ckpt_tuple = await checkpointer.aget_tuple(ckpt_config)
-                if ckpt_tuple is not None:
-                    ckpt = getattr(ckpt_tuple, "checkpoint", {}) or {}
-                    title = ckpt.get("channel_values", {}).get("title")
-                    if title:
-                        await thread_store.update_display_name(thread_id, title)
-            except Exception:
-                logger.debug("Failed to sync title for thread %s (non-fatal)", thread_id)
+                if task_info is not None and task_store is not None:
+                    # Keep the finalizing barrier held until stop observers finish, so
+                    # a same-thread replacement cannot overlap this task's lifecycle.
+                    task_stop = asyncio.create_task(
+                        notify_task_stop(
+                            extensions,
+                            task_store,
+                            task_info,
+                            lead_task_outcome(
+                                aborted=(record.abort_event.is_set() or record.status == RunStatus.interrupted),
+                                succeeded=record.status == RunStatus.success,
+                            ),
+                            timeout=_EXTENSION_TASK_NOTIFY_TIMEOUT_SECONDS,
+                        ),
+                        name=f"extension-task-stop-{run_id}",
+                    )
+                    try:
+                        deferred_finalization_interrupt = await _await_task_stop_after_host_cancellation(
+                            task_stop,
+                            deferred_finalization_interrupt,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Extension task-stop notification failed for run %s (non-fatal)",
+                            run_id,
+                            exc_info=True,
+                        )
+                    except BaseException as exc:
+                        # Cancellation here must not strand the finalizing barrier or
+                        # leave stream consumers waiting for the end frame.
+                        deferred_finalization_interrupt = _defer_finalization_interrupt(
+                            deferred_finalization_interrupt,
+                            exc,
+                        )
+                        logger.warning(
+                            "Extension task-stop notification interrupted for run %s; completing cleanup first",
+                            run_id,
+                        )
+                if not record.ownership_lost and journal is not None:
+                    evidence_failure = None
+                    try:
 
-        # Update threads_meta status based on run outcome
-        if started and not record.ownership_lost and thread_store is not None:
-            try:
-                final_status = "idle" if record.status == RunStatus.success else record.status.value
-                await thread_store.update_status(thread_id, final_status)
-            except Exception:
-                logger.debug("Failed to update thread_meta status for %s (non-fatal)", thread_id)
+                        async def confirm_terminal() -> None:
+                            nonlocal evidence_failure
+                            from deerflow.runtime.events.terminal import confirm_terminal_event
 
-        if not record.ownership_lost and ctx.on_run_completed is not None:
-            try:
-                await ctx.on_run_completed(record)
-            except Exception:
-                logger.warning("Run completion hook failed for %s (non-fatal)", run_id, exc_info=True)
+                            status = run_manager.terminal_event_status(record)
+                            if status is None:
+                                evidence_failure = "Terminal event lacks an attributable final commit ACK"
+                                raise RuntimeError(evidence_failure)
+                            confirmation = await confirm_terminal_event(
+                                event_store,
+                                thread_id=thread_id,
+                                run_id=run_id,
+                                status=status,
+                                user_id=record.user_id,
+                                authorized=lambda: run_manager.terminal_event_status(record) == status,
+                            )
+                            if not confirmation.confirmed:
+                                evidence_failure = f"Terminal event confirmation: {confirmation.value}."
+                                raise RuntimeError(evidence_failure)
 
-        if task_info is not None and task_store is not None:
-            # Keep the finalizing barrier held until stop observers finish, so
-            # a same-thread replacement cannot overlap this task's lifecycle.
-            try:
-                await notify_task_stop(
-                    extensions,
-                    task_store,
-                    task_info,
-                    lead_task_outcome(
-                        aborted=(record.abort_event.is_set() or record.status == RunStatus.interrupted),
-                        succeeded=record.status == RunStatus.success,
-                    ),
-                    timeout=_EXTENSION_TASK_NOTIFY_TIMEOUT_SECONDS,
-                )
-            except Exception:
-                logger.warning(
-                    "Extension task-stop notification failed for run %s (non-fatal)",
-                    run_id,
-                    exc_info=True,
-                )
-            except BaseException as exc:
-                # Cancellation here must not strand the finalizing barrier or
-                # leave stream consumers waiting for the end frame.
-                deferred_stop_interrupt = exc
-                logger.warning(
-                    "Extension task-stop notification interrupted for run %s; completing cleanup first",
-                    run_id,
-                )
-        if record.finalizing:
-            await run_manager.set_finalizing(run_id, False)
+                        evidence_receipt = await journal.finish_evidence(before_receipt=confirm_terminal)
+                        if evidence_receipt is not None and (subagent_events is None or not subagent_events._pending):
+                            from deerflow.runtime.events.store.db import DbRunEventStore
 
-        await bridge.publish_end(run_id)
-        asyncio.create_task(bridge.cleanup(run_id, delay=60))
+                            if isinstance(event_store, DbRunEventStore) and current_producer() is not None:
+                                if not await event_store.close_producer(current_producer()):
+                                    raise RuntimeError("Run evidence producer could not be closed")
+                        if evidence_receipt is not None:
+                            if not evidence_execution_started:
+                                evidence_failure = "Lead graph execution did not begin; producer coverage is partial."
+                            elif not await run_manager.seal_completed_evidence(run_id, evidence_receipt):
+                                evidence_failure = "The owning worker could not persist the journal seal."
+                    except BaseException as exc:
+                        evidence_failure = evidence_failure or f"Journal seal failed ({type(exc).__name__})."
+                        if not isinstance(exc, Exception):
+                            deferred_finalization_interrupt = _defer_finalization_interrupt(deferred_finalization_interrupt, exc)
+                        logger.warning("Failed to seal completed-run evidence for %s (non-fatal)", run_id, exc_info=True)
+                    if evidence_failure is not None:
+                        try:
+                            await run_manager.mark_evidence_partial(run_id, error=evidence_failure)
+                        except Exception:
+                            logger.warning("Failed to persist partial evidence for %s (non-fatal)", run_id, exc_info=True)
+                        except BaseException as exc:
+                            deferred_finalization_interrupt = _defer_finalization_interrupt(deferred_finalization_interrupt, exc)
+                            logger.warning("Partial evidence persistence interrupted for %s; completing cleanup first", run_id)
 
-        if deferred_stop_interrupt is not None:
-            raise deferred_stop_interrupt
+                if record.finalizing:
+                    await run_manager.set_finalizing(run_id, False)
+
+                terminal_stream_authorized = not record.ownership_lost and record.status not in (RunStatus.pending, RunStatus.running) and getattr(record, "terminal_status_persisted", True)
+                if terminal_stream_authorized:
+                    if terminal_error_frame is not None:
+                        await bridge.publish(
+                            run_id,
+                            "error",
+                            terminal_error_frame,
+                        )
+                    await bridge.publish_end(run_id)
+                else:
+                    logger.warning(
+                        "Skipping stream end for run %s because its durable terminal status is unconfirmed",
+                        run_id,
+                    )
+
+                if deferred_finalization_interrupt is not None:
+                    raise deferred_finalization_interrupt
+            finally:
+                try:
+                    if journal is not None:
+                        try:
+                            await journal.close(flush=not record.ownership_lost)
+                        except Exception:
+                            logger.warning("Failed to close journal for run %s", run_id, exc_info=True)
+                finally:
+                    if stream_producer_lease_started:
+                        try:
+                            await bridge.finish_producer_lease(run_id)
+                        except Exception:
+                            logger.warning(
+                                "Failed to finish stream producer lease for run %s",
+                                run_id,
+                                exc_info=True,
+                            )
+                    lease_cleanup_interrupt: BaseException | None = None
+                    try:
+                        from deerflow.sandbox.lease import release_sandbox_execution_lease_async
+
+                        await release_sandbox_execution_lease_async(runtime_ctx)
+                    except Exception:
+                        logger.warning("Failed to release sandbox execution lease for run %s", run_id, exc_info=True)
+                    except BaseException as exc:
+                        # release_async completes the underlying cleanup before it
+                        # re-raises cancellation. Defer that interruption until the
+                        # worker has dropped all other run-scoped references too.
+                        lease_cleanup_interrupt = exc
+                        logger.warning(
+                            "Sandbox execution lease cleanup was interrupted for run %s; completing local cleanup first",
+                            run_id,
+                        )
+                    finally:
+                        _release_run_scoped_references(
+                            runnable_configs,
+                            runtime_ctx,
+                            journal,
+                        )
+                    # Drop graph and per-run payload references before the terminal
+                    # worker task itself becomes collectable.
+                    # Diagnostic tracebacks can retain this frame. Release both
+                    # the journal and the stamper callback that closes over it.
+                    seq_stamper = None
+                    journal = None
+                    agent = None
+                    agent_result = None
+                    accessor = None
+                    runtime = None
+                    runtime_ctx = None
+                    rollback_point = None
+                    subagent_events = None
+                    goal_evaluator_model = None
+                    goal_completion = None
+                    task_store = None
+                    task_info = None
+                    pre_run_workspace_snapshot = None
+                    delivery_content = None
+                    produced_output_paths = None
+                    graph_input = {}
+
+                    # Durable finalization and terminal publication may depend on
+                    # external backends, but local housekeeping must always run.
+                    record.scheduled_goal_cleanup_pending = False
+                    _create_contextless_task(bridge.cleanup(run_id, delay=60))
+                    # Preserve the existing five-minute grace period for local
+                    # join/status paths, then release the terminal record, completed
+                    # task, and request payload. Durable run history remains available
+                    # through RunStore.
+                    _create_contextless_task(run_manager.cleanup(run_id))
+                    _schedule_terminal_cycle_collection()
+
+                    if lease_cleanup_interrupt is not None:
+                        raise lease_cleanup_interrupt
+
+        # The registered worker remains the owner until every terminal and
+        # resource-cleanup await settles. Never cancel or detach this task.
+        finalizer = asyncio.create_task(finalize(), name=f"run-finalization-{run_id}")
+        if stream_producer_lease_started:
+            transfer_producer_lease = _declared_bridge_method(
+                bridge,
+                "transfer_producer_lease",
+            )
+            if transfer_producer_lease is not None:
+                transfer_producer_lease(run_id, finalizer)
+        await _drain_run_finalization(finalizer, on_host_cancel=interrupt_completion_hook)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+# Stops that end the run with an error before the turn has a final reply: the
+# goal stands down without an evaluator call, since there is nothing to judge.
+_GOAL_RUN_ERROR_STOP_REASONS = frozenset({_RECURSION_CAPPED_STOP_REASON})
+
+
+@dataclass(frozen=True)
+class _GoalCompletionCandidate:
+    goal: GoalState
+    conversation_signature: str
+    evaluation: GoalEvaluation
+
+
+def _scheduled_goal_objective(record: RunRecord, scheduled_runtime: Mapping[str, Any] | None) -> str | None:
+    if scheduled_runtime is None or scheduled_runtime.get("goal_objective") is None:
+        return None
+    metadata = record.metadata or {}
+    if not record.user_id or scheduled_runtime.get("user_id") != record.user_id or scheduled_runtime.get("task_id") != metadata.get("scheduled_task_id") or scheduled_runtime.get("occurrence_id") != metadata.get("scheduled_task_run_id"):
+        raise ValueError("Scheduled goal authority does not match the admitted occurrence")
+    objective = metadata.get("scheduled_goal_objective")
+    if not isinstance(objective, str) or objective != scheduled_runtime.get("goal_objective"):
+        raise ValueError("Scheduled goal snapshot does not match the admitted objective")
+    return objective
+
+
+async def _install_scheduled_goal(*, checkpointer: Any, accessor: CheckpointStateAccessor, thread_id: str, goal: GoalState) -> None:
+    if checkpointer is None:
+        raise RuntimeError("Scheduled goals require a checkpointer")
+    async with goal_thread_lock(thread_id), _checkpoint_thread_lock(thread_id):
+        checkpoint = await _call_checkpointer_method(checkpointer, "aget_tuple", "get_tuple", {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}})
+        if checkpoint is not None:
+            if _read_checkpoint_goal(checkpoint) is not None or any(_is_visible_message(message) for message in await _materialized_checkpoint_messages(accessor, thread_id)):
+                raise GoalWriteConflict("A scheduled goal requires a fresh conversation")
+        await write_thread_goal(checkpointer, thread_id, goal, as_node="scheduled_goal", create_if_missing=True, expected_checkpoint_id=_checkpoint_id(checkpoint))
+
+
+async def _clear_scheduled_goal(*, goal: GoalState, record: RunRecord, run_manager: RunManager, bridge: StreamBridge | None, checkpointer: Any, owned_admission: bool = False) -> None:
+    """Release only this occurrence's goal under a real run/checkpoint slot."""
+    try:
+        reservation = _checkpoint_thread_lock(record.thread_id) if owned_admission else run_manager.reserve_thread_operation(record.thread_id, kind=ThreadOperationKind.checkpoint_write, user_id=record.user_id)
+        async with goal_thread_lock(record.thread_id), reservation:
+            if owned_admission and not await run_manager.owns_active_admission(record):
+                return
+            checkpoint = await _call_checkpointer_method(checkpointer, "aget_tuple", "get_tuple", {"configurable": {"thread_id": record.thread_id, "checkpoint_ns": ""}})
+            if checkpoint is None or not _goal_instance_matches(goal, _read_checkpoint_goal(checkpoint)) or record.ownership_lost:
+                return
+            values = await write_thread_goal(checkpointer, record.thread_id, None, as_node="scheduled_goal", expected_checkpoint_id=_checkpoint_id(checkpoint))
+            if bridge is not None:
+                await bridge.publish(record.run_id, "values", serialize(values, mode="values"))
+    except (GoalWriteConflict, ConflictError):
+        return
+
+
+async def clear_recovered_scheduled_goal(record: RunRecord, *, run_manager: RunManager, checkpointer: Any) -> None:
+    """Clean an idle recovered occurrence; an admitted new run wins safely.
+
+    Verify durable owner/thread/timestamp/objective identity before acquiring
+    the existing checkpoint reservation. Busy threads defer to worker preflight.
+    No ORM writer transaction spans a checkpointer write.
+    """
+    metadata = record.metadata or {}
+    objective = metadata.get("scheduled_goal_objective")
+    if checkpointer is None or not record.user_id or not isinstance(objective, str):
+        return
+    try:
+        timestamp = canonical_run_created_at(record.created_at)
+        expected = build_goal_state(objective, now=timestamp)
+        source = await run_manager.scheduled_goal_source(record.thread_id, user_id=record.user_id, created_at=timestamp, objective=expected["objective"])
+        if source is None or source.run_id != record.run_id:
+            return
+        await _clear_scheduled_goal(goal=expected, record=record, run_manager=run_manager, bridge=None, checkpointer=checkpointer)
+    except Exception:
+        logger.warning("Unable to remove recovered scheduled goal for run %s; preserving it for guarded worker preflight", record.run_id, exc_info=True)
+
+
+async def _clear_stale_scheduled_goal(*, record: RunRecord, run_manager: RunManager, bridge: StreamBridge, checkpointer: Any) -> None:
+    """Before a new turn, remove a provably terminal predecessor's goal only."""
+    if checkpointer is None or not record.user_id:
+        return
+    async with goal_thread_lock(record.thread_id), _checkpoint_thread_lock(record.thread_id):
+        checkpoint = await _call_checkpointer_method(checkpointer, "aget_tuple", "get_tuple", {"configurable": {"thread_id": record.thread_id, "checkpoint_ns": ""}})
+        current = _read_checkpoint_goal(checkpoint) if checkpoint is not None else None
+        if current is None:
+            return
+        try:
+            created_at = canonical_run_created_at(current.get("created_at", ""))
+        except (TypeError, ValueError):
+            return
+        if current.get("created_at") != created_at:
+            # Only this canonical representation is emitted by the scheduled
+            # installer; equivalent user timestamps are not provenance.
+            return
+        try:
+            source = await run_manager.scheduled_goal_source(record.thread_id, user_id=record.user_id, created_at=created_at, objective=current["objective"])
+        except Exception as exc:
+            # Idle recovery can defer cleanup, but a new run must not inherit
+            # an unverified goal. Keep cancellation and the checkpoint intact.
+            raise RuntimeError("Scheduled goal recovery could not verify the existing goal's ownership. Agent execution did not start; the goal was preserved.") from exc
+        if source is None or not await run_manager.owns_active_admission(record):
+            return
+        try:
+            values = await write_thread_goal(checkpointer, record.thread_id, None, as_node="scheduled_goal_recovery", expected_checkpoint_id=_checkpoint_id(checkpoint))
+            await bridge.publish(record.run_id, "values", serialize(values, mode="values"))
+        except GoalWriteConflict:
+            return
+
+
+async def _clear_completed_goal(
+    *,
+    candidate: _GoalCompletionCandidate,
+    record: RunRecord,
+    run_manager: RunManager,
+    bridge: StreamBridge,
+    accessor: CheckpointStateAccessor,
+    checkpointer: Any,
+) -> None:
+    """Clear only the evaluated goal after the run has successfully finalized."""
+    try:
+        # Terminal status has released the run's admission. Use the same durable
+        # reservation as other out-of-run checkpoint writers; a peer that already
+        # admitted a new run wins, even before it has written any checkpoint.
+        async with (
+            goal_thread_lock(record.thread_id),
+            run_manager.reserve_thread_operation(record.thread_id, kind=ThreadOperationKind.checkpoint_write, user_id=record.user_id),
+        ):
+            checkpoint_tuple = await _call_checkpointer_method(
+                checkpointer,
+                "aget_tuple",
+                "get_tuple",
+                {"configurable": {"thread_id": record.thread_id, "checkpoint_ns": ""}},
+            )
+            if checkpoint_tuple is None:
+                logger.debug("Skipping goal completion for run %s: checkpoint is unavailable", record.run_id)
+                return
+            # Full equality is intentional: even same-instance goal updates must win over clearing.
+            if _read_checkpoint_goal(checkpoint_tuple) != candidate.goal:
+                logger.debug("Skipping goal completion for run %s: goal snapshot changed", record.run_id)
+                return
+            messages = await _materialized_checkpoint_messages(accessor, record.thread_id)
+            if visible_conversation_signature(messages) != candidate.conversation_signature:
+                logger.debug("Skipping goal completion for run %s: visible conversation changed", record.run_id)
+                return
+            if record.status != RunStatus.success or record.abort_event.is_set() or record.ownership_lost:
+                logger.debug(
+                    "Skipping goal completion for run %s: status=%s, aborted=%s, ownership_lost=%s",
+                    record.run_id,
+                    record.status.value,
+                    record.abort_event.is_set(),
+                    record.ownership_lost,
+                )
+                return
+            # Duration bookkeeping may advance the checkpoint after evaluation.
+            # Compare goal/conversation above, then guard against stale writes.
+            # The record lands in the same checkpoint as the clear, or not at all.
+            values = await write_thread_goal(
+                checkpointer,
+                record.thread_id,
+                None,
+                as_node="goal_evaluator",
+                expected_checkpoint_id=_checkpoint_id(checkpoint_tuple),
+                outcome=build_goal_outcome(candidate.goal, candidate.evaluation, reply_message_id=latest_visible_assistant_message_id(messages)),
+            )
+            await bridge.publish(record.run_id, "values", serialize(values, mode="values"))
+    except GoalWriteConflict:
+        logger.debug("Skipping goal completion for run %s: checkpoint changed before the goal write", record.run_id)
+        return
+    except ConflictError:
+        return
 
 
 def _checkpoint_id(checkpoint_tuple: Any) -> str | None:
@@ -1426,6 +2615,24 @@ def _has_durable_goal_turn_receipt(checkpoint_tuple: Any, messages: list[Any]) -
     return _message_type(visible_messages[-1]) == "ai"
 
 
+def _ends_on_human_input_request(messages: list[Any]) -> bool:
+    """Return true when the turn ended on a Human Input Card the user has not answered.
+
+    ``ask_clarification`` and the sandbox network prompt put the request in a
+    ToolMessage artifact and end the graph there, so it sits in the trailing run of
+    tool results. Continuing would tell the agent to keep going while the question is
+    still open, so the evaluator is not asked.
+    """
+    for message in reversed(messages):
+        if _message_type(message) != "tool":
+            return False
+        artifact = message.get("artifact") if isinstance(message, dict) else getattr(message, "artifact", None)
+        human_input = artifact.get("human_input") if isinstance(artifact, Mapping) else None
+        if isinstance(human_input, Mapping) and human_input.get("kind") == "human_input_request":
+            return True
+    return False
+
+
 def _stand_down_reason(goal: GoalState, evaluation: GoalEvaluation, no_progress_count: int) -> str | None:
     if evaluation["satisfied"]:
         return None
@@ -1452,6 +2659,7 @@ async def _persist_goal_evaluation(
     continuation_count: int | None = None,
     stand_down_reason: str | None = None,
     evidence_signature: str = "",
+    operation_progress: dict[str, Any] | None = None,
 ) -> GoalState | None:
     try:
         async with goal_thread_lock(thread_id):
@@ -1481,6 +2689,7 @@ async def _persist_goal_evaluation(
                 no_progress_count=no_progress_count,
                 stand_down_reason=stand_down_reason,
                 evidence_signature=evidence_signature,
+                operation_progress=operation_progress,
             )
             values = await write_thread_goal(
                 checkpointer,
@@ -1525,8 +2734,13 @@ async def _prepare_goal_continuation_input(
     deerflow_trace_id: str | None = None,
     task_store: Any | None = None,
     extensions: Any | None = None,
-) -> dict[str, Any] | None:
-    """Evaluate the active goal and return a hidden continuation input if needed.
+    run_stop_reason: str | None = None,
+    interaction_policy: RunInteractionPolicy | None = None,
+    expected_goal: GoalState | None = None,
+    verdict_callback: Callable[[GoalState, GoalEvaluation, str | None], None] | None = None,
+    usage_callback: Callable[[list[dict[str, int | str | None]]], None] | None = None,
+) -> dict[str, Any] | _GoalCompletionCandidate | None:
+    """Return a continuation input or a completion candidate for finalization.
 
     NOTE: The re-reads below catch a racing user message or ``/goal clear``
     before we queue a continuation. Goal writes then serialize per thread and
@@ -1545,6 +2759,8 @@ async def _prepare_goal_continuation_input(
         return None
     if not goal or goal.get("status") != "active":
         return None
+    if expected_goal is not None and not _goal_instance_matches(expected_goal, goal):
+        return None
 
     async def _persist(
         goal: GoalState,
@@ -1555,7 +2771,7 @@ async def _prepare_goal_continuation_input(
         continuation_count: int | None = None,
     ) -> GoalState | None:
         """Record the evaluation against the still-current goal instance."""
-        return await _persist_goal_evaluation(
+        updated = await _persist_goal_evaluation(
             bridge=bridge,
             checkpointer=checkpointer,
             thread_id=thread_id,
@@ -1566,7 +2782,11 @@ async def _prepare_goal_continuation_input(
             continuation_count=continuation_count,
             stand_down_reason=stand_down_reason,
             evidence_signature=evidence_signature,
+            operation_progress=operation_progress,
         )
+        if updated is not None and verdict_callback is not None:
+            verdict_callback(updated, evaluation, stand_down_reason)
+        return updated
 
     try:
         checkpoint_tuple = await _call_checkpointer_method(
@@ -1581,6 +2801,35 @@ async def _prepare_goal_continuation_input(
         messages = await _materialized_checkpoint_messages(accessor, thread_id)
         conversation_signature_before = visible_conversation_signature(messages)
         evidence_signature = latest_visible_assistant_signature(messages)
+        operation_progress = observe_goal_operations(goal, messages)
+
+        if run_stop_reason in _GOAL_RUN_ERROR_STOP_REASONS:
+            # Checked first: otherwise the stop would read as a missing receipt
+            # or cost an evaluator call, depending on the last message's text.
+            # Keep it ahead of the evaluator section: the step-limit caller in
+            # run_agent passes no evaluator_model_factory or usage_callback.
+            evaluation = GoalEvaluation(
+                satisfied=False,
+                blocker="run_failed",
+                reason="The run reached its step limit before finishing.",
+                evidence_summary="",
+            )
+            no_progress_count = compute_no_progress_count(goal, evaluation, evidence_signature=evidence_signature, operation_progress=operation_progress)
+            await _persist(goal, evaluation, no_progress_count, stand_down_reason=run_stop_reason)
+            return None
+
+        if _ends_on_human_input_request(messages):
+            # The agent asked the user something. Continuing would tell it to keep
+            # going while the question is still open on screen.
+            evaluation = GoalEvaluation(
+                satisfied=False,
+                blocker="needs_user_input",
+                reason="The turn ended on a question to the user that has not been answered.",
+                evidence_summary="",
+            )
+            no_progress_count = compute_no_progress_count(goal, evaluation, evidence_signature=evidence_signature, operation_progress=operation_progress)
+            await _persist(goal, evaluation, no_progress_count, stand_down_reason=_stand_down_reason(goal, evaluation, no_progress_count))
+            return None
 
         if not _has_durable_goal_turn_receipt(checkpoint_tuple, messages):
             evaluation = GoalEvaluation(
@@ -1589,32 +2838,70 @@ async def _prepare_goal_continuation_input(
                 reason="No durable assistant end-of-turn receipt was available.",
                 evidence_summary="",
             )
-            no_progress_count = compute_no_progress_count(goal, evaluation, evidence_signature=evidence_signature)
+            no_progress_count = compute_no_progress_count(goal, evaluation, evidence_signature=evidence_signature, operation_progress=operation_progress)
             await _persist(goal, evaluation, no_progress_count, stand_down_reason="no_durable_end_of_turn")
             return None
 
         if abort_event is not None and abort_event.is_set():
             return None
-        evaluator_model = evaluator_model_factory() if evaluator_model_factory is not None else None
-        evaluation = await evaluate_goal_completion(
-            goal,
-            messages,
-            model=evaluator_model,
-            model_name=model_name,
-            app_config=app_config,
-            thread_id=thread_id,
-            user_id=user_id,
-            deerflow_trace_id=deerflow_trace_id,
-            task_store=task_store,
-            extensions=extensions,
-        )
-        if abort_event is not None and abort_event.is_set():
-            return None
     except Exception:
-        logger.warning("Goal evaluator failed for thread %s after run %s", thread_id, run_id, exc_info=True)
+        logger.warning("Could not prepare goal evaluation for thread %s after run %s", thread_id, run_id, exc_info=True)
         return None
 
-    no_progress_count = compute_no_progress_count(goal, evaluation, evidence_signature=evidence_signature)
+    try:
+        # The factory builds the evaluator on first use, which can read local
+        # credentials; keep that off the event loop (see utils/AGENTS.md).
+        evaluator_model = await run_assembly(evaluator_model_factory) if evaluator_model_factory is not None else None
+        for attempt in range(2):
+            try:
+                evaluation = await evaluate_goal_completion(
+                    goal,
+                    messages,
+                    model=evaluator_model,
+                    model_name=model_name,
+                    app_config=app_config,
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    deerflow_trace_id=deerflow_trace_id,
+                    task_store=task_store,
+                    extensions=extensions,
+                    interaction_policy=interaction_policy,
+                    usage_callback=usage_callback,
+                )
+                break
+            except GoalEvaluationFormatError:
+                if attempt:
+                    raise
+                if abort_event is not None and abort_event.is_set():
+                    return None
+                current_goal, current_checkpoint = await _reread_goal_and_checkpoint(checkpointer, thread_id)
+                if not _goal_instance_matches(goal, current_goal) or current_checkpoint is None:
+                    return None
+                if _checkpoint_id(current_checkpoint) != checkpoint_id_before or visible_conversation_signature(await _materialized_checkpoint_messages(accessor, thread_id)) != conversation_signature_before:
+                    return None
+                if abort_event is not None and abort_event.is_set():
+                    return None
+                logger.info("Retrying one malformed goal evaluation for thread %s after run %s", thread_id, run_id)
+    except Exception as exc:
+        logger.warning("Goal evaluator failed for thread %s after run %s", thread_id, run_id, exc_info=True)
+        if abort_event is not None and abort_event.is_set():
+            return None
+        # Record the failure like the other stand-downs; otherwise the goal keeps the
+        # previous run's verdict, or none. Only the exception type is stored: a provider's
+        # error message can carry request details, and the traceback is logged above.
+        evaluation = GoalEvaluation(
+            satisfied=False,
+            blocker="run_failed",
+            reason=f"The goal evaluator did not return a verdict ({type(exc).__name__}).",
+            evidence_summary="",
+        )
+        no_progress_count = compute_no_progress_count(goal, evaluation, evidence_signature=evidence_signature, operation_progress=operation_progress)
+        await _persist(goal, evaluation, no_progress_count, stand_down_reason="evaluator_failed")
+        return None
+    if abort_event is not None and abort_event.is_set():
+        return None
+
+    no_progress_count = compute_no_progress_count(goal, evaluation, evidence_signature=evidence_signature, operation_progress=operation_progress)
 
     # Re-check that neither the goal nor the visible conversation changed while the
     # evaluator ran — a user message or /goal clear racing the evaluation must win.
@@ -1634,36 +2921,34 @@ async def _prepare_goal_continuation_input(
         return None
 
     if evaluation["satisfied"]:
-        try:
-            async with goal_thread_lock(thread_id):
-                latest_checkpoint_tuple = await _call_checkpointer_method(
-                    checkpointer,
-                    "aget_tuple",
-                    "get_tuple",
-                    {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}},
-                )
-                if latest_checkpoint_tuple is None:
-                    return None
-                latest_goal = _read_checkpoint_goal(latest_checkpoint_tuple)
-                if latest_goal is None or not _goal_instance_matches(goal, latest_goal):
-                    return None
-                values = await write_thread_goal(
-                    checkpointer,
-                    thread_id,
-                    None,
-                    as_node="goal_evaluator",
-                    expected_checkpoint_id=_checkpoint_id(latest_checkpoint_tuple),
-                )
-            await bridge.publish(run_id, "values", serialize(values, mode="values"))
-        except GoalWriteConflict:
-            return None
-        except Exception:
-            logger.warning("Could not clear satisfied goal for thread %s", thread_id, exc_info=True)
-        return None
+        if verdict_callback is not None:
+            verdict_callback(current_goal, evaluation, None)
+        return _GoalCompletionCandidate(copy.deepcopy(current_goal), conversation_signature_before, evaluation)
 
     stand_down_reason = _stand_down_reason(goal, evaluation, no_progress_count)
+    if stand_down_reason is None and run_stop_reason in _GOAL_RUN_HARD_STOP_REASONS:
+        # Both guards keep their safety state across hidden turns in this run.
+        # Respect the hard stop instead of re-entering the same run budget.
+        stand_down_reason = run_stop_reason
     if stand_down_reason is not None or not should_continue_goal(goal, evaluation, no_progress_count=no_progress_count):
         await _persist(goal, evaluation, no_progress_count, stand_down_reason=stand_down_reason)
+        return None
+
+    # Built before the continuation is counted: the message is redacted under the run's
+    # pii_redaction, and a redaction error fails the check as an evaluator redaction error
+    # does, so the raw objective and reason are never sent and the budget is not spent.
+    try:
+        continuation_message = make_goal_continuation_message(goal, evaluation, pii_redaction=getattr(app_config, "pii_redaction", None))
+    except Exception as exc:
+        logger.warning("Could not redact the goal continuation for thread %s after run %s", thread_id, run_id, exc_info=True)
+        # Only the exception type is stored: the error message could quote the text.
+        evaluation = GoalEvaluation(
+            satisfied=False,
+            blocker="run_failed",
+            reason=f"The goal continuation could not be redacted ({type(exc).__name__}).",
+            evidence_summary="",
+        )
+        await _persist(goal, evaluation, compute_no_progress_count(goal, evaluation, evidence_signature=evidence_signature, operation_progress=operation_progress), stand_down_reason="evaluator_failed")
         return None
 
     next_count = int(goal.get("continuation_count", 0)) + 1
@@ -1704,7 +2989,7 @@ async def _prepare_goal_continuation_input(
         updated_goal.get("continuation_count", next_count),
         updated_goal.get("max_continuations", 0),
     )
-    return {"messages": [make_goal_continuation_message(updated_goal, evaluation)]}
+    return {"messages": [continuation_message]}
 
 
 def _is_edit_replay_run(record: RunRecord) -> bool:
@@ -1813,6 +3098,15 @@ def _complete_state_replacement_values(
     return replacement_values
 
 
+def _is_resume_command_input(graph_input: Any) -> bool:
+    """Identify requests that need to preserve interrupted execution position."""
+    return isinstance(graph_input, Command) and graph_input.resume is not None
+
+
+class CheckpointResumeRejected(RuntimeError):
+    """Checkpoint preparation was rejected before any state write."""
+
+
 async def _linearize_delta_checkpoint_resume(
     *,
     accessor: CheckpointStateAccessor,
@@ -1820,6 +3114,7 @@ async def _linearize_delta_checkpoint_resume(
     config: dict[str, Any],
     thread_id: str,
     run_id: str,
+    resume_command: bool = False,
 ) -> list[Any] | None:
     """Replace a delta-mode checkpoint fork with an equivalent linear write.
 
@@ -1844,6 +3139,10 @@ async def _linearize_delta_checkpoint_resume(
     exist only on the newer head are reset to their schema default (or
     ``None`` when the channel has no constructible default). The abandoned
     turn stays in checkpoint history as the rewritten head's ancestry.
+
+    The owner's current goal and continuation budget survive replay; the old
+    achievement record cannot certify the new answer. Full mode applies that
+    policy through the run input after scheduled-goal preflight instead.
 
     Returns the materialized messages when the resume was linearized, or
     ``None`` when there was nothing to do (full mode, no checkpoint selector,
@@ -1878,6 +3177,23 @@ async def _linearize_delta_checkpoint_resume(
     messages = values.get("messages") if isinstance(values, dict) else None
     if not isinstance(messages, list):
         raise RuntimeError(f"Run {run_id} could not materialize resume checkpoint {checkpoint_id}")
+    # Pending Sends cannot survive the state-only rewrite for any input shape.
+    # Resume commands also need branch-triggered execution positions preserved;
+    # fresh input may regenerate those nodes. Check both the selected state and
+    # the head that would be overwritten. The synthetic input entry is not work.
+    for location, checkpoint_config, inspected_snapshot in (("selected", source_config, snapshot), ("head", head.config, head)):
+        inspected_id = checkpoint_config["configurable"]["checkpoint_id"]
+        checkpoint_tuple = await accessor.aget_tuple(checkpoint_config)
+        if checkpoint_tuple is None:
+            raise CheckpointResumeRejected(f"Run {run_id} could not inspect pending execution for {location} checkpoint {inspected_id} while resuming checkpoint {checkpoint_id}")
+        pending_nodes = tuple(sorted(node for node in (getattr(inspected_snapshot, "next", None) or ()) if node != "__start__")) if resume_command else ()
+        if (checkpoint_tuple.checkpoint.get("channel_values") or {}).get("__pregel_tasks") or pending_nodes:
+            pending_detail = f" for {pending_nodes}" if pending_nodes else ""
+            raise CheckpointResumeRejected(
+                f"Run {run_id} cannot resume an older delta checkpoint {checkpoint_id}: the {location} checkpoint {inspected_id} has pending execution{pending_detail}. "
+                "Resume pending work from the latest checkpoint; to regenerate completed work, submit new input from the latest checkpoint."
+            )
+    head_config["metadata"] = checkpoint_agent_binding_metadata(getattr(snapshot, "metadata", None))
 
     # Write through the thread's effective schema so every application and
     # middleware channel can be restored. Reducer channels need Overwrite to
@@ -1886,6 +3202,8 @@ async def _linearize_delta_checkpoint_resume(
     selected_values = dict(values)
     head_values = getattr(head, "values", None) or {}
     head_values = dict(head_values) if isinstance(head_values, dict) else {}
+    selected_values["goal"] = head_values.get("goal")
+    selected_values["goal_outcome"] = None
     replacement_values = _complete_state_replacement_values(
         mutation_graph=mutation_graph,
         selected_values=selected_values,
@@ -1967,8 +3285,13 @@ async def _rollback_to_pre_run_checkpoint(
             operation="rollback",
         )
     else:
-        restore_config = rollback_point.config
+        restore_config = {
+            **rollback_point.config,
+            "configurable": dict(rollback_point.config.get("configurable", {})),
+        }
         replacement_values = {"messages": Overwrite(list(rollback_point.messages))}
+
+    restore_config["metadata"] = checkpoint_agent_binding_metadata(rollback_point.metadata)
 
     restored_config = await mutation_accessor.aupdate(
         restore_config,
@@ -2484,6 +3807,107 @@ def _compose_sse_event(sse_event: str, namespace: tuple[str, ...]) -> str:
     return "|".join((sse_event, *namespace))
 
 
+#: Sentinel generation for an identity no lookup has missed at yet. Below every
+#: real generation, so it never reads as "already asked at this generation".
+_NEVER_LOOKED_UP = -1
+
+
+def _NO_FEED_WRITES() -> int:  # noqa: N802 — a callable constant, not a class
+    """Generation source for a path with no journal: the feed never moves."""
+    return 0
+
+
+class _MessageSeqStamper:
+    """Attach each already-persisted message's feed seq to a ``values`` frame.
+
+    A checkpoint carries no seq of its own and loses messages to summarization,
+    so a client merging it with the seq-ordered thread feed cannot place a
+    surviving old message once the feed's loaded page window no longer reaches
+    back to it (#4666). The seq exists in the event store keyed by message
+    identity; this carries it to the client and writes nothing back to the
+    checkpoint.
+
+    Cost is bounded to frames that introduce identities it has not resolved
+    yet: a resolved seq is final (the feed's earliest-seq-wins rule), so it is
+    never looked up twice, and in a real run the only frame that pays for a
+    query is the one where compaction brings older messages back into view.
+
+    A miss, unlike a hit, is only provisional. A message this run produces
+    reaches a frame before ``RunJournal`` flushes it, so it legitimately misses
+    and would stay unstamped for the whole run if that answer were kept — the
+    long run that then rolls past the history page and compacts is exactly the
+    case this stamper exists for. Misses are therefore re-asked, but only once
+    the feed has actually gained rows, which *feed_generation* reports; frames
+    alone never trigger a retry. A failed lookup is a miss under the same rule,
+    so a transient store error costs one generation, not the run.
+
+    An unstamped message needs no seq while it is still streaming: appending it
+    at the tail is already its correct position.
+    """
+
+    __slots__ = ("_store", "_thread_id", "_user_id", "_seqs", "_missing", "_feed_generation")
+
+    def __init__(self, event_store: Any, thread_id: str, *, feed_generation: Callable[[], int] | None = None) -> None:
+        self._store = event_store
+        self._thread_id = thread_id
+        # Without a generation source (no journal on this path) nothing can
+        # report a feed write, so a miss stays cached rather than being re-asked
+        # on every frame: a constant reads as "the feed has not moved".
+        self._feed_generation = feed_generation if feed_generation is not None else _NO_FEED_WRITES
+        # Soft-resolved once at build time, like the worker's write paths: a
+        # launch path that never inherits the auth contextvar (e.g. a
+        # null-owner scheduled task) writes rows with no user_id, so the
+        # lookup filters by the same id the writes stamped — or not at all —
+        # instead of the db store's strict AUTO default raising per frame.
+        user = get_current_user()
+        self._user_id: str | None = str(user.id) if user is not None else None
+        self._seqs: dict[str, int] = {}
+        # identity -> the feed generation its last lookup missed at.
+        self._missing: dict[str, int] = {}
+
+    async def stamp(self, payload: Any) -> Any:
+        if self._store is None or not isinstance(payload, Mapping):
+            return payload
+        messages = payload.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return payload
+
+        identities = [message_identity(m) if isinstance(m, Mapping) else None for m in messages]
+        # Read before the lookup, never after: a write landing mid-query then
+        # advances past the generation the miss is recorded under, so the next
+        # frame re-asks. The reverse order could bury such a write.
+        generation = self._feed_generation()
+        unresolved = {i for i in identities if i is not None and i not in self._seqs and self._missing.get(i, _NEVER_LOOKED_UP) != generation}
+        if unresolved:
+            try:
+                found = await self._store.get_message_seqs(self._thread_id, sorted(unresolved), user_id=self._user_id)
+            except Exception:
+                # Placement is an enhancement: a client without seq falls back
+                # to its own ordering rule. Never fail the frame over it.
+                logger.warning("Failed to resolve message seqs for thread %s", self._thread_id, exc_info=True)
+                found = {}
+            self._seqs.update(found)
+            self._missing.update(dict.fromkeys(unresolved - found.keys(), generation))
+
+        stamped = [attach_message_seq(message, seq) if identity is not None and (seq := self._seqs.get(identity)) is not None else message for message, identity in zip(messages, identities, strict=True)]
+        return {**payload, "messages": stamped}
+
+
+def _build_seq_stamper(event_store: Any, thread_id: str, journal: Any) -> _MessageSeqStamper:
+    """Build the run's stamper, reading feed writes from *journal*.
+
+    The journal owns the writes that turn a lookup miss into a hit, so it is
+    also what can tell the stamper that a cached miss is worth re-asking. A run
+    without one has no writer to report, and the stamper falls back to keeping
+    its misses.
+    """
+    return _MessageSeqStamper(
+        event_store,
+        thread_id,
+        feed_generation=(lambda: journal.feed_generation) if journal is not None else None,
+    )
+
+
 async def _publish_stream_item(
     *,
     bridge: Any,
@@ -2493,6 +3917,7 @@ async def _publish_stream_item(
     namespace: tuple[str, ...],
     file_tool_chunk_batcher: Any,
     subagent_events: Any,
+    seq_stamper: Any = None,
 ) -> None:
     """Publish one stream frame, preserving the subgraph namespace.
 
@@ -2513,6 +3938,11 @@ async def _publish_stream_item(
             await bridge.publish(run_id, "messages", serialize(publish_chunk, mode="messages"))
     chunks_to_publish = file_tool_chunk_batcher.push(chunk) if mode == "messages" and file_tool_chunk_batcher is not None else [chunk]
     for publish_chunk in chunks_to_publish:
-        await bridge.publish(run_id, sse_event, serialize(publish_chunk, mode=mode))
+        payload = serialize(publish_chunk, mode=mode)
+        if mode == "values" and seq_stamper is not None:
+            # Root frames only: a subagent's snapshot is not part of this
+            # thread's feed ordering (the namespaced branch returned above).
+            payload = await seq_stamper.stamp(payload)
+        await bridge.publish(run_id, sse_event, payload)
     if mode == "custom":
         await subagent_events.add(chunk)

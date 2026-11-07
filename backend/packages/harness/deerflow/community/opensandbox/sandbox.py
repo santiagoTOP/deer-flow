@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
-import errno
 import logging
 import posixpath
 import re
 import shlex
 import threading
+import time
+from contextlib import suppress
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
 from deerflow.config.paths import VIRTUAL_PATH_PREFIX
+from deerflow.sandbox.download import DEFAULT_DOWNLOAD_LIMIT as _MAX_DOWNLOAD_SIZE
+from deerflow.sandbox.download import download_limit, read_download_stream
+from deerflow.sandbox.read_file_contract import split_file_lines
+from deerflow.sandbox.remote_list_dir import parse_remote_list_dir_output, remote_list_dir_command
+from deerflow.sandbox.remote_search import parse_remote_search_output, remote_search_command
 from deerflow.sandbox.sandbox import Sandbox, _validate_extra_env
-from deerflow.sandbox.search import GrepMatch, path_matches, should_ignore_path, truncate_line
+from deerflow.sandbox.search import GrepMatch, path_matches, should_ignore_path_under_root, truncate_line
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -24,7 +30,6 @@ logger = logging.getLogger(__name__)
 
 _TERMINAL_ERROR_NAMES = frozenset({"SandboxUnhealthyException"})
 _COMMAND_TTL_GRACE = timedelta(seconds=30)
-_MAX_DOWNLOAD_SIZE = 100 * 1024 * 1024
 
 
 def _exception_chain(error: BaseException):
@@ -76,11 +81,7 @@ def execution_stdout(execution: Any) -> str:
 
 def format_execution(execution: Any) -> str:
     """Combine stdout, result text, and stderr using DeerFlow's string contract."""
-    output = execution_stdout(execution)
-    result = _join_event_text(item.text for item in getattr(execution, "result", []) if getattr(item, "text", None) is not None)
-    output = _append_output(output, result)
-    stderr = _join_event_text(message.text for message in getattr(getattr(execution, "logs", None), "stderr", []))
-    output = _append_output(output, stderr)
+    output = execution_body(execution)
     error = getattr(execution, "error", None)
     if error is not None:
         detail = f"{getattr(error, 'name', type(error).__name__)}: {getattr(error, 'value', error)}"
@@ -88,8 +89,37 @@ def format_execution(execution: Any) -> str:
     return output
 
 
+def execution_body(execution: Any) -> str:
+    """Combine the command's own stdout, result text and stderr.
+
+    Excludes the error detail so a caller that reports the failure itself (the
+    timeout branch) can present the partial output without a second, rawer copy
+    of the same failure underneath it.
+    """
+    output = execution_stdout(execution)
+    result = _join_event_text(item.text for item in getattr(execution, "result", []) if getattr(item, "text", None) is not None)
+    output = _append_output(output, result)
+    stderr = _join_event_text(message.text for message in getattr(getattr(execution, "logs", None), "stderr", []))
+    return _append_output(output, stderr)
+
+
+def _is_timeout_execution(execution: Any, exit_code: int | None) -> bool:
+    """Recognize an explicit command deadline, not an ambiguous signal kill.
+
+    The SDK leaves exit_code unset when the error value is nonnumeric. A
+    bare -1 only indicates signal termination and cannot prove a timeout.
+    """
+    error = getattr(execution, "error", None)
+    return exit_code is None and getattr(error, "name", None) == "CommandExecError" and getattr(error, "value", None) == "context deadline exceeded"
+
+
 class OpenSandboxSandbox(Sandbox):
     """Wrap one live ``opensandbox.sync.SandboxSync`` instance."""
+
+    #: Every call is a fresh ``run_command`` execution — no shell state
+    #: survives into the next command.
+    persistent_shell_sessions = False
+    artifact_root = "/mnt/user-data"
 
     def __init__(
         self,
@@ -245,13 +275,22 @@ class OpenSandboxSandbox(Sandbox):
         except Exception as exc:
             logger.error("Failed to execute command in OpenSandbox %s: %s", self.id, exc)
             return f"Error: {exc}"
-        output = format_execution(execution)
         exit_code = getattr(execution, "exit_code", None)
+        # Command deadlines arrive as execution error events, not builtin
+        # TimeoutError. Normalize only the explicit deadline result; transport
+        # errors, launch failures and signal-only exits keep their own details.
+        if _is_timeout_execution(execution, exit_code):
+            body = execution_body(execution)
+            message = "Error: command timed out\nExit Code: 124"
+            return f"{body}\n{message}" if body else message
+        output = format_execution(execution)
         if exit_code is None:
             detail = output or "no completion or error event"
             return f"Error: OpenSandbox command completed without an exit code: {detail}"
-        if exit_code != 0 and not output:
-            output = f"Command exited with code {exit_code}"
+        if exit_code != 0:
+            # Mirror LocalSandbox: preserve a nonzero exit in the output text
+            # even when the command produced output (see e2b_sandbox).
+            output = f"{output}\nExit Code: {exit_code}" if output else f"Command exited with code {exit_code}"
         return output if output else "(no output)"
 
     def read_file(self, path: str, start_line: int | None = None, end_line: int | None = None) -> str:
@@ -263,9 +302,11 @@ class OpenSandboxSandbox(Sandbox):
             return f"Error: {exc}"
         if start_line is None and end_line is None:
             return content or ""
-        lines = (content or "").splitlines()
-        start = start_line or 1
-        end = end_line if end_line is not None else len(lines)
+        lines = split_file_lines(content or "")
+        # Clamp like LocalSandbox.read_file: a negative start would otherwise
+        # wrap around through Python's negative-index slicing.
+        start = max(start_line or 1, 1)
+        end = max(end_line, 0) if end_line is not None else len(lines)
         return "\n".join(lines[start - 1 : end])
 
     def write_file(self, path: str, content: str, append: bool = False) -> None:
@@ -287,24 +328,31 @@ class OpenSandboxSandbox(Sandbox):
         resolved = self._resolve_path(path)
         self._file_op(lambda files: files.write_file(resolved, content, mode=644))
 
-    def download_file(self, path: str) -> bytes:
+    def download_file(self, path: str, *, max_bytes: int | None = None) -> bytes:
+        return self._download_file_bounded(path, max_bytes=download_limit(max_bytes, _MAX_DOWNLOAD_SIZE))
+
+    def _download_file_bounded(self, path: str, *, max_bytes: int, deadline: float | None = None) -> bytes:
+        """Use the native streaming transport with the release pass's remaining budget."""
         resolved = self._resolve_download_path(path)
 
         def read_bounded(files) -> bytes:
-            chunks: list[bytes] = []
-            total = 0
             stream = files.read_bytes_stream(resolved)
-            try:
-                for chunk in stream:
-                    total += len(chunk)
-                    if total > _MAX_DOWNLOAD_SIZE:
-                        raise OSError(errno.EFBIG, f"File exceeds maximum download size of {_MAX_DOWNLOAD_SIZE} bytes", path)
-                    chunks.append(chunk)
-            finally:
-                close = getattr(stream, "close", None)
-                if callable(close):
-                    close()
-            return b"".join(chunks)
+            if deadline is None:
+                return read_download_stream(stream, max_bytes, path)
+
+            def timed_chunks():
+                try:
+                    for chunk in stream:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("OpenSandbox output synchronization timed out")
+                        yield chunk
+                finally:
+                    close = getattr(stream, "close", None)
+                    if callable(close):
+                        with suppress(Exception):
+                            close()
+
+            return read_download_stream(timed_chunks(), max_bytes, path)
 
         try:
             return self._file_op(read_bounded)
@@ -318,8 +366,16 @@ class OpenSandboxSandbox(Sandbox):
         if depth < 0:
             raise ValueError("max_depth must be non-negative")
         resolved = self._resolve_path(path)
-        execution = self._run(f"find {shlex.quote(resolved)} -maxdepth {depth} \\( -type f -o -type d \\) 2>/dev/null | head -500")
-        return [line.strip() for line in execution_stdout(execution).splitlines() if line.strip()]
+        execution = self._run(remote_list_dir_command(resolved, depth))
+        error = getattr(execution, "error", None)
+        if error is not None:
+            detail = f"{getattr(error, 'name', type(error).__name__)}: {getattr(error, 'value', error)}"
+            raise OSError(f"Failed to list_dir {resolved}: {detail}")
+        return parse_remote_list_dir_output(
+            execution_stdout(execution),
+            resolved,
+            pipeline_exit_code=getattr(execution, "exit_code", None),
+        )
 
     def glob(self, path: str, pattern: str, *, include_dirs: bool = False, max_results: int = 200) -> tuple[list[str], bool]:
         if max_results <= 0:
@@ -328,21 +384,30 @@ class OpenSandboxSandbox(Sandbox):
         types = ("f", "d") if include_dirs else ("f",)
         type_expr = " -o ".join(f"-type {entry_type}" for entry_type in types)
         hard_limit = max(max_results * 4, max_results + 50)
-        execution = self._run(f"find {shlex.quote(resolved)} \\( {type_expr} \\) -print 2>/dev/null | head -{hard_limit}")
+        # -H follows a symlinked search root, as list_dir does.
+        search = f"find -H {shlex.quote(resolved)} \\( {type_expr} \\) -print 2>/dev/null"
+        execution = self._run(remote_search_command(search, resolved, limit=hard_limit))
+        # A missing root or a failed find must not read as "no files matched" (#5376).
+        output = parse_remote_search_output(execution_stdout(execution), resolved, tool="find", limit=hard_limit)
 
         matches: list[str] = []
         root = resolved.rstrip("/") or "/"
         root_prefix = root if root == "/" else f"{root}/"
-        for entry in execution_stdout(execution).splitlines():
-            entry = entry.strip()
-            if not entry or (entry != root and not entry.startswith(root_prefix)) or should_ignore_path(entry):
+        # Records are LF-delimited; other splitlines() boundaries can be path characters.
+        for entry in output.text.split("\n"):
+            # Do NOT strip: trailing whitespace can be part of the filename.
+            if not entry or (entry != root and not entry.startswith(root_prefix)) or should_ignore_path_under_root(entry, root):
                 continue
             relative = entry[len(root) :].lstrip("/")
             if relative and path_matches(pattern, relative):
                 matches.append(entry)
-                if len(matches) >= max_results:
-                    return matches, True
-        return matches, False
+                # Look one match past the cap before deciding: returning on the
+                # max-th match cannot tell a search that held exactly
+                # ``max_results`` from one that held more, so an exhausted tree
+                # was reported as truncated.
+                if len(matches) > max_results:
+                    return matches[:max_results], True
+        return matches, output.truncated
 
     def grep(
         self,
@@ -367,26 +432,31 @@ class OpenSandboxSandbox(Sandbox):
         if glob is not None:
             include_pattern = glob.split("/")[-1] or glob
             flags.append(shlex.quote(f"--include={include_pattern}"))
-        per_file_cap = max(max_results, 50)
+        per_file_cap = max(max_results + 1, 50)
         flags.append(f"-m{per_file_cap}")
         hard_limit = max(max_results * 4, max_results + 50)
         arguments = f" -e {shlex.quote(pattern)} {shlex.quote(resolved)} 2>/dev/null"
         primary = "grep " + " ".join(flags) + arguments
         fallback = "grep " + " ".join(portable_flags) + arguments
-        command = f'{{ {primary}; status=$?; [ "$status" -eq 2 ] && {fallback}; }} | head -{hard_limit}'
-        execution = self._run(command)
+        # Retry without --include/-m only when the primary grep errors (BusyBox
+        # lacks them). Keep the primary's status otherwise, so a missing grep
+        # (127) is not reported as "no matches" (#5376).
+        search = f'{primary}; status=$?; if [ "$status" -eq 2 ]; then {fallback}; status=$?; fi; (exit "$status")'
+        execution = self._run(remote_search_command(search, resolved, limit=hard_limit))
+        output = parse_remote_search_output(execution_stdout(execution), resolved, tool="grep", limit=hard_limit)
 
         root = resolved.rstrip("/") or "/"
         root_prefix = root if root == "/" else f"{root}/"
         matches: list[GrepMatch] = []
         seen_positions: set[tuple[str, int]] = set()
-        for raw in execution_stdout(execution).splitlines():
+        # Keep non-LF separators inside filenames and matched text intact.
+        for raw in output.text.split("\n"):
             try:
                 file_path, line_number_text, line = raw.split(":", 2)
                 line_number = int(line_number_text)
             except ValueError:
                 continue
-            if should_ignore_path(file_path):
+            if should_ignore_path_under_root(file_path, root):
                 continue
             if glob is not None:
                 if file_path != root and not file_path.startswith(root_prefix):
@@ -399,9 +469,10 @@ class OpenSandboxSandbox(Sandbox):
                 continue
             seen_positions.add(position)
             matches.append(GrepMatch(path=file_path, line_number=line_number, line=truncate_line(line)))
-            if len(matches) >= max_results:
-                return matches, True
-        return matches, False
+            # Same one-match-past-the-cap rule as glob() above.
+            if len(matches) > max_results:
+                return matches[:max_results], True
+        return matches, output.truncated
 
     def ping(self, timeout: float = 10) -> bool:
         if self.is_closed:

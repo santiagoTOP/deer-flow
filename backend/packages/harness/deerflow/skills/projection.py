@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import tempfile
 import threading
 from collections.abc import Iterator
@@ -18,6 +19,8 @@ from typing import TYPE_CHECKING
 
 from deerflow.skills.parser import parse_skill_file
 from deerflow.skills.types import SKILL_MD_FILE, Skill, SkillCategory
+from deerflow.utils.atomic_write import cleanup_failed_atomic_write
+from deerflow.utils.file_lock import retry_until_locked
 
 if TYPE_CHECKING:
     from deerflow.skills.storage.skill_storage import SkillStorage
@@ -32,8 +35,10 @@ except ImportError:  # pragma: no cover - Windows
 
 _locks_guard = threading.Lock()
 _process_locks: dict[Path, threading.RLock] = {}
+_held_projection_locks = threading.local()
 _MANIFEST_VERSION = 1
 _MAX_REBUILD_ATTEMPTS = 2
+_THREAD_PROJECTION_POLICY_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -66,6 +71,29 @@ def get_skill_projection_paths(storage: SkillStorage) -> SkillProjectionPaths:
     )
 
 
+def get_thread_skill_projection_paths(storage: SkillStorage, thread_id: str) -> SkillProjectionPaths:
+    """Return stable category roots for one user's thread policy view."""
+    from deerflow.config.paths import get_paths
+
+    paths = getattr(storage, "_paths", None) or get_paths()
+    user_id = getattr(storage, "user_id", None)
+    if user_id is None:
+        raise ValueError("Thread skill projections require user-scoped skill storage")
+    root = paths.thread_skills_view_dir(thread_id, user_id=user_id)
+    return SkillProjectionPaths(
+        public=root / SkillCategory.PUBLIC.value,
+        custom=root / SkillCategory.CUSTOM.value,
+        legacy=root / SkillCategory.LEGACY.value,
+        integrations=root / SkillCategory.INTEGRATION.value,
+    )
+
+
+def thread_skill_projection_exists(storage: SkillStorage, thread_id: str) -> bool:
+    """Whether this thread has crossed into a stable policy-scoped view."""
+    paths = get_thread_skill_projection_paths(storage, thread_id)
+    return paths.public.parent.exists()
+
+
 def _lock_for(path: Path) -> threading.RLock:
     resolved = path.resolve()
     with _locks_guard:
@@ -73,25 +101,59 @@ def _lock_for(path: Path) -> threading.RLock:
 
 
 @contextmanager
-def _projection_lock(root: Path) -> Iterator[None]:
+def _projection_lock(root: Path, *, timeout: float | None = None, check=None) -> Iterator[None]:
     """Serialize projection replacement in-process and across POSIX workers."""
+    import time
+
     lock_path = root.parent / f".{root.name}.projection.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     process_lock = _lock_for(lock_path)
-    with process_lock, lock_path.open("a", encoding="utf-8") as lock_file:
-        if fcntl is not None:
-            fcntl.flock(lock_file, fcntl.LOCK_EX)
-        else:  # pragma: no cover - Windows
-            lock_file.seek(0)
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
-        try:
+    key = lock_path.resolve()
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while not process_lock.acquire(timeout=0.05):
+        if check:
+            check()
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("Skill projection lock timeout")
+    try:
+        held = getattr(_held_projection_locks, "paths", None)
+        if held is None:
+            held = _held_projection_locks.paths = set()
+        if key in held:
+            # Opening and flocking a second descriptor deadlocks even though
+            # the in-process RLock is reentrant. Nested readers share the fd.
             yield
-        finally:
-            if fcntl is not None:
-                fcntl.flock(lock_file, fcntl.LOCK_UN)
-            else:  # pragma: no cover - Windows
-                lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            return
+        with lock_path.open("a", encoding="utf-8") as lock_file:
+
+            def acquire_region() -> None:
+                if fcntl is not None:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:  # pragma: no cover - Windows
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+
+            retry_until_locked(
+                acquire_region,
+                interval=0.02,
+                deadline=deadline,
+                sleep=time.sleep,
+                monotonic=time.monotonic,
+                check=check,
+                timeout_message="Skill projection lock timeout",
+            )
+            held.add(key)
+            try:
+                yield
+            finally:
+                held.remove(key)
+                if fcntl is not None:
+                    fcntl.flock(lock_file, fcntl.LOCK_UN)
+                else:  # pragma: no cover - Windows
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        process_lock.release()
 
 
 def _copy_into_view(source: str, target: str, *, follow_symlinks: bool = True) -> str:
@@ -103,7 +165,42 @@ def _copy_into_view(source: str, target: str, *, follow_symlinks: bool = True) -
     return target
 
 
-def _stage_skill(source: Path, target: Path, nested_skill_roots: set[Path]) -> None:
+def _validate_projected_skill_symlinks(source: Path) -> None:
+    """Reject links that would escape a policy-scoped skill package.
+
+    Relative links to support files inside the same package remain useful and
+    resolve inside the copied projection. Absolute links would keep pointing at
+    the canonical host tree, and links outside the package could expose an
+    omitted skill, so both fail closed before any live view is changed.
+    """
+    package_root = source.resolve(strict=True)
+    for current_root, dir_names, file_names in os.walk(source, followlinks=False):
+        current = Path(current_root)
+        for name in (*dir_names, *file_names):
+            path = current / name
+            if not path.is_symlink():
+                continue
+            raw_target = Path(os.readlink(path))
+            if raw_target.is_absolute():
+                raise ValueError(f"Policy-scoped skill contains an absolute symlink: {path}")
+            try:
+                resolved_target = path.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                raise ValueError(f"Policy-scoped skill contains an invalid symlink: {path}") from exc
+            if not resolved_target.is_relative_to(package_root):
+                raise ValueError(f"Policy-scoped skill symlink escapes its package: {path}")
+
+
+def _stage_skill(
+    source: Path,
+    target: Path,
+    nested_skill_roots: set[Path],
+    *,
+    enforce_symlink_boundary: bool = False,
+) -> None:
+    if enforce_symlink_boundary:
+        _validate_projected_skill_symlinks(source)
+
     def _exclude_nested_skills(current: str, names: list[str]) -> list[str]:
         relative_root = Path(current).relative_to(source)
         return [name for name in names if relative_root / name in nested_skill_roots]
@@ -190,14 +287,25 @@ def _sync_staged_category(root: Path, staging: Path) -> None:
         (staging / relative_path).replace(target)
 
 
-def _replace_category(root: Path, desired: dict[Path, Skill], skill_boundaries: set[Path]) -> None:
+def _replace_category(
+    root: Path,
+    desired: dict[Path, Skill],
+    skill_boundaries: set[Path],
+    *,
+    enforce_symlink_boundary: bool = False,
+) -> None:
     """Reconcile entries beneath a stable category root without blanking it."""
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f".{root.name}.projection-", dir=root.parent) as staging_dir:
         staging = Path(staging_dir)
         for relative_path, skill in desired.items():
             nested_roots = {boundary.relative_to(relative_path) for boundary in skill_boundaries if boundary != relative_path and boundary.is_relative_to(relative_path)}
-            _stage_skill(skill.skill_dir, staging / relative_path, nested_roots)
+            _stage_skill(
+                skill.skill_dir,
+                staging / relative_path,
+                nested_roots,
+                enforce_symlink_boundary=enforce_symlink_boundary,
+            )
         _sync_staged_category(root, staging)
 
 
@@ -331,15 +439,62 @@ def _write_manifest(scope_root: Path, source_signature: str, view_signature: str
     if view_signature is not None:
         payload["view_signature"] = view_signature
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream = os.fdopen(fd, "w", encoding="utf-8")
+        fd = None  # The file object now owns the descriptor.
+        with stream:
             json.dump(payload, stream, sort_keys=True)
         temporary.replace(target)
-    except Exception:
-        temporary.unlink(missing_ok=True)
+    except BaseException:
+        cleanup_failed_atomic_write(temporary, fd)
         raise
 
 
+def _thread_view_signature(paths: SkillProjectionPaths) -> str:
+    """Sign projected bytes/layout without NFS-sensitive inode/size/timestamps.
+
+    Unlike source/shared-view metadata checks, this reads every projected file
+    in bounded chunks. That cost preserves next-acquire repair of sandbox edits
+    without recopying the whole view when only filesystem metadata settles.
+    Symlinks are signed as links, never opened; special files are not read.
+    """
+    digest = hashlib.sha256()
+    for category in ("public", "custom", "legacy", "integrations"):
+        digest.update(f"root:{category}\0".encode())
+        stack = [(getattr(paths, category), Path("."))]
+        while stack:
+            current, relative_root = stack.pop()
+            with os.scandir(current) as entries:
+                ordered = sorted(entries, key=lambda entry: entry.name)
+            child_dirs: list[tuple[Path, Path]] = []
+            for entry in ordered:
+                relative = relative_root / entry.name
+                if entry.is_symlink():
+                    value = ["link", os.readlink(entry.path)]
+                elif entry.is_dir(follow_symlinks=False):
+                    value = ["dir"]
+                    child_dirs.append((Path(entry.path), relative))
+                elif entry.is_file(follow_symlinks=False):
+                    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                    fd = os.open(entry.path, flags)
+                    try:
+                        metadata = os.fstat(fd)
+                        if not stat.S_ISREG(metadata.st_mode):
+                            raise ValueError(f"Projected skill file changed type: {entry.path}")
+                        with os.fdopen(fd, "rb", closefd=False) as stream:
+                            content = hashlib.file_digest(stream, "sha256").hexdigest()
+                        value = ["file", content, metadata.st_mode & 0o111]
+                    finally:
+                        os.close(fd)
+                else:
+                    value = ["special", stat.S_IFMT(entry.stat(follow_symlinks=False).st_mode)]
+                digest.update(json.dumps([category, relative.as_posix(), value], separators=(",", ":")).encode())
+            stack.extend(reversed(child_dirs))
+    return digest.hexdigest()
+
+
 def _view_signature(paths: SkillProjectionPaths, scope: str) -> str:
+    if scope == "thread":
+        return _thread_view_signature(paths)
     digest = hashlib.sha256()
     if scope == "public":
         _update_tree_digest(digest, paths.public, "public_view")
@@ -350,6 +505,41 @@ def _view_signature(paths: SkillProjectionPaths, scope: str) -> str:
     else:  # pragma: no cover - internal invariant
         raise ValueError(f"Unknown skill projection scope: {scope}")
     return digest.hexdigest()
+
+
+def _thread_source_signature(
+    storage: SkillStorage,
+    allowed_skills: set[str] | None,
+) -> str:
+    """Sign every input that changes a thread's effective skill view."""
+    digest = hashlib.sha256()
+    digest.update(f"policy-version:{_THREAD_PROJECTION_POLICY_VERSION}\0".encode())
+    digest.update(f"public:{_source_signature(storage, 'public')}\0".encode())
+    digest.update(f"user:{_source_signature(storage, 'user')}\0".encode())
+    policy = None if allowed_skills is None else sorted(allowed_skills)
+    digest.update(json.dumps(policy, separators=(",", ":"), ensure_ascii=True).encode())
+    return digest.hexdigest()
+
+
+def _thread_projection_is_fresh(
+    storage: SkillStorage,
+    paths: SkillProjectionPaths,
+    allowed_skills: set[str] | None,
+) -> bool:
+    scope_root = paths.public.parent
+    if not all(path.is_dir() for path in (paths.public, paths.custom, paths.legacy, paths.integrations)):
+        return False
+    manifest_before = _read_manifest(scope_root)
+    if manifest_before is None or manifest_before.get("version") != _MANIFEST_VERSION:
+        return False
+    source_sig = _thread_source_signature(storage, allowed_skills)
+    if manifest_before.get("source_signature") != source_sig:
+        return False
+    # Thread view metadata can settle after a rebuild on shared storage. Check
+    # bytes/layout instead, retaining repair of out-of-band edits on any FS.
+    view_sig = _view_signature(paths, "thread")
+    manifest_after = _read_manifest(scope_root)
+    return manifest_before == manifest_after and manifest_before.get("view_signature") == view_sig
 
 
 def _load_public_skills(storage: SkillStorage, *, enabled_only: bool) -> list[Skill]:
@@ -443,7 +633,136 @@ def _rebuild_user_locked(storage: SkillStorage, paths: SkillProjectionPaths) -> 
         raise
 
 
+def _rebuild_thread_locked(
+    storage: SkillStorage,
+    paths: SkillProjectionPaths,
+    allowed_skills: set[str] | None,
+) -> None:
+    """Rebuild one thread's effective view, removing old authority first.
+
+    Category roots stay inode-stable for live bind mounts. Clearing all four
+    before repopulating is deliberately fail-closed: concurrent readers may
+    briefly observe fewer allowed skills, but never a skill removed by the new
+    policy.
+    """
+    scope_root = paths.public.parent
+    category_roots = (paths.public, paths.custom, paths.legacy, paths.integrations)
+    try:
+        for _attempt in range(_MAX_REBUILD_ATTEMPTS):
+            before = _thread_source_signature(storage, allowed_skills)
+            # User-scoped loading performs the same name-shadow resolution as
+            # prompt discovery. Use that effective catalog for every category;
+            # independently loading public skills would expose both copies when
+            # a custom or integration skill shadows a built-in skill by name.
+            all_effective_skills = storage.load_skills(enabled_only=False)
+            enabled_skills = [skill for skill in all_effective_skills if skill.enabled]
+            if allowed_skills is not None:
+                enabled_skills = [skill for skill in enabled_skills if skill.name in allowed_skills]
+
+            # Revoke the previous policy before exposing any part of the new
+            # one. The enclosing cross-process lock serializes competing runs.
+            _clear_projection_scope(scope_root, *category_roots)
+            _replace_category(
+                paths.public,
+                _by_relative_path(enabled_skills, SkillCategory.PUBLIC),
+                _category_boundaries(all_effective_skills, SkillCategory.PUBLIC),
+                enforce_symlink_boundary=True,
+            )
+            _replace_category(
+                paths.custom,
+                _by_relative_path(enabled_skills, SkillCategory.CUSTOM),
+                _category_boundaries(all_effective_skills, SkillCategory.CUSTOM),
+                enforce_symlink_boundary=True,
+            )
+            _replace_category(
+                paths.legacy,
+                _by_relative_path(enabled_skills, SkillCategory.LEGACY),
+                _category_boundaries(all_effective_skills, SkillCategory.LEGACY),
+                enforce_symlink_boundary=True,
+            )
+            _replace_category(
+                paths.integrations,
+                _by_relative_path(enabled_skills, SkillCategory.INTEGRATION),
+                _category_boundaries(all_effective_skills, SkillCategory.INTEGRATION),
+                enforce_symlink_boundary=True,
+            )
+            after = _thread_source_signature(storage, allowed_skills)
+            if before == after:
+                _write_manifest(scope_root, after, _view_signature(paths, "thread"))
+                return
+        raise RuntimeError("Skills changed repeatedly while rebuilding the thread sandbox projection")
+    except Exception:
+        _clear_projection_scope(scope_root, *category_roots)
+        raise
+
+
+def ensure_thread_skill_projection(
+    storage: SkillStorage,
+    thread_id: str,
+    allowed_skills: set[str] | None,
+) -> SkillProjectionPaths | None:
+    from deerflow.skills.mutations.guard import managed_global_read, managed_read
+
+    # Global -> owner -> thread. No fresh-view fast path bypasses recovery.
+    with managed_global_read(storage):
+        with managed_read(storage):
+            return _ensure_thread_skill_projection(storage, thread_id, allowed_skills)
+
+
+def _ensure_thread_skill_projection(
+    storage: SkillStorage,
+    thread_id: str,
+    allowed_skills: set[str] | None,
+) -> SkillProjectionPaths | None:
+    """Ensure the filesystem view for one run's effective Agent skill policy.
+
+    ``None`` keeps the existing shared projection for threads that have never
+    needed policy isolation. Once a thread has a scoped view, later unrestricted
+    runs rebuild that same stable mount with all enabled skills so switching
+    agents cannot leave the thread accidentally restricted.
+    """
+    paths = get_thread_skill_projection_paths(storage, thread_id)
+    scope_root = paths.public.parent
+    if allowed_skills is None and not scope_root.exists():
+        return None
+
+    try:
+        fresh = _thread_projection_is_fresh(storage, paths, allowed_skills)
+    except Exception:
+        fresh = False
+    if fresh:
+        return paths
+
+    with _projection_lock(scope_root):
+        try:
+            if not _thread_projection_is_fresh(storage, paths, allowed_skills):
+                _rebuild_thread_locked(storage, paths, allowed_skills)
+        except Exception:
+            _clear_projection_scope(
+                scope_root,
+                paths.public,
+                paths.custom,
+                paths.legacy,
+                paths.integrations,
+            )
+            raise
+    return paths
+
+
 def rebuild_skill_projections(
+    storage: SkillStorage,
+    *,
+    include_public: bool = True,
+    include_user: bool = True,
+) -> SkillProjectionPaths:
+    from deerflow.skills.mutations.guard import managed_global_read, managed_read
+
+    with managed_global_read(storage):
+        with managed_read(storage):
+            return _rebuild_skill_projections(storage, include_public=include_public, include_user=include_user)
+
+
+def _rebuild_skill_projections(
     storage: SkillStorage,
     *,
     include_public: bool = True,
@@ -475,6 +794,14 @@ def _public_projection_is_fresh(storage: SkillStorage, paths: SkillProjectionPat
 
 
 def ensure_skill_projections(storage: SkillStorage) -> SkillProjectionPaths:
+    from deerflow.skills.mutations.guard import managed_global_read, managed_read
+
+    with managed_global_read(storage):
+        with managed_read(storage):
+            return _ensure_skill_projections(storage)
+
+
+def _ensure_skill_projections(storage: SkillStorage) -> SkillProjectionPaths:
     """Repair stale projection scopes, otherwise leave their inodes untouched."""
     paths = get_skill_projection_paths(storage)
 
@@ -522,6 +849,7 @@ def skill_projection_mutation(
     *,
     remove: tuple[tuple[SkillCategory, Path], ...] = (),
     remove_names: tuple[str, ...] = (),
+    mutation_names: tuple[str, ...] = (),
 ) -> Iterator[None]:
     """Hold a projection scope lock across a source/state mutation."""
     if not isinstance(storage.get_skills_root_path(), Path):
@@ -560,7 +888,9 @@ def skill_projection_mutation(
         _validate_projection_relative_path(relative_path)
         removals.add((root, relative_path))
 
-    with _projection_lock(scope_root):
+    from deerflow.skills.mutations.guard import managed_name_writes
+
+    with managed_name_writes(storage, mutation_names), _projection_lock(scope_root):
         if remove_names:
             names = set(remove_names)
             skills = _load_public_skills(storage, enabled_only=False) if scope == "public" else storage.load_skills(enabled_only=False)
@@ -575,7 +905,10 @@ def skill_projection_mutation(
             _manifest_path(scope_root).unlink(missing_ok=True)
             for root, relative_path in removals:
                 _remove_projection_relative(root, relative_path)
-            yield
+            from deerflow.skills.mutations.guard import managed_writer
+
+            with managed_writer(storage, mutation_names):
+                yield
             rebuild()
         except Exception:
             _clear_projection_scope(scope_root, *category_roots.values())
@@ -607,3 +940,11 @@ def ensure_public_skill_projection(*, app_config=None) -> bool:
             logger.error("Failed to clear the public skill projection after a boot-time error", exc_info=True)
         return False
     return True
+
+
+@contextmanager
+def skill_projection_read_lock(storage: SkillStorage, *, timeout: float = 5.0, check=None) -> Iterator[None]:
+    """Bounded, non-mutating acquisition of the existing user projection lock."""
+    root = (storage.get_skills_root_path() / "custom") if getattr(storage, "user_id", None) is None else get_skill_projection_paths(storage).custom.parent
+    with _projection_lock(root, timeout=timeout, check=check):
+        yield

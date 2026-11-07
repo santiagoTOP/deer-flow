@@ -5,8 +5,8 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
 import deerflow.utils.llm_text as llm_text
-from app.gateway.authz import require_permission
-from app.gateway.deps import get_config
+from app.gateway.authz import _is_internal_caller, authorize_model_use, require_permission
+from app.gateway.deps import get_config, get_current_user_from_request
 from deerflow.config.app_config import AppConfig
 from deerflow.config.suggestions_config import DEFAULT_MAX_SUGGESTIONS, MAX_SUGGESTIONS_LIMIT
 from deerflow.utils.oneshot_llm import run_oneshot_llm
@@ -38,11 +38,11 @@ class SuggestionsConfigResponse(BaseModel):
 
 
 _strip_markdown_code_fence = llm_text.strip_markdown_code_fence
-_strip_think_blocks = llm_text.strip_think_blocks
+_strip_think_blocks_outside_json_strings = llm_text.strip_think_blocks_outside_json_strings
 
 
 def _parse_json_string_list(text: str) -> list[str] | None:
-    candidate = _strip_think_blocks(text)
+    candidate = _strip_think_blocks_outside_json_strings(text)
     candidate = _strip_markdown_code_fence(candidate)
     start = candidate.find("[")
     end = candidate.rfind("]")
@@ -117,6 +117,12 @@ async def generate_suggestions(
     conversation = _format_conversation(body.messages)
     if not conversation:
         return SuggestionsResponse(suggestions=[])
+
+    # Check the same effective model the factory will use, including its
+    # default when the caller omits model_name. Keep permission failures out
+    # of the best-effort LLM error handler below so a denial remains a 403.
+    user = await get_current_user_from_request(request)
+    authorize_model_use(user, body.model_name, is_internal=_is_internal_caller(request, user), app_config=config)
 
     system_instruction = (
         "You are generating follow-up questions to help the user continue the conversation.\n"

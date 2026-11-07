@@ -43,6 +43,8 @@ diverge.
 
 from __future__ import annotations
 
+import csv
+import ctypes
 import hashlib
 import io
 import json
@@ -51,6 +53,9 @@ import os
 import posixpath
 import re
 import shutil
+import signal
+import stat
+import struct
 import subprocess
 import tarfile
 import tempfile
@@ -59,13 +64,18 @@ import time
 import urllib.parse
 import urllib.request
 import zipfile
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from concurrent.futures import Future
+from contextlib import contextmanager, suppress
+from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import uuid4
 from weakref import WeakValueDictionary
+
+from deerflow.utils.file_lock import retry_until_locked
 
 try:
     import fcntl
@@ -76,10 +86,12 @@ except ImportError:  # pragma: no cover - Windows fallback
 from deerflow.config.app_config import AppConfig
 from deerflow.config.paths import Paths, get_paths
 from deerflow.integrations.lark_broker import LARK_BROKER_URL_ENV
-from deerflow.skills.installer import is_executable_binary_prefix, is_symlink_member, is_unsafe_zip_member
+from deerflow.skills.installer import is_symlink_member, is_unsafe_zip_member
+from deerflow.skills.package_files import EXEC_SNIFF_BYTES, is_executable_binary_prefix
 from deerflow.skills.parser import parse_skill_file
 from deerflow.skills.permissions import make_skill_tree_sandbox_readable
 from deerflow.skills.types import SKILL_MD_FILE, SkillCategory
+from deerflow.utils.atomic_write import cleanup_failed_atomic_write
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +101,14 @@ INTEGRATION_ID = "lark-cli"
 FALLBACK_LARK_CLI_VERSION = "v1.0.65"
 LARK_CLI_NPM_VERSION = FALLBACK_LARK_CLI_VERSION.removeprefix("v")
 LARK_CLI_NPM_PACKAGE = "@larksuite/cli"
+# ``lark-cli`` is a native binary (installed by the npm package's Node wrapper)
+# and npm itself always write UTF-8 to a pipe, so every capture of their output
+# must be decoded as UTF-8 rather than with the host locale. On a host whose ANSI
+# code page is not UTF-8 (cp936, cp1252) the locale decode silently mangles every
+# non-ASCII field -- ``auth status --json`` reports a CJK ``userName``, documents
+# titles come back garbled -- and can kill the pipe reader thread outright when a
+# byte sequence is invalid in the code page, leaving ``stdout`` as ``None``.
+LARK_CLI_SUBPROCESS_ENCODING = "utf-8"
 LARK_CLI_GITHUB_REPO = "larksuite/cli"
 LARK_CLI_LATEST_RELEASE_API = f"https://api.github.com/repos/{LARK_CLI_GITHUB_REPO}/releases/latest"
 LARK_CLI_SOURCE_ARCHIVE_ENV = "DEER_FLOW_LARK_CLI_SKILLS_ARCHIVE"
@@ -132,8 +152,8 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 exec "$script_dir/../linux-$arch/lark-cli" "$@"
 """
 _VERSION_TAG_RE = re.compile(r"v?\d+\.\d+\.\d+")
-_DEERFLOW_LARK_SHARED_GUIDANCE_MARKER = "<!-- deerflow-lark-cli-auth-guidance-v2 -->"
-_DEERFLOW_LARK_SHARED_GUIDANCE_LEGACY_MARKERS = ("<!-- deerflow-lark-cli-auth-guidance-v1 -->",)
+_DEERFLOW_LARK_SHARED_GUIDANCE_MARKER = "<!-- deerflow-lark-cli-auth-guidance-v3 -->"
+_DEERFLOW_LARK_SHARED_GUIDANCE_LEGACY_MARKERS = ("<!-- deerflow-lark-cli-auth-guidance-v1 -->", "<!-- deerflow-lark-cli-auth-guidance-v2 -->")
 _LARK_APP_REGISTRATION_PATH = "/oauth/v1/app/registration"
 
 LARK_SKILL_NAMES: tuple[str, ...] = (
@@ -166,10 +186,14 @@ LARK_SKILL_NAMES: tuple[str, ...] = (
     "lark-workflow-standup-report",
 )
 LARK_SKILL_NAME_SET = frozenset(LARK_SKILL_NAMES)
+# Allow long installs to finish without waiting indefinitely on a stuck holder.
+_INSTALL_LOCK_TIMEOUT_SECONDS = 15 * 60
 _LARK_INSTALL_THREAD_LOCK = threading.Lock()
 _LARK_RUNTIME_INSTALL_THREAD_LOCK = threading.Lock()
 _LARK_CREDENTIAL_LOCKS_GUARD = threading.Lock()
 _LARK_CREDENTIAL_LOCKS: WeakValueDictionary[str, threading.Lock] = WeakValueDictionary()
+_LARK_HARDENING_LOCKS_GUARD = threading.Lock()
+_LARK_HARDENING_LOCKS: WeakValueDictionary[str, threading.RLock] = WeakValueDictionary()
 
 
 @dataclass(frozen=True)
@@ -206,6 +230,7 @@ class LarkIntegrationStatus:
     cli: LarkCliProbe
     auth: LarkAuthProbe
     sandbox_runtime_mode: str = "none"
+    sandbox_runtime_probed: bool = False
     sandbox_runtime_ready: bool = False
     sandbox_runtime_detail: str | None = None
 
@@ -298,31 +323,860 @@ def _lark_cli_credential_root(user_id: str) -> Path:
 
 
 def ensure_lark_cli_credential_tree(user_id: str, *, paths: Paths | None = None) -> None:
-    """Make the user's secret-bearing Lark CLI tree owner-only.
+    """Harden the secret-bearing credential tree to owner-only.
 
-    The CLI writes plaintext app secrets and OAuth tokens beneath this tree.
-    Reject links before changing modes so a compromised tree cannot redirect a
-    chmod or subsequent CLI write outside the user's integration directory.
+    Windows uses a handle-relative walker (:func:`_ensure_and_harden_windows_credential_tree`):
+    every descendant is opened/created relative to an already-open parent handle, so a pathname
+    swap cannot redirect validation, the ACL update, or traversal for the duration of that
+    hardening walk. This guarantee does not extend to a later pathname-based reopen by a
+    credential consumer after ``ensure`` returns. POSIX keeps the ``lstat()``-before-descent
+    walk and does not take the hardening lock (its share mode has no cross-process race).
     """
     paths = paths or get_paths()
     root = paths.user_dir(user_id) / "integrations" / INTEGRATION_ID
-    if root.is_symlink():
-        raise ValueError(f"Lark CLI credential path must not be a symlink: {root}")
+    if os.name == "nt":
+        with _lark_hardening_lock(user_id, paths):
+            _ensure_and_harden_windows_credential_tree(paths, root)
+        return
+
+    _reject_credential_reparse(root)
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     root.chmod(0o700)
     for required in (root / "config", root / "config" / "locks", root / "data"):
-        if required.is_symlink():
-            raise ValueError(f"Lark CLI credential path must not be a symlink: {required}")
+        _reject_credential_reparse(required)
         required.mkdir(parents=True, exist_ok=True, mode=0o700)
-    for path in root.rglob("*"):
-        if path.is_symlink():
-            raise ValueError(f"Lark CLI credential path must not be a symlink: {path}")
-        if path.is_dir():
-            path.chmod(0o700)
-        elif path.is_file():
-            path.chmod(0o600)
-        else:
-            raise ValueError(f"Unsupported file type in Lark CLI credential tree: {path}")
+    _harden_posix_credential_tree(root)
+
+
+def _ensure_and_harden_windows_credential_tree(paths: Paths, root: Path) -> None:
+    """Create + harden the credential tree with handle-relative traversal (Windows).
+
+    The trusted base is opened by name; every descendant is then opened/created
+    *relative* to an already-open parent handle (``RootDirectory``). The walker never
+    re-resolves a pathname, so a concurrent rename/replace of an ancestor or directory
+    cannot redirect validation, the ACL update, or traversal to a swapped object.
+    """
+    owner_sid = _resolve_current_user_sid()
+    pinned: list[_WindowsTreeHandle] = []
+    try:
+        chain = _credential_chain_paths(paths.base_dir, root)
+        # The trusted base is the storage root; create it if absent, then open it
+        # by name (it is deliberately allowed to be a reparse point).
+        chain[0].mkdir(parents=True, exist_ok=True)
+        base_handle = _open_windows_pinned(chain[0], access=_WINDOWS_PIN_ACCESS, reject_reparse=False)
+        pinned.append(base_handle)
+
+        # Pin the ancestor chain from the base down to the credential root.
+        parent = base_handle
+        for component in chain[1:]:
+            is_root = component == chain[-1]
+            access = _WINDOWS_HARDEN_ACCESS if is_root else _WINDOWS_PIN_ACCESS
+            share = _WINDOWS_EXCLUSIVE_SHARE if is_root else _WINDOWS_NORMAL_SHARE
+            parent = _open_or_create_dir_relative(parent, component.name, full_path=component, access=access, share=share)
+            pinned.append(parent)
+        root_handle = parent
+
+        # Handle-relative hardening walk.
+        _walk_and_harden_windows_handle(root, root_handle, owner_sid, root)
+    finally:
+        for handle in reversed(pinned):
+            handle.close()
+
+
+@contextmanager
+def _private_lark_temp_dir(*, prefix: str, dir: Path | None = None):
+    """Yield an empty, owner-only temp directory for secret-bearing work.
+
+    The root is hardened (owner-only) *before* any child or credential is
+    created, so ``config`` / ``data`` / snapshot directories and the secrets
+    written or copied into them inherit the owner-only ACL boundary on Windows
+    and the ``0700`` mode on POSIX.
+    """
+    with tempfile.TemporaryDirectory(prefix=prefix, dir=str(dir) if dir else None) as temp_dir:
+        root = Path(temp_dir)
+        # No credential has been written yet — establish the boundary first.
+        _establish_private_directory_boundary(root)
+        yield root
+
+
+def _harden_posix_credential_tree(root: Path) -> None:
+    def _chmod(path: Path, kind: str) -> None:
+        path.chmod(0o700 if kind == "dir" else 0o600)
+
+    _walk_and_harden(root, _chmod)
+
+
+def _walk_and_harden(root: Path, apply_: Callable[[Path, str], None]) -> None:
+    """Lstat-before-descent walk over *root* and each descendant (POSIX).
+
+    Every path is validated with ``lstat()`` (symlink / reparse-point / unsupported
+    type rejected) *before* applying permissions and descending, and we only
+    ``iterdir()`` a path after it is confirmed to be a real directory.
+
+    This is a best-effort static check, not a race-proof one: it does not pin the
+    object, so a concurrent local principal could still swap a checked directory
+    for a symlink between the ``lstat`` and a later permission apply / ``iterdir``.
+    Windows intentionally uses :func:`_walk_and_harden_windows_handle`, which keeps
+    validation, the ACL update, and traversal bound to the opened object (all descendant
+    opens are relative to an already-open parent handle), so it does not depend on the
+    pathname remaining stable.
+    """
+    pending: list[Path] = [root]
+    while pending:
+        path = pending.pop()
+        try:
+            kind = _credential_tree_path_kind(path)
+            apply_(path, kind)
+            if kind == "dir":
+                pending.extend(path.iterdir())
+        except FileNotFoundError:
+            # Atomic publication may remove a descendant at any walk step.
+            # Losing the root itself is a broken credential boundary.
+            if path == root:
+                raise
+
+
+def _credential_tree_path_kind(path: Path) -> str:
+    """Return ``"dir"`` or ``"file"`` for a safe real entry, else raise.
+
+    Rejects any symlink and any Windows reparse point *before* the caller may
+    descend, so a junction cannot redirect traversal outside the tree.
+    """
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"Lark CLI credential path must not be a symlink: {path}")
+    if os.name == "nt" and (getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+        raise ValueError(f"Lark CLI credential path must not be a reparse point: {path}")
+    if stat.S_ISDIR(info.st_mode):
+        return "dir"
+    if stat.S_ISREG(info.st_mode):
+        return "file"
+    raise ValueError(f"Unsupported file type in Lark CLI credential tree: {path}")
+
+
+def _reject_reparse_stat(path: Path, info: os.stat_result) -> None:
+    """Reject a symlink or Windows reparse point *path* with stat *info*."""
+    if stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"Lark CLI credential path must not be a symlink: {path}")
+    if os.name == "nt" and (getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+        raise ValueError(f"Lark CLI credential path must not be a reparse point: {path}")
+
+
+def _reject_credential_reparse(path: Path) -> None:
+    """Reject an already-existing symlink / reparse point before ``mkdir``.
+
+    ``mkdir(exist_ok=True)`` would accept an existing junction, so a reparse
+    root or required directory must be rejected up front rather than after it is
+    used. Non-existent paths are fine to create.
+    """
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    _reject_reparse_stat(path, info)
+
+
+def _resolve_current_user_sid() -> str:
+    """Return the current process user's Windows SID, e.g. ``S-1-5-21-...``.
+
+    ``whoami /user /fo csv /nh`` prints ``"<domain>\\<user>","<sid>"`` — the SID
+    is the *second* CSV field — so we parse it with ``csv.reader`` rather than
+    guessing a field position. SIDs are locale/display-name independent and
+    are the single principal granted in the Windows allowlist below.
+    """
+    result = subprocess.run(
+        ["whoami", "/user", "/fo", "csv", "/nh"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        # whoami writes the account name in the console's ANSI code page, which does
+        # not need to match the interpreter's encoding (e.g. UTF-8 mode on a Chinese Windows).
+        # Without errors="replace" the decoder raises inside subprocess's reader
+        # thread and leaves stdout as None. Only the SID (ASCII) and the CSV
+        # delimiters matter here, so replacing the account name is harmless.
+        errors="replace",
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"failed to resolve current Windows user SID: {result.stderr.strip() or result.stdout.strip()}")
+    try:
+        fields = next(csv.reader([result.stdout.strip()]))
+    except (csv.Error, StopIteration) as exc:
+        raise RuntimeError(f"unexpected whoami /user output: {result.stdout.strip()!r}") from exc
+    if len(fields) < 2 or not fields[1].startswith("S-"):
+        raise RuntimeError(f"unexpected whoami /user output: {result.stdout.strip()!r}")
+    return fields[1]
+
+
+def _windows_private_sddl(owner_sid: str, *, inheritable_full: bool) -> str:
+    """SDDL for a protected owner-only descriptor that also transfers ownership.
+
+    ``O:<owner SID>D:P(A;...;FA;;;<owner SID>)`` sets the security descriptor's
+    owner to *owner_sid* and installs a protected DACL granting only *owner_sid*
+    Full Access. The ``O:`` prefix is what lets the successor (attacker) lose
+    implicit ``WRITE_DAC``.
+    """
+    ace = "(A;OICI;FA;;;" if inheritable_full else "(A;;FA;;;"
+    return f"O:{owner_sid}D:P{ace}{owner_sid})"
+
+
+def _windows_private_security_information() -> int:
+    """Security-information flags: OWNER | DACL | PROTECTED_DACL."""
+    return 0x00000001 | 0x00000004 | 0x80000000
+
+
+# --- Handle-relative Windows credential-tree walker -------------------------
+#
+# The secret-bearing Lark CLI tree is hardened with *handle-relative* primitives.
+# A ``no-FILE_SHARE_DELETE`` handle is not a rename barrier on its own (``os.rename``
+# of a directory is authorized by the object's DELETE right or the parent's
+# DELETE_CHILD, and does not require re-opening the directory for DELETE). So the
+# walker never re-resolves a pathname at all: it opens the tree once, then
+# enumerates and opens/creates every child *relative* to an already-open parent
+# handle (``RootDirectory``), and inspects/hardens from the handle. A pathname
+# swap can therefore not redirect the walker's validation, ACL update, or traversal.
+
+_FILE_LIST_DIRECTORY = 0x0001  # == FILE_READ_DATA when the target is a file
+_FILE_READ_ATTRIBUTES = 0x0080
+_READ_CONTROL = 0x00020000
+_WRITE_DAC = 0x00040000
+_WRITE_OWNER = 0x00080000
+_SYNCHRONIZE = 0x00100000
+_FILE_SHARE_READ = 0x00000001
+_FILE_SHARE_WRITE = 0x00000002
+_WINDOWS_NORMAL_SHARE = _FILE_SHARE_READ | _FILE_SHARE_WRITE
+# An exclusive (share=0) directory handle makes ``SetSecurityInfo`` skip automatic
+# propagation of an inheritable ACE into existing children, so we can apply the final
+# owner-only OI|CI DACL to a directory *before* walking its (as-yet-unvalidated) children.
+_WINDOWS_EXCLUSIVE_SHARE = 0
+_OPEN_EXISTING = 3
+_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+# Ancestors are carried only to retain the opened object's identity so children can
+# be opened *relative* to them via ``RootDirectory``; they are never hardened, so a
+# read-only handle (attributes + synchronize) is enough.
+_WINDOWS_PIN_ACCESS = _FILE_READ_ATTRIBUTES | _SYNCHRONIZE
+# The credential root and its descendants get ``SetSecurityInfo`` on the open
+# handle, so they additionally need read-control plus write-DAC / write-owner.
+# Native Windows requires READ_CONTROL for this particular SetSecurityInfo path
+# in addition to WRITE_DAC / WRITE_OWNER — verified empirically: omitting it
+# yields ERROR_ACCESS_DENIED (WinError 5). ``FILE_LIST_DIRECTORY`` is needed on
+# directory handles so ``GetFileInformationByHandleEx`` can enumerate them. We
+# deliberately do *not* request ``FILE_READ_EA``.
+_WINDOWS_HARDEN_ACCESS = _WINDOWS_PIN_ACCESS | _READ_CONTROL | _WRITE_DAC | _WRITE_OWNER | _FILE_LIST_DIRECTORY
+
+
+class _BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("dwFileAttributes", wintypes.DWORD),
+        ("ftCreationTime", wintypes.FILETIME),
+        ("ftLastAccessTime", wintypes.FILETIME),
+        ("ftLastWriteTime", wintypes.FILETIME),
+        ("dwVolumeSerialNumber", wintypes.DWORD),
+        ("nFileSizeHigh", wintypes.DWORD),
+        ("nFileSizeLow", wintypes.DWORD),
+        ("nNumberOfLinks", wintypes.DWORD),
+        ("nFileIndexHigh", wintypes.DWORD),
+        ("nFileIndexLow", wintypes.DWORD),
+    ]
+
+
+class _WindowsFileInfo:
+    """Attribute snapshot taken from an already-open handle."""
+
+    def __init__(self, attributes: int, link_count: int) -> None:
+        self.attributes = attributes
+        self.link_count = link_count
+
+    @property
+    def reparse(self) -> bool:
+        return bool(self.attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+    @property
+    def is_dir(self) -> bool:
+        return bool(self.attributes & stat.FILE_ATTRIBUTE_DIRECTORY)
+
+
+def _create_windows_handle_no_follow(
+    path: Path,
+    *,
+    access: int,
+    share: int = _WINDOWS_NORMAL_SHARE,
+) -> int:
+    """Open *path* by name, never following a reparse point.
+
+    ``FILE_FLAG_OPEN_REPARSE_POINT`` opens the reparse point itself rather than
+    following it; ``FILE_FLAG_BACKUP_SEMANTICS`` lets a directory be opened as a
+    handle. This is used only to open the trusted base; every descendant is opened
+    relative to an already-open parent handle, so the walker does not depend on the
+    pathname remaining stable.
+    """
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    handle = kernel32.CreateFileW(
+        str(path),
+        access,
+        share,
+        None,
+        _OPEN_EXISTING,
+        _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle is None or handle == _INVALID_HANDLE_VALUE:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return handle
+
+
+def _close_windows_handle(handle: int) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    if not kernel32.CloseHandle(handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _windows_file_info_from_handle(handle: int) -> _WindowsFileInfo:
+    """Read attributes of an already-open handle (never follows the pathname)."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.GetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_BY_HANDLE_FILE_INFORMATION),
+    ]
+    info = _BY_HANDLE_FILE_INFORMATION()
+    if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return _WindowsFileInfo(info.dwFileAttributes, info.nNumberOfLinks)
+
+
+@contextmanager
+def _windows_private_security_parts(owner_sid: str, *, inheritable_full: bool) -> Iterator[tuple[ctypes.c_void_p, ctypes.c_void_p]]:
+    """Build an owner + protected owner-only descriptor and yield ``(owner, dacl)``.
+
+    *owner* and *dacl* point into the descriptor; the caller applies the security within
+    this context, which releases the descriptor on exit.
+    """
+    sddl = _windows_private_sddl(owner_sid, inheritable_full=inheritable_full)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    descriptor = ctypes.c_void_p()
+    size = wintypes.DWORD()
+    if not advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(descriptor), ctypes.byref(size)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        dacl_present = wintypes.BOOL()
+        dacl_defaulted = wintypes.BOOL()
+        dacl = ctypes.c_void_p()
+        advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
+        advapi32.GetSecurityDescriptorDacl.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.BOOL),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(wintypes.BOOL),
+        ]
+        if not advapi32.GetSecurityDescriptorDacl(descriptor, ctypes.byref(dacl_present), ctypes.byref(dacl), ctypes.byref(dacl_defaulted)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not dacl_present.value or not dacl.value:
+            raise RuntimeError("private security descriptor has no DACL")
+
+        owner_defaulted = wintypes.BOOL()
+        owner = ctypes.c_void_p()
+        advapi32.GetSecurityDescriptorOwner.restype = wintypes.BOOL
+        advapi32.GetSecurityDescriptorOwner.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(wintypes.BOOL),
+        ]
+        if not advapi32.GetSecurityDescriptorOwner(descriptor, ctypes.byref(owner), ctypes.byref(owner_defaulted)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not owner.value:
+            raise RuntimeError("private security descriptor has no owner")
+        yield owner, dacl
+    finally:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.LocalFree.restype = ctypes.c_void_p
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree(descriptor)
+
+
+def _set_windows_security_info_handle(handle: int, owner_sid: str, *, inheritable_full: bool) -> None:
+    """Apply an owner + protected owner-only DACL to an open object handle.
+
+    This is the handle variant of ``SetNamedSecurityInfoW``: it acts on the
+    already-open object, so it cannot be redirected by a concurrent pathname
+    replacement. No intermediate parent-inherited DACL is written before this final
+    handle-bound call, so a failure is surfaced to the caller rather than leaving a
+    broadened intermediate ACL in place.
+    """
+    with _windows_private_security_parts(owner_sid, inheritable_full=inheritable_full) as (owner, dacl):
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        advapi32.SetSecurityInfo.restype = wintypes.DWORD
+        advapi32.SetSecurityInfo.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        result = advapi32.SetSecurityInfo(
+            handle,
+            1,  # SE_FILE_OBJECT
+            _windows_private_security_information(),
+            owner,
+            None,
+            dacl,
+            None,
+        )
+        if result != 0:
+            raise ctypes.WinError(result)
+
+
+_FILE_DIRECTORY_FILE = 0x00000001
+_FILE_OPEN_REPARSE_POINT = 0x00200000
+_FILE_OPEN_FOR_BACKUP_INTENT = 0x00004000
+_FILE_OPEN_IF = 3
+_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+_OBJ_CASE_INSENSITIVE = 0x00000040
+_FILE_FULL_DIRECTORY_RESTART_INFO = 0x0F
+_FILE_FULL_DIRECTORY_INFO = 0x0E
+_ERROR_NO_MORE_FILES = 18
+
+
+class _UNICODE_STRING(ctypes.Structure):
+    _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT), ("Buffer", wintypes.LPWSTR)]
+
+
+class _OBJECT_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("Length", wintypes.ULONG),
+        ("RootDirectory", wintypes.HANDLE),
+        ("ObjectName", ctypes.POINTER(_UNICODE_STRING)),
+        ("Attributes", wintypes.ULONG),
+        ("SecurityDescriptor", ctypes.c_void_p),
+        ("SecurityQualityOfService", ctypes.c_void_p),
+    ]
+
+
+class _IO_STATUS_BLOCK(ctypes.Structure):
+    _fields_ = [("Status", ctypes.c_long), ("Information", ctypes.c_void_p)]
+
+
+def _windows_unicode_string(name: str) -> tuple[_UNICODE_STRING, ctypes.Array]:
+    """Build a ``UNICODE_STRING`` over *name*, sized in bytes (UTF-16 code units).
+
+    ``create_unicode_buffer`` allocates for the UTF-16 representation, so non-BMP
+    characters (surrogate pairs) are sized correctly; ``Length`` excludes the
+    terminating NUL while ``MaximumLength`` includes it. The caller must keep the
+    returned buffer alive for the duration of the Win32 call.
+    """
+    buf = ctypes.create_unicode_buffer(name)
+    us = _UNICODE_STRING()
+    us.Buffer = ctypes.cast(buf, wintypes.LPWSTR)
+    us.Length = ctypes.sizeof(buf) - ctypes.sizeof(ctypes.c_wchar)
+    us.MaximumLength = ctypes.sizeof(buf)
+    return us, buf
+
+
+def _object_attributes(parent_handle: int, name: str) -> tuple[_OBJECT_ATTRIBUTES, ctypes.Array]:
+    """Build ``OBJECT_ATTRIBUTES`` for *name* relative to *parent_handle*."""
+    us, buf = _windows_unicode_string(name)
+    oa = _OBJECT_ATTRIBUTES()
+    oa.Length = ctypes.sizeof(_OBJECT_ATTRIBUTES)
+    oa.RootDirectory = parent_handle
+    oa.ObjectName = ctypes.pointer(us)
+    oa.Attributes = _OBJ_CASE_INSENSITIVE
+    return oa, buf
+
+
+def _nt_open_relative(
+    parent_handle: int,
+    name: str,
+    *,
+    access: int,
+    directory: bool,
+    share: int = _WINDOWS_NORMAL_SHARE,
+) -> int:
+    """Open *name* relative to *parent_handle*, no-follow (never follows a junction)."""
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    ntdll.NtOpenFile.restype = ctypes.c_long
+    ntdll.NtOpenFile.argtypes = [
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        ctypes.POINTER(_OBJECT_ATTRIBUTES),
+        ctypes.POINTER(_IO_STATUS_BLOCK),
+        wintypes.ULONG,
+        wintypes.ULONG,
+    ]
+    oa, _buf = _object_attributes(parent_handle, name)
+    io = _IO_STATUS_BLOCK()
+    handle = wintypes.HANDLE()
+    options = _FILE_OPEN_REPARSE_POINT | _FILE_OPEN_FOR_BACKUP_INTENT | (_FILE_DIRECTORY_FILE if directory else 0)
+    status = ntdll.NtOpenFile(
+        ctypes.byref(handle),
+        access,
+        ctypes.byref(oa),
+        ctypes.byref(io),
+        share,
+        options,
+    )
+    if status != 0:
+        raise ctypes.WinError(_ntstatus_to_dos(status))
+    return handle.value
+
+
+def _nt_create_dir_relative(
+    parent_handle: int,
+    name: str,
+    *,
+    access: int,
+    share: int = _WINDOWS_NORMAL_SHARE,
+) -> int:
+    """Create *name* as a directory relative to *parent_handle* and open it."""
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    ntdll.NtCreateFile.restype = ctypes.c_long
+    ntdll.NtCreateFile.argtypes = [
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        ctypes.POINTER(_OBJECT_ATTRIBUTES),
+        ctypes.POINTER(_IO_STATUS_BLOCK),
+        ctypes.c_void_p,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        ctypes.c_void_p,
+        wintypes.ULONG,
+    ]
+    oa, _buf = _object_attributes(parent_handle, name)
+    io = _IO_STATUS_BLOCK()
+    handle = wintypes.HANDLE()
+    options = _FILE_DIRECTORY_FILE | _FILE_OPEN_REPARSE_POINT | _FILE_OPEN_FOR_BACKUP_INTENT
+    status = ntdll.NtCreateFile(
+        ctypes.byref(handle),
+        access,
+        ctypes.byref(oa),
+        ctypes.byref(io),
+        None,
+        _FILE_ATTRIBUTE_DIRECTORY,
+        share,
+        _FILE_OPEN_IF,
+        options,
+        None,
+        0,
+    )
+    if status != 0:
+        raise ctypes.WinError(_ntstatus_to_dos(status))
+    return handle.value
+
+
+def _ntstatus_to_dos(status: int) -> int:
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    ntdll.RtlNtStatusToDosError.restype = wintypes.ULONG
+    ntdll.RtlNtStatusToDosError.argtypes = [ctypes.c_long]
+    return ntdll.RtlNtStatusToDosError(status)
+
+
+def _enumerate_directory_handle(handle: int) -> Iterator[str]:
+    """Yield entry names directly from a directory handle (no pathname re-resolution)."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    kernel32.GetFileInformationByHandleEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+    info_class = _FILE_FULL_DIRECTORY_RESTART_INFO
+    buffer = ctypes.create_string_buffer(65536)
+    while True:
+        ok = kernel32.GetFileInformationByHandleEx(handle, info_class, ctypes.byref(buffer), ctypes.sizeof(buffer))
+        if not ok:
+            err = ctypes.get_last_error()
+            if err == _ERROR_NO_MORE_FILES:
+                return
+            raise ctypes.WinError(err)
+        info_class = _FILE_FULL_DIRECTORY_INFO
+        data = buffer.raw
+        offset = 0
+        while True:
+            (next_offset,) = struct.unpack_from("<I", data, offset)
+            (name_len,) = struct.unpack_from("<I", data, offset + 60)
+            name = data[offset + 68 : offset + 68 + name_len].decode("utf-16-le")
+            if name not in (".", ".."):
+                yield name
+            if next_offset == 0:
+                break
+            offset += next_offset
+
+
+class _WindowsTreeHandle:
+    """A no-follow handle to one credential-tree object.
+
+    Attribute inspection, the security update, enumeration, and child open/create
+    all operate through this single handle. Children are opened/created *relative*
+    to this handle (``RootDirectory``) rather than by re-resolving a pathname, so
+    a pathname swap cannot redirect validation, the ACL update, or traversal.
+    """
+
+    def __init__(self, path: Path, handle: int, info: _WindowsFileInfo) -> None:
+        self.path = path
+        self._handle = handle
+        self.info = info
+
+    def set_security(self, owner_sid: str, *, inheritable_full: bool) -> None:
+        _set_windows_security_info_handle(self._handle, owner_sid, inheritable_full=inheritable_full)
+
+    def enumerate(self) -> Iterator[str]:
+        yield from _enumerate_directory_handle(self._handle)
+
+    def open_child(self, name: str) -> _WindowsTreeHandle:
+        handle = _nt_open_relative(
+            self._handle,
+            name,
+            access=_WINDOWS_HARDEN_ACCESS,
+            directory=False,
+            share=_WINDOWS_EXCLUSIVE_SHARE,
+        )
+        return _wrap_windows_handle(self.path / name, handle)
+
+    def open_or_create_child_dir(self, name: str) -> _WindowsTreeHandle:
+        """Open (or create) a child directory relative to this handle, exclusively."""
+        try:
+            handle = _nt_open_relative(
+                self._handle,
+                name,
+                access=_WINDOWS_HARDEN_ACCESS,
+                directory=True,
+                share=_WINDOWS_EXCLUSIVE_SHARE,
+            )
+        except FileNotFoundError:
+            handle = _nt_create_dir_relative(
+                self._handle,
+                name,
+                access=_WINDOWS_HARDEN_ACCESS,
+                share=_WINDOWS_EXCLUSIVE_SHARE,
+            )
+        return _wrap_windows_handle(self.path / name, handle)
+
+    def close(self) -> None:
+        _close_windows_handle(self._handle)
+
+    def __enter__(self) -> _WindowsTreeHandle:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+
+def _wrap_windows_handle(
+    path: Path,
+    handle: int,
+    *,
+    reject_reparse: bool = True,
+    full_path: Path | None = None,
+) -> _WindowsTreeHandle:
+    """Read handle info, reject a reparse point, and wrap the handle (closing on error)."""
+    try:
+        info = _windows_file_info_from_handle(handle)
+        target = full_path or path
+        if reject_reparse and info.reparse:
+            raise ValueError(f"Lark CLI credential path must not be a reparse point: {target}")
+        return _WindowsTreeHandle(target, handle, info)
+    except BaseException:
+        _close_windows_handle(handle)
+        raise
+
+
+def _open_windows_pinned(
+    path: Path,
+    *,
+    access: int,
+    reject_reparse: bool = True,
+    share: int = _WINDOWS_NORMAL_SHARE,
+) -> _WindowsTreeHandle:
+    """Open *path* by name, no-follow and pin it (used only for the trusted base)."""
+    handle = _create_windows_handle_no_follow(path, access=access, share=share)
+    return _wrap_windows_handle(path, handle, reject_reparse=reject_reparse)
+
+
+def _open_or_create_dir_relative(
+    parent: _WindowsTreeHandle,
+    name: str,
+    *,
+    full_path: Path,
+    access: int,
+    share: int = _WINDOWS_NORMAL_SHARE,
+) -> _WindowsTreeHandle:
+    """Open a child directory relative to *parent*, creating it if absent."""
+    try:
+        handle = _nt_open_relative(parent._handle, name, access=access, directory=True, share=share)
+    except FileNotFoundError:
+        handle = _nt_create_dir_relative(parent._handle, name, access=access, share=share)
+    return _wrap_windows_handle(full_path, handle)
+
+
+def _required_credential_child_dirs(path: Path, root: Path) -> tuple[str, ...]:
+    """Return the required sub-directories to ensure beneath *path* before enumerating."""
+    if path == root:
+        return ("config", "data")
+    if path == root / "config":
+        return ("locks",)
+    return ()
+
+
+class _WindowsWalkFrame:
+    """One active directory frame in the iterative hardening walk.
+
+    An ancestor frame keeps its exclusive directory handle open while deeper frames process
+    descendants, which preserves the object-identity/exclusive-share invariant without
+    Python recursion (an unbounded tree depth).
+    """
+
+    __slots__ = ("path", "handle", "iterator", "close_when_done")
+
+    def __init__(self, path: Path, handle: _WindowsTreeHandle, *, close_when_done: bool) -> None:
+        self.path = path
+        self.handle = handle
+        self.iterator = None
+        self.close_when_done = close_when_done
+
+
+def _walk_and_harden_windows_handle(root_path: Path, root_handle: _WindowsTreeHandle, owner_sid: str, root: Path) -> None:
+    """Iteratively validate + harden a credential-tree object using handle-relative traversal.
+
+    A file is only hardened if it has exactly one link: an NTFS hard link shares the
+    underlying file object, so changing its security descriptor would also change the
+    owner/DACL of every other hard-link path. Directories are opened exclusively (share=0):
+    ``SetSecurityInfo`` therefore does not propagate the final inheritable OI|CI ACE into
+    as-yet-unvalidated children, and the namespace is locked while it is enumerated. This is a
+    plain DFS over a stack rather than recursion, so an unbounded tree depth cannot hit the
+    Python recursion limit.
+    """
+    stack: list[_WindowsWalkFrame] = [_WindowsWalkFrame(root_path, root_handle, close_when_done=False)]
+    try:
+        while stack:
+            frame = stack[-1]
+            if frame.iterator is None:
+                info = frame.handle.info
+                if info.reparse:
+                    raise ValueError(f"Lark CLI credential path must not be a reparse point: {frame.path}")
+                if not info.is_dir:
+                    if info.link_count != 1:
+                        raise ValueError(f"Lark CLI credential file must not be hard-linked: {frame.path}")
+                    frame.handle.set_security(owner_sid, inheritable_full=False)
+                    stack.pop()
+                    if frame.close_when_done:
+                        frame.handle.close()
+                    continue
+                frame.handle.set_security(owner_sid, inheritable_full=True)
+                for name in _required_credential_child_dirs(frame.path, root):
+                    with frame.handle.open_or_create_child_dir(name):
+                        pass
+                frame.iterator = frame.handle.enumerate()
+            try:
+                name = next(frame.iterator)
+            except StopIteration:
+                stack.pop()
+                if frame.close_when_done:
+                    frame.handle.close()
+                continue
+            child = frame.handle.open_child(name)
+            stack.append(_WindowsWalkFrame(frame.path / name, child, close_when_done=True))
+    except BaseException:
+        # A hard-linked/reparse descendant raises mid-walk; close every open child frame's
+        # handle so nothing leaks (the caller owns the root handle and closes it separately).
+        for frame in reversed(stack):
+            if frame.close_when_done:
+                frame.handle.close()
+        raise
+
+
+def _credential_chain_paths(base_dir: Path, root: Path) -> list[Path]:
+    """Return the ancestor chain from *base_dir* down to and including *root*."""
+    chain = [base_dir]
+    current = base_dir
+    for part in root.relative_to(base_dir).parts:
+        current = current / part
+        chain.append(current)
+    return chain
+
+
+def _set_windows_private_inheritable_directory_dacl(path: Path, owner_sid: str) -> None:
+    """Make *path* an owner-only inheritable directory boundary (Windows).
+
+    Uses ``SetNamedSecurityInfoW`` with an ``O:<owner>D:P(A;OICI;FA;;;<owner>)``
+    descriptor so ownership is transferred and the OI|CI owner Full Access ACE is
+    inheritable by children created afterwards. Legal only on an empty directory;
+    see ``_establish_private_directory_boundary``.
+    """
+    with _windows_private_security_parts(owner_sid, inheritable_full=True) as (owner, dacl):
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+        advapi32.SetNamedSecurityInfoW.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        result = advapi32.SetNamedSecurityInfoW(
+            str(path),
+            1,  # SE_FILE_OBJECT
+            _windows_private_security_information(),
+            owner,
+            None,
+            dacl,
+            None,
+        )
+        if result != 0:
+            raise ctypes.WinError(result)
+
+
+def _establish_private_directory_boundary(path: Path) -> None:
+    """Make *path* an owner-only inheritable directory boundary.
+
+    Only legal while *path* is an empty directory, so the OI|CI owner ACE can
+    propagate to objects created underneath afterwards. Windows uses
+    ``SetNamedSecurityInfoW``; POSIX uses ``chmod 0o700``.
+    """
+    if _credential_tree_path_kind(path) != "dir":
+        raise ValueError(f"Lark CLI private boundary must be a directory: {path}")
+    if next(path.iterdir(), None) is not None:
+        raise ValueError("Lark CLI private directory boundary must be established while empty")
+    if os.name == "nt":
+        _set_windows_private_inheritable_directory_dacl(path, _resolve_current_user_sid())
+    else:
+        path.chmod(0o700)
+
+
+def _mkdir_under_private_boundary(path: Path) -> None:
+    """Create a child directory beneath an already-private boundary.
+
+    On Windows, do not pass ``mode=0o700``: Python 3.12.4+ synthesizes its own
+    Windows ACL for that mode, replacing the owner-only ACL inherited from the
+    private parent. A plain ``mkdir()`` lets the child inherit the parent's
+    inheritable owner-only ACE.
+    """
+    if os.name == "nt":
+        path.mkdir()
+    else:
+        path.mkdir(mode=0o700)
 
 
 def lark_cli_managed_gateway_dir() -> Path:
@@ -413,15 +1267,58 @@ def _extract_lark_cli_runtime_binary(archive: bytes, destination: Path) -> None:
     if not candidate:
         raise ValueError("Lark CLI runtime archive does not contain a lark-cli executable.")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(candidate)
+    _publish_bytes_atomically(destination, candidate)
     destination.chmod(0o755)
+
+
+def _publish_bytes_atomically(path: Path, content: bytes) -> None:
+    """Publish *content* at *path* without exposing a partial file.
+
+    Flush and fsync a same-directory temporary file before ``os.replace``.
+    Callers own the final mode: runtime binaries and launchers use 0o755;
+    staged skill files and manifests become read-only through
+    ``make_skill_tree_sandbox_readable``. The parent directory is not fsynced,
+    so this helper alone does not guarantee publication survives power loss.
+    A failed write, fsync, or replace leaves the previous file intact.
+    Removing the temporary is best-effort and must not replace that error.
+    """
+    fd, temporary_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    temporary = Path(temporary_name)
+    try:
+        handle = os.fdopen(fd, "wb")
+        fd = None  # The file object now owns the descriptor.
+        with handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        cleanup_failed_atomic_write(temporary, fd)
+        raise
 
 
 def _write_lark_cli_sandbox_launcher(staging: Path) -> None:
     launcher = staging / "bin" / "lark-cli"
     launcher.parent.mkdir(parents=True, exist_ok=True)
-    launcher.write_text(LARK_CLI_SANDBOX_LAUNCHER_SCRIPT, encoding="utf-8")
+    _publish_bytes_atomically(launcher, LARK_CLI_SANDBOX_LAUNCHER_SCRIPT.encode("utf-8"))
     launcher.chmod(0o755)
+
+
+def _runtime_artifact_is_executable(relative: Path, candidate: Path) -> bool:
+    """Decide whether a managed runtime artifact is executable, platform-aware.
+
+    POSIX keeps the strict executable-bit contract. NTFS cannot represent the
+    exec bit, so Windows validates these Linux-only artifacts by content
+    instead: the per-arch binaries must carry an executable image magic and
+    the ``bin/lark-cli`` launcher must be a script with a shebang.
+    """
+    if os.name != "nt":
+        return candidate.stat().st_mode & 0o111 != 0
+    with candidate.open("rb") as handle:
+        prefix = handle.read(EXEC_SNIFF_BYTES)
+    if relative == Path("bin/lark-cli"):
+        return prefix.startswith(b"#!")
+    return is_executable_binary_prefix(prefix)
 
 
 def _validate_lark_cli_sandbox_runtime(root: Path) -> None:
@@ -436,7 +1333,7 @@ def _validate_lark_cli_sandbox_runtime(root: Path) -> None:
         candidate = root / relative
         if not candidate.is_file():
             raise ValueError(f"Managed Lark CLI sandbox runtime is missing a regular file: {relative}")
-        if candidate.stat().st_mode & 0o111 == 0:
+        if not _runtime_artifact_is_executable(relative, candidate):
             raise ValueError(f"Managed Lark CLI sandbox runtime file is not executable: {relative}")
 
 
@@ -462,7 +1359,18 @@ def _exclusive_install_lock(lock_path: Path, thread_lock):
         if fcntl is not None:
             fcntl.flock(lock_file, fcntl.LOCK_EX)
         else:  # pragma: no cover - Windows fallback
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+
+            def acquire_region() -> None:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+
+            retry_until_locked(
+                acquire_region,
+                deadline=time.monotonic() + _INSTALL_LOCK_TIMEOUT_SECONDS,
+                sleep=time.sleep,
+                monotonic=time.monotonic,
+                timeout_message="Lark install lock timed out",
+            )
         try:
             yield
         finally:
@@ -478,12 +1386,54 @@ def _lark_credential_thread_lock(user_id: str) -> threading.Lock:
         return _LARK_CREDENTIAL_LOCKS.setdefault(user_id, threading.Lock())
 
 
+def _lark_hardening_thread_lock(user_id: str) -> threading.RLock:
+    """Per-user lock that serializes credential-tree hardening across threads.
+
+    Distinct from :func:`_lark_credential_thread_lock`, which callers may already
+    hold (and which is non-reentrant); reusing it inside ``ensure`` would self-deadlock.
+    """
+    with _LARK_HARDENING_LOCKS_GUARD:
+        return _LARK_HARDENING_LOCKS.setdefault(user_id, threading.RLock())
+
+
+@contextmanager
+def _lark_hardening_lock(user_id: str, paths: Paths):
+    """Serialize credential-tree hardening across threads and Gateway worker processes.
+
+    The advisory lock file lives directly under the trusted ``paths.base_dir`` anchor, not
+    under the per-user chain — that chain is only validated by the handle-relative walker
+    *after* this lock is taken, so placing the lock file beneath an unverified ancestor would
+    itself be a pathname write before reparse validation. It is a separate lock domain from
+    the non-reentrant ``_lark_credential_lock`` so ``credential lock -> ensure -> hardening
+    lock`` never self-deadlocks, and the advisory file lock covers ``GATEWAY_WORKERS`` > 1.
+    """
+    user_dir = paths.user_dir(user_id)  # validates user_id
+    paths.base_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = paths.base_dir / f".{INTEGRATION_ID}.{user_dir.name}.hardening.lock"
+    with _exclusive_install_lock(lock_path, _lark_hardening_thread_lock(user_id)):
+        yield
+
+
 @contextmanager
 def _lark_credential_lock(user_id: str):
-    """Serialize credential replacement for one user across threads/processes."""
-    root = _lark_cli_credential_root(user_id)
-    root.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = root.parent / f".{INTEGRATION_ID}.credentials.lock"
+    """Serialize credential replacement for one user across threads/processes.
+
+    On Windows the advisory lock file is anchored directly under the trusted
+    ``paths.base_dir`` (mirroring :func:`_lark_hardening_lock`), because the per-user
+    chain is only validated by the handle-relative walker *after* this lock is taken —
+    writing a lock file beneath an unverified ancestor (e.g. a junction at
+    ``integrations``) would itself be a pathname write before reparse validation. POSIX
+    keeps the original location under the per-user ``integrations`` directory.
+    """
+    paths = get_paths()
+    user_dir = paths.user_dir(user_id)  # validates user_id
+    if os.name == "nt":
+        paths.base_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = paths.base_dir / f".{INTEGRATION_ID}.{user_dir.name}.credentials.lock"
+    else:
+        root = user_dir / "integrations" / INTEGRATION_ID
+        root.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = root.parent / f".{INTEGRATION_ID}.credentials.lock"
     with _exclusive_install_lock(lock_path, _lark_credential_thread_lock(user_id)):
         yield
 
@@ -492,23 +1442,39 @@ def _lark_flow_state_path(user_id: str) -> Path:
     return _lark_cli_credential_root(user_id) / LARK_CLI_FLOW_STATE_FILE
 
 
-def _write_lark_flow_generation_locked(user_id: str, generation: str) -> None:
-    ensure_lark_cli_credential_tree(user_id)
-    path = _lark_flow_state_path(user_id)
-    fd, temp_name = tempfile.mkstemp(prefix=f".{LARK_CLI_FLOW_STATE_FILE}.", dir=str(path.parent))
+def _write_json_file_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     os.close(fd)
     temp_path = Path(temp_name)
     try:
-        temp_path.write_text(json.dumps({"generation": generation}) + "\n", encoding="utf-8")
+        temp_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
         temp_path.chmod(0o600)
         os.replace(temp_path, path)
     finally:
-        temp_path.unlink(missing_ok=True)
+        cleanup_failed_atomic_write(temp_path)
+
+
+_LARK_FLOW_DEVICE_CODE_UNSET: Any = object()
+
+
+def _write_lark_flow_generation_locked(user_id: str, generation: str, *, device_code: Any = _LARK_FLOW_DEVICE_CODE_UNSET) -> None:
+    ensure_lark_cli_credential_tree(user_id)
+    state: dict[str, Any] = {"generation": generation}
+    if device_code is not _LARK_FLOW_DEVICE_CODE_UNSET:
+        # Only the digest is persisted; the single-use bearer code itself
+        # stays in memory.
+        state["device_code_digest"] = _lark_login_code_digest(device_code)
+    _write_json_file_atomic(_lark_flow_state_path(user_id), state)
 
 
 def _advance_lark_flow_generation_locked(user_id: str) -> str:
     generation = uuid4().hex
     _write_lark_flow_generation_locked(user_id, generation)
+    # A new flow supersedes every in-flight login run for this user: the
+    # orphaned process would otherwise keep polling a device code the caller
+    # can no longer complete.
+    _abandon_lark_login_runs(user_id)
     return generation
 
 
@@ -518,6 +1484,20 @@ def _require_lark_flow_generation_locked(user_id: str, generation: str) -> str:
     if not expected or state is None or state.get("generation") != expected:
         raise LarkFlowSupersededError("This Lark integration flow was superseded by a newer action.")
     return expected
+
+
+def _require_current_lark_device_code_locked(user_id: str, device_code: str) -> None:
+    """Reject a poll for a device code the flow has already replaced (caller holds the credential lock).
+
+    ``start_lark_auth`` records the digest of the issued code in the flow state
+    on mint success, so a delayed poll for a stale code fails here instead of
+    claiming the flow's single login slot and blocking polls for the current
+    code. A failed reissue mint leaves the previous code's digest in place —
+    the previous flow stays attachable, matching the pre-fence behavior.
+    """
+    state = _read_json_object_file(_lark_flow_state_path(user_id))
+    if state is not None and "device_code_digest" in state and state["device_code_digest"] != _lark_login_code_digest(device_code):
+        raise ValueError("This device_code is no longer the current Lark authorization code. Restart the authorization flow.")
 
 
 def _ensure_managed_sandbox_lark_cli(version: str) -> Path:
@@ -595,14 +1575,14 @@ def _lark_cli_managed_path() -> str | None:
 def lark_cli_env_overlay(user_id: str, *, sandbox_paths: bool = False, broker: bool = False) -> dict[str, str]:
     """Environment overlay for lark-cli using DeerFlow-managed credentials.
 
-    The directories are per-user so a local trusted-mode login cannot bleed
-    across accounts.
+    The directories are per-user so a local trusted-mode login cannot bleed across
+    accounts.
 
-    When ``broker`` is set (Pattern B, issue #4338), the sandbox talks to a
-    broker sidecar that owns the credentials, so the overlay carries only the
-    broker URL and the runtime PATH — never ``LARKSUITE_CLI_CONFIG_DIR`` /
-    ``DATA_DIR``. This keeps the plaintext app secret / OAuth tokens out of the
-    sandbox filesystem entirely. ``broker`` implies ``sandbox_paths``.
+    When ``broker`` is set (Pattern B, issue #4338), the sandbox talks to a broker
+    sidecar that owns the credentials, so the overlay carries only the broker URL
+    and the runtime PATH — never ``LARKSUITE_CLI_CONFIG_DIR`` / ``DATA_DIR``. This
+    keeps the plaintext app secret / OAuth tokens out of the sandbox filesystem
+    entirely. ``broker`` implies ``sandbox_paths``.
     """
     if broker:
         return {
@@ -648,6 +1628,8 @@ def _probe_lark_cli_at_path(path: str) -> LarkCliProbe:
             check=False,
             capture_output=True,
             text=True,
+            encoding=LARK_CLI_SUBPROCESS_ENCODING,
+            errors="replace",
             timeout=5,
         )
     except Exception as exc:  # noqa: BLE001 - probe boundary
@@ -683,6 +1665,8 @@ def probe_lark_auth(user_id: str, *, verify: bool = False) -> LarkAuthProbe:
             check=False,
             capture_output=True,
             text=True,
+            encoding=LARK_CLI_SUBPROCESS_ENCODING,
+            errors="replace",
             timeout=8,
             env=lark_cli_env(user_id),
         )
@@ -732,7 +1716,7 @@ def _resolve_sandbox_runtime_readiness(
     config: AppConfig,
     *,
     probe: bool,
-) -> tuple[str, bool, str | None]:
+) -> tuple[str, bool, str | None, bool]:
     """Resolve the sandbox lark-cli runtime mode and readiness.
 
     Modes:
@@ -748,86 +1732,210 @@ def _resolve_sandbox_runtime_readiness(
       supersedes ``init-container`` when both are available.
 
     ``probe`` gates the (best-effort, short-timeout) provisioner capability call.
+
+    The fourth element reports whether readiness was actually evaluated. It is
+    False only for the unevaluated remote fallback (``probe=False`` with a
+    remote provisioner) and lives next to that branch so the two can never
+    drift apart; every other mode resolves readiness deterministically or via
+    a real probe, so it reports True.
     """
     if not _uses_aio_sandbox(config):
-        return "none", False, "Sandbox does not run lark-cli in this configuration."
+        return "none", False, "Sandbox does not run lark-cli in this configuration.", True
 
     if _uses_remote_provisioner(config):
         if not probe:
-            return "init-container", False, None
+            return "init-container", False, None, False
         caps = _probe_provisioner_capabilities(config)
         if caps is None:
-            return "init-container", False, "Could not reach the provisioner to confirm the lark-cli runtime image."
+            return "init-container", False, "Could not reach the provisioner to confirm the lark-cli runtime image.", True
         # Pattern B (broker) supersedes Pattern A (init-container binary) when
         # the provisioner has a broker image configured.
         if caps["lark_cli_broker_image"]:
-            return "broker", True, None
+            return "broker", True, None, True
         if caps["lark_cli_init_image"]:
-            return "init-container", True, None
-        return "init-container", False, "The provisioner has no lark-cli runtime image configured (LARK_CLI_INIT_IMAGE / LARK_CLI_BROKER_IMAGE)."
+            return "init-container", True, None, True
+        return "init-container", False, "The provisioner has no lark-cli runtime image configured (LARK_CLI_INIT_IMAGE / LARK_CLI_BROKER_IMAGE).", True
 
     # Local AIO: Gateway-download runtime dir.
     runtime_dir = lark_cli_managed_sandbox_dir()
     try:
         _validate_lark_cli_sandbox_runtime(runtime_dir)
     except (ValueError, OSError):
-        return "gateway-download", False, "The managed sandbox lark-cli runtime is not installed."
-    return "gateway-download", True, None
+        return "gateway-download", False, "The managed sandbox lark-cli runtime is not installed.", True
+    return "gateway-download", True, None, True
 
 
+# Machine-readable marker the provisioner attaches to a lark
+# provisioning-config conflict (409/503) so the Gateway drops its cached
+# broker capability observation. Keep in sync with docker/provisioner/app.py.
+PROVISIONER_CAPABILITY_REFRESH_HEADER = "X-DeerFlow-Capability-Refresh"
+PROVISIONER_CAPABILITY_REFRESH_LARK_BROKER = "lark-broker"
 LARK_BROKER_MODE_TTL_SECONDS = 60
 # Negative results (broker not active) are cached longer than positive ones: a
 # non-broker remote-provisioner deployment stays non-broker for the life of the
 # process far more often than it flips on, so this keeps the hot bash path from
 # re-probing every minute. A positive result still refreshes on the shorter TTL.
 LARK_BROKER_MODE_NEGATIVE_TTL_SECONDS = 300
-# Tight probe budget on the per-bash-call hot path: unlike the Settings status
-# probe (5s, user is waiting on a page), this runs inline before a sandbox
-# lark-cli command, so a slow/unreachable provisioner must not add seconds of
-# latency to every first-call-per-TTL for non-broker deployments.
+# Tight admission probe budget, separate from the Settings status probe (5s).
+# Command execution uses the sandbox's attested mode and never probes here.
 LARK_BROKER_MODE_PROBE_TIMEOUT_SECONDS = 1.5
-# Guards the cache attribute on sandbox_lark_broker_active against concurrent
-# bash invocations so the correctness story doesn't rely on idempotent races.
+LARK_BROKER_MODE_PROBE_RETRY_SECONDS = 1.5
+# Only cache/flight bookkeeping holds this lock; HTTP and waiting never do.
 _LARK_BROKER_MODE_CACHE_LOCK = threading.Lock()
+_LARK_BROKER_MODE_PROBES: dict[tuple[str, str], Future[bool]] = {}
 
 
-def sandbox_lark_broker_active(config: AppConfig | None = None) -> bool:
+@dataclass(frozen=True)
+class _LarkBrokerModeCacheEntry:
+    active: bool | None
+    confirmed_at: float
+    retry_after: float = 0.0
+
+
+class LarkBrokerCapabilityUnknownError(RuntimeError):
+    """The provisioner's broker capability could not be confirmed.
+
+    Raised instead of guessing: only a confirmed observation may select
+    credential placement. Callers holding a stronger, Pod-level attestation may
+    catch this and defer the deployment-level decision; everything else fails
+    closed.
+    """
+
+
+def _known_broker_requirement(active: bool | None) -> bool:
+    if active is True:
+        return True
+    raise LarkBrokerCapabilityUnknownError("Provisioner Lark broker capability is unknown; refusing to mount credentials in the sandbox")
+
+
+def _fresh_broker_observation(cached: _LarkBrokerModeCacheEntry, now: float, observed_mode: bool | None) -> bool | None:
+    """Return the still-trustworthy cached observation, or None when a new probe is required.
+
+    A contradictory ``observed_mode`` never receives the cached value: the
+    in-flight or next probe must confirm which mode the provisioner actually runs.
+    """
+    if now < cached.retry_after:
+        return _known_broker_requirement(cached.active)
+    ttl = LARK_BROKER_MODE_TTL_SECONDS if cached.active else LARK_BROKER_MODE_NEGATIVE_TTL_SECONDS
+    if not cached.retry_after and now - cached.confirmed_at < ttl and (observed_mode is None or observed_mode is cached.active):
+        return cached.active
+    return None
+
+
+def sandbox_lark_broker_active(config: AppConfig | None = None, *, observed_mode: bool | None = None) -> bool:
     """Whether sandbox ``lark-cli`` runs in broker mode (Pattern B).
 
-    Cached with a short TTL because it is consulted on every ``lark-cli`` bash
-    call and reads the provisioner capability over HTTP. Broker mode requires a
-    remote provisioner that reports a configured broker image; any other config
-    (local AIO, init-container binary mode, unreachable provisioner) is False, so
-    the caller falls back to the credential-mount overlay.
-
-    The probe uses a tight timeout and negatives are cached longer than positives
-    so a non-broker remote-provisioner deployment does not pay a latency penalty
-    on the bash hot path.
+    Only confirmed capabilities may select credential placement. An unavailable
+    or malformed response is unknown, never a negative observation. Keep a known
+    broker requirement through outages; without one, fail closed. A confirmed
+    non-broker observation is likewise only trusted inside its TTL: once it goes
+    stale, or while a refresh is backing off after a probe failure, admission
+    raises instead of trusting a negative that would mount credentials on a pod
+    whose mode is no longer verified. Execution uses the mode reported for the
+    actual sandbox, rather than probing again. An attested ``observed_mode``
+    contradicting a cached observation forces one shared refresh before
+    admission decides whether the Pod needs replacement.
     """
     if config is None:
-        try:
-            from deerflow.config.app_config import get_app_config
+        from deerflow.config.app_config import get_app_config
 
-            config = get_app_config()
-        except Exception:  # noqa: BLE001 - degrade to non-broker overlay
-            return False
+        config = get_app_config()
 
-    now = time.monotonic()
+    if not (_uses_aio_sandbox(config) and _uses_remote_provisioner(config)):
+        return False
+
+    cache_key = (_sandbox_config_value(config, "provisioner_url").rstrip("/"), _sandbox_config_value(config, "provisioner_api_key"))
+    probe_owner = False
     with _LARK_BROKER_MODE_CACHE_LOCK:
-        cached = getattr(sandbox_lark_broker_active, "_cache", None)
+        cache = getattr(sandbox_lark_broker_active, "_cache", {})
+        sandbox_lark_broker_active._cache = cache  # type: ignore[attr-defined]
+        cached = cache.get(cache_key)
+        flight = _LARK_BROKER_MODE_PROBES.get(cache_key)
+        if flight is None:
+            now = time.monotonic()
+            if cached is not None:
+                fresh = _fresh_broker_observation(cached, now, observed_mode)
+                if fresh is not None:
+                    return fresh
+            flight = Future()
+            _LARK_BROKER_MODE_PROBES[cache_key] = flight
+            probe_owner = True
+
+    if not probe_owner:
         if cached is not None:
-            ts, value = cached
-            ttl = LARK_BROKER_MODE_TTL_SECONDS if value else LARK_BROKER_MODE_NEGATIVE_TTL_SECONDS
-            if now - ts < ttl:
-                return value
+            # A probe another caller started does not invalidate this caller's
+            # still-fresh observation; only a contradictory attestation waits.
+            fresh = _fresh_broker_observation(cached, time.monotonic(), observed_mode)
+            if fresh is not None:
+                return fresh
+        return flight.result()
 
-    active = False
-    if _uses_aio_sandbox(config) and _uses_remote_provisioner(config):
+    try:
+        # One flight per endpoint/auth identity shares success AND failure.
+        # It also orders observations without blocking unrelated endpoints.
         caps = _probe_provisioner_capabilities(config, timeout=LARK_BROKER_MODE_PROBE_TIMEOUT_SECONDS)
-        active = bool(caps and caps["lark_cli_broker_image"])
+        active = caps.get("lark_cli_broker_image") if isinstance(caps, dict) else None
+        now = time.monotonic()
+        if isinstance(active, bool):
+            entry = _LarkBrokerModeCacheEntry(active, now)
+        else:
+            # Backoff is separate from confirmation freshness: failure never
+            # authorizes False or extends a previous observation's TTL.
+            entry = _LarkBrokerModeCacheEntry(
+                cached.active if cached is not None else None,
+                cached.confirmed_at if cached is not None else 0.0,
+                retry_after=now + LARK_BROKER_MODE_PROBE_RETRY_SECONDS,
+            )
+        with _LARK_BROKER_MODE_CACHE_LOCK:
+            cache[cache_key] = entry
+        flight.set_result(active if isinstance(active, bool) else _known_broker_requirement(entry.active))
+    except BaseException as exc:
+        # Publish every outcome so waiters cannot be stranded by an exception.
+        flight.set_exception(exc)
+    finally:
+        with _LARK_BROKER_MODE_CACHE_LOCK:
+            _LARK_BROKER_MODE_PROBES.pop(cache_key, None)
+    return flight.result()
+
+
+def invalidate_cached_lark_broker_mode(provisioner_url: str, api_key: str | None = None) -> None:
+    """Drop the cached broker-mode observation for one provisioner identity.
+
+    The provisioner marks a lark provisioning-config conflict (409/503) with
+    ``PROVISIONER_CAPABILITY_REFRESH_HEADER`` so a deployment change (e.g. the
+    broker image being added or removed) takes effect on the next acquire
+    instead of living out the cache TTL — up to 300s for a confirmed
+    non-broker. Only the cached observation is dropped; an in-flight probe is
+    left alone and repopulates the cache with a fresh observation.
+    """
+    key = (provisioner_url.rstrip("/"), (api_key or "").strip())
     with _LARK_BROKER_MODE_CACHE_LOCK:
-        sandbox_lark_broker_active._cache = (now, active)  # type: ignore[attr-defined]
-    return active
+        cache = getattr(sandbox_lark_broker_active, "_cache", None)
+        if cache:
+            cache.pop(key, None)
+
+
+@dataclass(frozen=True)
+class _LarkCredentialSnapshot:
+    """Credential-derived status fields captured under ``_lark_credential_lock``.
+
+    Mutation endpoints must snapshot these fields in the same critical section
+    that commits the credential change; the slower, credential-independent
+    runtime probe can then run after the lock is released without letting a
+    concurrent app switch or auth flow mix newer credential state (or cleared
+    tokens) into the response for the just-completed mutation.
+    """
+
+    app_config: dict[str, str | bool | None]
+    auth: LarkAuthProbe
+
+
+def _read_lark_credential_snapshot(user_id: str, *, verify_auth: bool) -> _LarkCredentialSnapshot:
+    """Read the credential-derived status fields; call under the credential lock."""
+    return _LarkCredentialSnapshot(
+        app_config=read_lark_app_config(user_id),
+        auth=probe_lark_auth(user_id, verify=verify_auth),
+    )
 
 
 def get_lark_integration_status(
@@ -837,16 +1945,19 @@ def get_lark_integration_status(
     verify_auth: bool = False,
     check_latest: bool = False,
     check_runtime: bool = False,
+    credential_snapshot: _LarkCredentialSnapshot | None = None,
 ) -> LarkIntegrationStatus:
     root = lark_integration_root(user_id)
     manifest = _read_manifest(root)
-    app_config = read_lark_app_config(user_id)
+    if credential_snapshot is None:
+        credential_snapshot = _read_lark_credential_snapshot(user_id, verify_auth=verify_auth)
+    app_config = credential_snapshot.app_config
     installed_skills = tuple(sorted(_installed_lark_skill_names(root)))
     enabled_skills = tuple(sorted(_enabled_lark_skill_names(user_id, config)))
     manifest_version = str(manifest.get("version")) if manifest else None
     cli = probe_lark_cli()
     latest_available = _cached_latest_lark_cli_version() if check_latest else None
-    runtime_mode, runtime_ready, runtime_detail = _resolve_sandbox_runtime_readiness(config, probe=check_runtime)
+    runtime_mode, runtime_ready, runtime_detail, runtime_probed = _resolve_sandbox_runtime_readiness(config, probe=check_runtime)
     return LarkIntegrationStatus(
         installed=bool(manifest) and "lark-shared" in installed_skills,
         version=manifest_version or FALLBACK_LARK_CLI_VERSION,
@@ -862,10 +1973,36 @@ def get_lark_integration_status(
         enabled_skills=enabled_skills,
         install_path=str(root),
         cli=cli,
-        auth=probe_lark_auth(user_id, verify=verify_auth),
+        auth=credential_snapshot.auth,
         sandbox_runtime_mode=runtime_mode,
+        sandbox_runtime_probed=runtime_probed,
         sandbox_runtime_ready=runtime_ready,
         sandbox_runtime_detail=runtime_detail,
+    )
+
+
+def _get_lark_mutation_status(
+    user_id: str,
+    config: AppConfig,
+    *,
+    verify_auth: bool = False,
+    credential_snapshot: _LarkCredentialSnapshot | None = None,
+) -> LarkIntegrationStatus:
+    """Build a mutation response with the same runtime probe used by the GET route.
+
+    Pass ``credential_snapshot`` (captured under ``_lark_credential_lock`` right
+    after the mutation) so the credential-derived fields stay tied to the
+    committed change while the independent runtime probe runs unlocked; without
+    it, a concurrent app switch or auth flow landing during that probe could
+    clear the new tokens or mix a newer ``app_id``/auth state into this
+    response.
+    """
+    return get_lark_integration_status(
+        user_id,
+        config,
+        verify_auth=verify_auth,
+        check_runtime=True,
+        credential_snapshot=credential_snapshot,
     )
 
 
@@ -971,7 +2108,17 @@ def install_lark_integration(
         sandbox_version = str(installed_manifest.get("version") or resolved_version or FALLBACK_LARK_CLI_VERSION)
         _ensure_managed_sandbox_lark_cli(sandbox_version)
 
-    status = get_lark_integration_status(user_id, config)
+    # Install does not change credentials, but it shares the mutation-status
+    # discipline: snapshot the credential-derived fields under the credential
+    # lock so a concurrent app switch or auth flow landing during the unlocked
+    # runtime probe cannot mix newer credential state into this response. The
+    # snapshot's auth probe runs `lark-cli auth status` as a subprocess
+    # (worst case its 8s timeout), so a concurrent same-user mutation may now
+    # wait on the lock for that duration — an accepted trade-off since install
+    # itself never mutates credentials.
+    with _lark_credential_lock(user_id):
+        credential_snapshot = _read_lark_credential_snapshot(user_id, verify_auth=False)
+    status = _get_lark_mutation_status(user_id, config, credential_snapshot=credential_snapshot)
     content_changed = previous_content_sha is not None and previous_content_sha != content_sha
     message = f"Installed {len(installed_skills)} Lark/Feishu skills."
     if content_changed:
@@ -1011,9 +2158,8 @@ def _probe_provisioner_capabilities(config: AppConfig, *, timeout: float = 5.0) 
 
     Returns the capability dict when the provisioner answers, or None when it
     can't be reached. Used both for the status readiness signal and to select
-    broker vs. binary mode on the bash hot path; failures degrade to "not
-    ready"/"not broker" rather than raising. ``timeout`` is caller-tunable so the
-    per-bash-call probe can use a tighter budget than the Settings status probe.
+    broker vs. binary mode when provisioning. Failures mean unknown; status
+    callers can report "not ready", while provisioning must fail closed.
     """
     base = _sandbox_config_value(config, "provisioner_url")
     if not base:
@@ -1025,11 +2171,11 @@ def _probe_provisioner_capabilities(config: AppConfig, *, timeout: float = 5.0) 
         request = urllib.request.Request(url, headers={"User-Agent": "deer-flow", **headers})
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
-        if not isinstance(payload, dict):
+        if not isinstance(payload, dict) or any(not isinstance(payload.get(key), bool) for key in ("lark_cli_init_image", "lark_cli_broker_image")):
             return None
         return {
-            "lark_cli_init_image": bool(payload.get("lark_cli_init_image")),
-            "lark_cli_broker_image": bool(payload.get("lark_cli_broker_image")),
+            "lark_cli_init_image": payload["lark_cli_init_image"],
+            "lark_cli_broker_image": payload["lark_cli_broker_image"],
         }
     except Exception:
         return None
@@ -1106,7 +2252,8 @@ def complete_lark_config(
             app_secret=app_secret,
             brand=final_brand,
         )
-        status = get_lark_integration_status(user_id, config)
+        credential_snapshot = _read_lark_credential_snapshot(user_id, verify_auth=False)
+    status = _get_lark_mutation_status(user_id, config, credential_snapshot=credential_snapshot)
     return LarkConfigCompleteResult(
         success=True,
         status=status,
@@ -1143,13 +2290,572 @@ def set_lark_app_credentials(
             app_secret=app_secret,
             brand=parsed_brand,
         )
-        status = get_lark_integration_status(user_id, config)
+        credential_snapshot = _read_lark_credential_snapshot(user_id, verify_auth=False)
+    status = _get_lark_mutation_status(user_id, config, credential_snapshot=credential_snapshot)
     return LarkConfigCompleteResult(
         success=True,
         status=status,
         message="Lark/Feishu app switched. Reconnect to authorize the new app.",
         generation=generation,
     )
+
+
+# Single-flight device-login runs.
+#
+# ``lark-cli auth login --device-code`` performs a non-atomic transaction:
+# poll the IdP, redeem the device code, fetch user info, then persist the
+# credentials. Redeeming is externally visible and irreversible (the code is
+# single-use), so killing the process mid-transaction strands the flow: the
+# code is consumed but nothing was saved, and a retry with the same code fails
+# with ``device_code is invalid``. The process lifecycle is therefore owned by
+# the flow generation — one shared background run per ``(user_id,
+# generation)`` that polls attach to — and never by an HTTP request's wait
+# budget.
+#
+# ``GATEWAY_WORKERS > 1`` has no request affinity, so the same single-flight is
+# mirrored onto the filesystem: the owner records its CLI in a per-generation
+# marker file and publishes the outcome in a result file (first writer wins)
+# before removing the marker. Polls landing on a non-owner worker wait on
+# those files instead of spawning a second CLI, and supersession terminates
+# the marker's CLI, so a login owned by one worker cannot keep writing
+# credentials after another worker replaced the flow.
+
+# A login attempt is only terminated by the flow lifecycle (superseding
+# generation, device-code reissue, or test teardown) or by this reaper bound,
+# which comfortably covers the device code's server-side lifetime.
+_LARK_LOGIN_ATTEMPT_MAX_SECONDS = 600
+
+# Bound an unpublished result after the CLI is first observed to have exited.
+# Login duration itself must never consume this publication grace.
+_LARK_LOGIN_OWNER_ALIVE_GRACE_SECONDS = 10.0
+
+# A finished run's outcome stays attachable briefly so late/duplicate polls
+# return the same result instead of re-consuming an already-redeemed code.
+_LARK_LOGIN_RUN_RETENTION_SECONDS = 120.0
+
+_LARK_LOGIN_WAIT_TIMEOUT_MESSAGE = "Timed out waiting for Lark/Feishu authorization. Complete authorization in the browser, then try again."
+_LARK_LOGIN_RESULT_UNAVAILABLE_MESSAGE = "The Lark authorization attempt ended without a durable result. Restart the authorization flow."
+
+# Poll cadence for waiters attached to a login run owned by another worker.
+_LARK_LOGIN_FOREIGN_POLL_SECONDS = 0.2
+
+_LARK_LOGIN_OUTCOME_PENDING = object()
+
+_LARK_LOGIN_RUNS: dict[tuple[str, str], _LarkLoginRun] = {}
+_LARK_LOGIN_RUNS_LOCK = threading.Lock()
+
+
+class _LarkLoginRun:
+    """One device-login CLI execution owned by its flow generation."""
+
+    def __init__(self, user_id: str, generation: str, device_code: str) -> None:
+        self.user_id = user_id
+        self.generation = generation
+        self.device_code = device_code
+        self.done = threading.Event()
+        # Serializes outcome publication: supersession takes the lock and wins
+        # deterministically once it has fired, even over a completed outcome.
+        self.outcome_lock = threading.Lock()
+        self.outcome: dict[str, Any] | BaseException | object = _LARK_LOGIN_OUTCOME_PENDING
+        self.process: subprocess.Popen[str] | None = None
+        self.thread: threading.Thread | None = None
+        self.finished_at: float | None = None
+
+
+class _ForeignLarkLoginRun:
+    """A login run owned by another Gateway worker, tracked via its marker file."""
+
+    def __init__(self, user_id: str, generation: str, device_code: str) -> None:
+        self.user_id = user_id
+        self.generation = generation
+        self.device_code = device_code
+
+
+def _lark_login_code_digest(device_code: str) -> str:
+    """Stable non-secret fingerprint of a device code for markers and the fence."""
+    return hashlib.sha256(device_code.encode("utf-8")).hexdigest()[:16]
+
+
+def _lark_login_marker_path(user_id: str, generation: str, device_code_digest: str) -> Path:
+    return _lark_cli_credential_root(user_id) / f".login-run-{generation}-{device_code_digest}.json"
+
+
+def _lark_login_result_path(user_id: str, generation: str, device_code_digest: str) -> Path:
+    return _lark_cli_credential_root(user_id) / f".login-result-{generation}-{device_code_digest}.json"
+
+
+def _pid_alive(pid: int | None) -> bool:
+    if pid is None:
+        return False
+    if os.name == "nt":  # pragma: no cover - Windows fallback
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _terminate_pid(pid: int | None) -> None:
+    if pid is None:
+        return
+    if os.name == "nt":  # pragma: no cover - Windows fallback
+        with suppress(OSError):
+            kernel32 = ctypes.windll.kernel32
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            handle = kernel32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+            if handle:
+                kernel32.TerminateProcess(handle, 1)
+                kernel32.CloseHandle(handle)
+        return
+    # POSIX: the login CLI is its own session/group leader, so kill the whole
+    # group — but only while the pid still matches that shape. Between the
+    # owner reaping the CLI and the marker sweep, the pid can be recycled; a
+    # recycled pid that landed in this worker's own group (any plain
+    # subprocess child) must never be group-killed.
+    with suppress(OSError):
+        if _pid_alive(pid) and os.getpgid(pid) == pid:
+            os.killpg(pid, signal.SIGKILL)
+
+
+def _write_lark_login_marker_locked(user_id: str, run: _LarkLoginRun) -> None:
+    ensure_lark_cli_credential_tree(user_id)
+    cli_pid = run.process.pid if run.process is not None else None
+    payload = {
+        "generation": run.generation,
+        "device_code_digest": _lark_login_code_digest(run.device_code),
+        "cli_pid": cli_pid if isinstance(cli_pid, int) else None,
+        "owner_pid": os.getpid(),
+        "created_at": time.time(),
+    }
+    _write_json_file_atomic(_lark_login_marker_path(run.user_id, run.generation, payload["device_code_digest"]), payload)
+
+
+def _read_live_lark_login_marker_locked(user_id: str, generation: str, device_code: str) -> dict[str, Any] | None:
+    """Return an attachable marker, rejecting an abandoned attempt (credential lock held).
+
+    CLI exit alone does not end ownership: the owner still has to re-harden the
+    credential tree and publish the result before the marker may be swept. A
+    marker whose CLI is dead but whose owner is alive with no result published
+    is still live, so a foreign poll in that exit-to-publication window waits
+    instead of spawning a second login for the same device code.
+    """
+    digest = _lark_login_code_digest(device_code)
+    path = _lark_login_marker_path(user_id, generation, digest)
+    marker = _read_json_object_file(path)
+    if marker is None:
+        return None
+    if isinstance(marker.get("outcome"), dict):
+        return marker
+    cli_pid = marker.get("cli_pid")
+    owner_pid = marker.get("owner_pid")
+    cli_alive = _pid_alive(cli_pid) if isinstance(cli_pid, int) else False
+    owner_alive = _pid_alive(owner_pid) if isinstance(owner_pid, int) else False
+    created_at = marker.get("created_at")
+    fresh = isinstance(created_at, (int, float)) and time.time() - created_at <= _LARK_LOGIN_ATTEMPT_MAX_SECONDS
+    result_published = _lark_login_result_path(user_id, generation, digest).is_file()
+    if result_published:
+        return marker
+    if cli_alive and owner_alive and fresh:
+        return marker
+    if owner_alive and not cli_alive:
+        exit_observed_at = marker.get("cli_exit_observed_at")
+        if not isinstance(exit_observed_at, (int, float)):
+            # The credential lock serializes peers establishing this deadline.
+            marker["cli_exit_observed_at"] = time.time()
+            ensure_lark_cli_credential_tree(user_id)
+            _write_json_file_atomic(path, marker)
+            return marker
+        if time.time() - exit_observed_at <= _LARK_LOGIN_OWNER_ALIVE_GRACE_SECONDS:
+            return marker
+    if cli_alive:
+        _terminate_pid(cli_pid)
+    # A dead attempt may have redeemed its single-use code. Keep the marker
+    # until supersession so another poll cannot silently retry that code.
+    raise ValueError(_LARK_LOGIN_RESULT_UNAVAILABLE_MESSAGE)
+
+
+def _write_lark_login_result_once(user_id: str, generation: str, device_code_digest: str, payload: dict[str, Any]) -> bool:
+    """Publish atomically if absent; caller holds the cross-worker credential lock."""
+    ensure_lark_cli_credential_tree(user_id)
+    path = _lark_login_result_path(user_id, generation, device_code_digest)
+    if path.exists():
+        return False
+    _write_json_file_atomic(path, payload)
+    return True
+
+
+def _publish_lark_login_outcome_locked(user_id: str, generation: str, digest: str, outcome: dict[str, Any] | BaseException) -> dict[str, Any] | BaseException:
+    """Publish or retain a terminal failure without abandoning cleanup (credential lock held)."""
+    result_path = _lark_login_result_path(user_id, generation, digest)
+    marker_path = _lark_login_marker_path(user_id, generation, digest)
+    marker = _read_json_object_file(marker_path) or {"generation": generation, "device_code_digest": digest}
+    previous = marker.get("outcome")
+    if isinstance(previous, dict) and not isinstance(outcome, LarkFlowSupersededError):
+        outcome = _lark_login_outcome_from_payload(previous, fallback=outcome)
+    try:
+        _write_lark_login_result_once(user_id, generation, digest, _lark_login_result_payload(outcome))
+    except Exception:
+        logger.exception("Failed to publish the Lark login result.")
+    published = _read_json_object_file(result_path)
+    if published is not None:
+        outcome = _lark_login_outcome_from_payload(published, fallback=outcome)
+        try:
+            marker_path.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("Failed to remove a finished Lark login marker.")
+        return outcome
+
+    # A result write may fail after the CLI already redeemed the code. Retain
+    # a terminal receipt on the existing marker instead of exposing an empty
+    # slot that another worker could fill with a second CLI.
+    if not isinstance(outcome, LarkFlowSupersededError):
+        outcome = ValueError(_LARK_LOGIN_RESULT_UNAVAILABLE_MESSAGE)
+    if isinstance(previous, dict) and not isinstance(outcome, LarkFlowSupersededError):
+        return _lark_login_outcome_from_payload(previous, fallback=outcome)
+    marker["outcome"] = _lark_login_result_payload(outcome)
+    try:
+        ensure_lark_cli_credential_tree(user_id)
+        _write_json_file_atomic(marker_path, marker)
+    except Exception:
+        # If even the fallback cannot be written, the original marker still
+        # prevents respawning; its exit-observation grace bounds foreign waits.
+        logger.exception("Failed to retain the Lark login failure on its marker.")
+    return outcome
+
+
+def _lark_login_result_payload(outcome: dict[str, Any] | BaseException) -> dict[str, Any]:
+    if isinstance(outcome, dict):
+        return {"ok": True}
+    if isinstance(outcome, LarkFlowSupersededError):
+        return {"ok": False, "kind": "superseded", "error": str(outcome)}
+    if isinstance(outcome, TimeoutError):
+        return {"ok": False, "kind": "timeout", "error": str(outcome)}
+    return {"ok": False, "kind": "value", "error": str(outcome)}
+
+
+def _lark_login_outcome_from_payload(payload: dict[str, Any], *, fallback: dict[str, Any] | BaseException) -> dict[str, Any] | BaseException:
+    if payload.get("ok"):
+        return fallback if isinstance(fallback, dict) else {}
+    kind = payload.get("kind")
+    message = str(payload.get("error") or "Lark authorization failed.")
+    if kind == "superseded":
+        return LarkFlowSupersededError(message)
+    if kind == "timeout":
+        return TimeoutError(message)
+    return ValueError(message)
+
+
+def _await_lark_login_result(user_id: str, generation: str, device_code: str, wait_timeout_seconds: int) -> dict[str, Any]:
+    """Wait for a login run owned by another worker to publish its outcome."""
+    deadline = time.monotonic() + wait_timeout_seconds
+    marker_path = _lark_login_marker_path(user_id, generation, _lark_login_code_digest(device_code))
+    result_path = _lark_login_result_path(user_id, generation, _lark_login_code_digest(device_code))
+    while True:
+        payload = _read_json_object_file(result_path)
+        if payload is not None:
+            return payload
+        marker = _read_json_object_file(marker_path)
+        if marker is None:
+            # The owner publishes before removing its marker; re-read to
+            # cover publication between the first read and marker removal.
+            return _read_json_object_file(result_path) or {"ok": False, "kind": "value", "error": _LARK_LOGIN_RESULT_UNAVAILABLE_MESSAGE}
+        terminal = marker.get("outcome")
+        if isinstance(terminal, dict):
+            return terminal
+        with _lark_credential_lock(user_id):
+            _read_live_lark_login_marker_locked(user_id, generation, device_code)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(_LARK_LOGIN_WAIT_TIMEOUT_MESSAGE)
+        time.sleep(min(_LARK_LOGIN_FOREIGN_POLL_SECONDS, remaining))
+
+
+def _reraise_lark_login_outcome(outcome: BaseException) -> None:
+    """Re-raise a run outcome as a fresh instance for this waiter.
+
+    Raising the shared instance would append every waiter's raise site to one
+    ``__traceback__`` (the frontend polls several times within the retention
+    window, from different threads) and let one handler's mutation of the
+    exception leak into the others. The shared instance stays as ``__cause__``.
+    """
+    try:
+        fresh = type(outcome)(str(outcome))
+    except Exception:
+        fresh = ValueError(str(outcome))
+    raise fresh from outcome
+
+
+def _spawn_lark_login_process(args: list[str], *, user_id: str) -> subprocess.Popen[str]:
+    """Process factory for the backgrounded device-login CLI (test seam).
+
+    The CLI runs in its own process group/session so lifecycle termination
+    (supersession, reaper) fences wrapper children as well, not only the
+    direct process.
+    """
+    group_kwargs: dict[str, Any] = {}
+    if os.name == "nt":  # pragma: no cover - Windows fallback
+        group_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        group_kwargs["start_new_session"] = True
+    return subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding=LARK_CLI_SUBPROCESS_ENCODING,
+        errors="replace",
+        env=lark_cli_env(user_id),
+        **group_kwargs,
+    )
+
+
+def _lark_login_run_worker(run: _LarkLoginRun) -> None:
+    process = run.process
+    assert process is not None
+    outcome: dict[str, Any] | BaseException
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=_LARK_LOGIN_ATTEMPT_MAX_SECONDS)
+        except subprocess.TimeoutExpired:
+            pid = process.pid if isinstance(process.pid, int) else None
+            if pid is not None:
+                _terminate_pid(pid)
+            else:
+                with suppress(OSError):
+                    process.kill()
+            process.communicate()
+            outcome = TimeoutError(_LARK_LOGIN_WAIT_TIMEOUT_MESSAGE)
+        else:
+            try:
+                outcome = _lark_cli_json_result(process.returncode, stdout, stderr, allow_empty_success=True)
+            except BaseException as exc:
+                outcome = exc
+    except BaseException as exc:
+        outcome = exc
+    try:
+        # Mirror ``_run_lark_cli_json``: re-harden any plaintext token files
+        # the CLI wrote before the run is observable as finished.
+        try:
+            ensure_lark_cli_credential_tree(run.user_id)
+        except Exception as hardening_exc:
+            logger.exception("Failed to re-harden the Lark credential tree after a device login attempt.")
+            if isinstance(outcome, dict):
+                outcome = hardening_exc
+        with _lark_credential_lock(run.user_id):
+            outcome = _publish_lark_login_outcome_locked(run.user_id, run.generation, _lark_login_code_digest(run.device_code), outcome)
+    except Exception:
+        logger.exception("Failed to finalize the Lark login attempt.")
+        outcome = ValueError(_LARK_LOGIN_RESULT_UNAVAILABLE_MESSAGE)
+    finally:
+        with run.outcome_lock:
+            if run.outcome is _LARK_LOGIN_OUTCOME_PENDING:
+                run.outcome = outcome
+            run.finished_at = time.monotonic()
+            run.done.set()
+
+
+def _prune_lark_login_runs_locked() -> None:
+    now = time.monotonic()
+    for key, run in list(_LARK_LOGIN_RUNS.items()):
+        if run.done.is_set() and run.finished_at is not None and now - run.finished_at > _LARK_LOGIN_RUN_RETENTION_SECONDS:
+            _LARK_LOGIN_RUNS.pop(key, None)
+
+
+def _prune_lark_login_files_locked(user_id: str) -> None:
+    """Drop expired cross-worker result files (caller holds the credential lock)."""
+    root = _lark_cli_credential_root(user_id)
+    now = time.time()
+    for path in root.glob(".login-result-*.json"):
+        with suppress(OSError):
+            if now - path.stat().st_mtime > _LARK_LOGIN_RUN_RETENTION_SECONDS:
+                path.unlink()
+
+
+def _require_matching_device_code(run: _LarkLoginRun, device_code: str) -> None:
+    if run.device_code != device_code:
+        raise ValueError("The provided device_code does not match the in-flight Lark authorization flow.")
+
+
+def _lark_login_run_is_stale(run: _LarkLoginRun) -> bool:
+    """Whether the flow's shared state has moved past this run's device code.
+
+    The registry is process-local, but ``start_lark_auth`` may be served by a
+    different worker: a reissue updates the shared code digest and sweeps the
+    marker without touching this worker's registry. A cached entry must be
+    revalidated against the shared state before it can reject or satisfy a
+    poll. Reads are safe without the credential lock — state writes are atomic.
+    """
+    state = _read_json_object_file(_lark_flow_state_path(run.user_id))
+    digest = state.get("device_code_digest") if state else None
+    return isinstance(digest, str) and digest != _lark_login_code_digest(run.device_code)
+
+
+def _evict_stale_lark_login_run_locked(run: _LarkLoginRun) -> None:
+    """Drop a stale registry entry: fence its files, terminate its run, wake waiters as superseded."""
+    with _LARK_LOGIN_RUNS_LOCK:
+        _LARK_LOGIN_RUNS.pop((run.user_id, run.generation), None)
+    # Publish + sweep idempotently: the cross-worker abandon normally did this
+    # already, and first-writer-wins keeps a raced worker publication intact.
+    digest = _lark_login_code_digest(run.device_code)
+    _publish_lark_login_outcome_locked(run.user_id, run.generation, digest, LarkFlowSupersededError("This Lark integration flow was superseded by a newer action."))
+    process = run.process
+    if process is not None and process.poll() is None:
+        pid = getattr(process, "pid", None)
+        if isinstance(pid, int):
+            _terminate_pid(pid)
+        else:
+            with suppress(OSError):
+                process.kill()
+    with run.outcome_lock:
+        run.outcome = LarkFlowSupersededError("This Lark integration flow was superseded by a newer action.")
+        if run.finished_at is None:
+            run.finished_at = time.monotonic()
+        run.done.set()
+
+
+def _get_or_start_lark_login_run(user_id: str, *, generation: str, device_code: str) -> _LarkLoginRun | _ForeignLarkLoginRun:
+    """Return the single login run for this flow, spawning it on first poll.
+
+    Every later poll for the same ``(user_id, generation)`` attaches to the
+    shared run — in-process through the registry, cross-worker through the
+    marker/result files. Spawning holds the credential lock so the generation
+    and device-code checks, the CLI launch, the marker write and the registry
+    insert stay atomic with respect to flow supersession (which takes the same
+    lock before abandoning runs).
+    """
+    key = (user_id, generation)
+    with _LARK_LOGIN_RUNS_LOCK:
+        _prune_lark_login_runs_locked()
+        existing = _LARK_LOGIN_RUNS.get(key)
+        if existing is not None and not _lark_login_run_is_stale(existing):
+            _require_matching_device_code(existing, device_code)
+            return existing
+
+    with _lark_credential_lock(user_id):
+        _require_lark_flow_generation_locked(user_id, generation)
+        _require_current_lark_device_code_locked(user_id, device_code)
+        path = _require_lark_cli_path()
+        stale = None
+        with _LARK_LOGIN_RUNS_LOCK:
+            existing = _LARK_LOGIN_RUNS.get(key)
+            if existing is not None:
+                if _lark_login_run_is_stale(existing):
+                    stale = existing
+                else:
+                    _require_matching_device_code(existing, device_code)
+                    return existing
+        if stale is not None:
+            _evict_stale_lark_login_run_locked(stale)
+        _prune_lark_login_files_locked(user_id)
+        if _lark_login_result_path(user_id, generation, _lark_login_code_digest(device_code)).is_file() or _read_live_lark_login_marker_locked(user_id, generation, device_code) is not None:
+            # Another Gateway worker owns (or just finished) this run.
+            return _ForeignLarkLoginRun(user_id, generation, device_code)
+        run = _LarkLoginRun(user_id, generation, device_code)
+        args = [path, "auth", "login", "--device-code", device_code, "--json"]
+        run.thread = threading.Thread(target=_lark_login_run_worker, args=(run,), name=f"lark-login-{generation[:8]}", daemon=True)
+        try:
+            # Reserve shared storage before starting an irreversible device
+            # login, then record its pid before exposing it to local waiters.
+            _write_lark_login_marker_locked(user_id, run)
+            run.process = _spawn_lark_login_process(args, user_id=user_id)
+            _write_lark_login_marker_locked(user_id, run)
+            with _LARK_LOGIN_RUNS_LOCK:
+                _LARK_LOGIN_RUNS[key] = run
+            run.thread.start()
+        except BaseException as exc:
+            process = run.process
+            if process is not None:
+                try:
+                    if process.poll() is None:
+                        pid = getattr(process, "pid", None)
+                        if isinstance(pid, int):
+                            _terminate_pid(pid)
+                        process.kill()
+                    if not run.thread.is_alive():
+                        process.communicate(timeout=10)
+                except Exception:
+                    logger.exception("Failed to reap a Lark login whose startup failed.")
+            try:
+                _publish_lark_login_outcome_locked(user_id, generation, _lark_login_code_digest(device_code), exc)
+            finally:
+                with _LARK_LOGIN_RUNS_LOCK:
+                    _LARK_LOGIN_RUNS.pop(key, None)
+                with run.outcome_lock:
+                    run.outcome = exc
+                    run.finished_at = time.monotonic()
+                    run.done.set()
+            raise
+        return run
+
+
+def _abandon_lark_login_runs(user_id: str) -> None:
+    """Terminate every login run for ``user_id`` and wake its waiters as superseded.
+
+    Covers both this process's registry and CLI runs owned by other Gateway
+    workers (via their marker files), so a flow switch on any worker fences
+    credential writes for the lifetime of every login.
+    """
+    with _LARK_LOGIN_RUNS_LOCK:
+        victims = [run for run in _LARK_LOGIN_RUNS.values() if run.user_id == user_id]
+        for run in victims:
+            _LARK_LOGIN_RUNS.pop((run.user_id, run.generation), None)
+    # Publish "superseded" before killing so the owner's worker keeps it over
+    # the killed CLI's exit error (first writer wins).
+    root = _lark_cli_credential_root(user_id)
+    for marker_path in root.glob(".login-run-*.json"):
+        marker = _read_json_object_file(marker_path)
+        if marker is None:
+            marker_path.unlink(missing_ok=True)
+            continue
+        generation = str(marker.get("generation") or "")
+        device_code_digest = str(marker.get("device_code_digest") or "")
+        if generation and device_code_digest:
+            _publish_lark_login_outcome_locked(user_id, generation, device_code_digest, LarkFlowSupersededError("This Lark integration flow was superseded by a newer action."))
+        cli_pid = marker.get("cli_pid")
+        _terminate_pid(cli_pid if isinstance(cli_pid, int) else None)
+    for run in victims:
+        process = run.process
+        if process is not None and process.poll() is None:
+            pid = getattr(process, "pid", None)
+            if isinstance(pid, int):
+                _terminate_pid(pid)
+            else:
+                with suppress(OSError):
+                    process.kill()
+        with run.outcome_lock:
+            # Supersession wins deterministically once fired — even over a
+            # completed outcome the worker published first.
+            run.outcome = LarkFlowSupersededError("This Lark integration flow was superseded by a newer action.")
+            if run.finished_at is None:
+                run.finished_at = time.monotonic()
+            run.done.set()
+
+
+def _clear_lark_login_runs_for_tests() -> None:
+    """Kill and reap every tracked login run; used by test teardown only."""
+    with _LARK_LOGIN_RUNS_LOCK:
+        runs = list(_LARK_LOGIN_RUNS.values())
+        _LARK_LOGIN_RUNS.clear()
+    for run in runs:
+        process = run.process
+        if process is not None and process.poll() is None:
+            with suppress(OSError):
+                process.kill()
+        run.done.set()
+        if run.thread is not None:
+            run.thread.join(timeout=10)
 
 
 def start_lark_auth(
@@ -1186,6 +2892,13 @@ def start_lark_auth(
         device_code = str(data.get("device_code") or "").strip()
         if not verification_url or not device_code:
             raise ValueError("lark-cli did not return a verification_url and device_code.")
+        # Fence the flow to the freshly issued code only on mint success: a
+        # failed reissue leaves the previous code attachable (base behavior),
+        # while a delayed poll for a replaced code can never claim the slot.
+        _write_lark_flow_generation_locked(user_id, generation, device_code=device_code)
+        # A freshly issued device code replaces any in-flight login run that
+        # is still polling a previous code for this flow.
+        _abandon_lark_login_runs(user_id)
 
     return LarkAuthStartResult(
         verification_url=verification_url,
@@ -1205,23 +2918,38 @@ def complete_lark_auth(
     generation: str,
     wait_timeout_seconds: int = LARK_AUTH_COMPLETE_DEFAULT_WAIT_SECONDS,
 ) -> LarkAuthCompleteResult:
-    """Complete a Lark device authorization flow after the user approves it."""
+    """Complete a Lark device authorization flow after the user approves it.
+
+    The first poll spawns the device-login CLI once per flow; every later
+    poll attaches to that shared run. ``wait_timeout_seconds`` only bounds
+    how long this call waits for the run — it never terminates the CLI, so a
+    timed-out poll cannot strand a half-completed login (device code redeemed
+    at the IdP but credentials not yet persisted).
+    """
     device_code = device_code.strip()
     if not device_code:
         raise ValueError("device_code is required.")
     if not LARK_AUTH_COMPLETE_MIN_WAIT_SECONDS <= wait_timeout_seconds <= LARK_AUTH_COMPLETE_MAX_WAIT_SECONDS:
         raise ValueError(f"wait_timeout_seconds must be between {LARK_AUTH_COMPLETE_MIN_WAIT_SECONDS} and {LARK_AUTH_COMPLETE_MAX_WAIT_SECONDS}.")
 
+    run = _get_or_start_lark_login_run(user_id, generation=generation, device_code=device_code)
+    if isinstance(run, _ForeignLarkLoginRun):
+        payload = _await_lark_login_result(user_id, generation, device_code, wait_timeout_seconds)
+        if not payload.get("ok"):
+            raise _lark_login_outcome_from_payload(payload, fallback={})
+    else:
+        if not run.done.wait(timeout=wait_timeout_seconds):
+            raise TimeoutError(_LARK_LOGIN_WAIT_TIMEOUT_MESSAGE)
+        outcome = run.outcome
+        if outcome is _LARK_LOGIN_OUTCOME_PENDING:
+            raise TimeoutError(_LARK_LOGIN_WAIT_TIMEOUT_MESSAGE)
+        if isinstance(outcome, BaseException):
+            _reraise_lark_login_outcome(outcome)
+
     with _lark_credential_lock(user_id):
         _require_lark_flow_generation_locked(user_id, generation)
-        path = _require_lark_cli_path()
-        _run_lark_cli_json(
-            [path, "auth", "login", "--device-code", device_code, "--json"],
-            user_id=user_id,
-            timeout=wait_timeout_seconds,
-            allow_empty_success=True,
-        )
-        status = get_lark_integration_status(user_id, config, verify_auth=True)
+        credential_snapshot = _read_lark_credential_snapshot(user_id, verify_auth=True)
+    status = _get_lark_mutation_status(user_id, config, verify_auth=True, credential_snapshot=credential_snapshot)
     return LarkAuthCompleteResult(
         success=status.auth.status == "authenticated",
         status=status,
@@ -1288,6 +3016,8 @@ def _install_managed_gateway_lark_cli(version: str) -> LarkCliProbe:
         check=False,
         capture_output=True,
         text=True,
+        encoding=LARK_CLI_SUBPROCESS_ENCODING,
+        errors="replace",
         timeout=LARK_CLI_NPM_INSTALL_TIMEOUT_SECONDS,
         env={**os.environ, "npm_config_update_notifier": "false"},
     )
@@ -1440,6 +3170,8 @@ def _run_lark_config_init(*, app_id: str, app_secret: str, brand: str, env: dict
             check=False,
             capture_output=True,
             text=True,
+            encoding=LARK_CLI_SUBPROCESS_ENCODING,
+            errors="replace",
             timeout=15,
             env=env,
         )
@@ -1466,12 +3198,11 @@ def _save_lark_app_config_with_cli(user_id: str, *, app_id: str, app_secret: str
 
 def _validate_lark_app_credentials_with_cli(*, app_id: str, app_secret: str, brand: str) -> None:
     """Validate credentials through config init's live tenant-token probe."""
-    with tempfile.TemporaryDirectory(prefix=".validating-lark-app-") as temp_dir:
-        root = Path(temp_dir)
+    with _private_lark_temp_dir(prefix=".validating-lark-app-") as root:
         config_dir = root / "config"
         data_dir = root / "data"
-        config_dir.mkdir(mode=0o700)
-        data_dir.mkdir(mode=0o700)
+        _mkdir_under_private_boundary(config_dir)
+        _mkdir_under_private_boundary(data_dir)
         _run_lark_config_init(
             app_id=app_id,
             app_secret=app_secret,
@@ -1484,8 +3215,8 @@ def _replace_lark_app_credentials_locked(user_id: str, *, app_id: str, app_secre
     ensure_lark_cli_credential_tree(user_id)
     root = _lark_cli_credential_root(user_id)
     with _lark_credential_transaction(user_id, root) as snapshot:
-        _save_lark_app_config_with_cli(user_id, app_id=app_id, app_secret=app_secret, brand=brand)
         _clear_directory_contents(lark_cli_data_dir(user_id))
+        _save_lark_app_config_with_cli(user_id, app_id=app_id, app_secret=app_secret, brand=brand)
         _revoke_lark_auth_from_snapshot(snapshot)
 
 
@@ -1502,10 +3233,21 @@ def _clear_directory_contents(directory: Path) -> None:
 
 @contextmanager
 def _lark_credential_transaction(user_id: str, root: Path):
-    """Restore the active credential tree if a switch step fails."""
-    with tempfile.TemporaryDirectory(prefix=".switching-lark-app-", dir=str(root.parent)) as temp_dir:
-        snapshot = Path(temp_dir) / "credentials"
-        shutil.copytree(root, snapshot, symlinks=False)
+    """Copy the active credential tree to a snapshot and restore on failure.
+
+    The snapshot lives beneath the already-hardened credential *root* (owner-only) rather
+    than under the per-user parent namespace that a local principal could mutate, so a
+    pathname swap cannot redirect the snapshot to an external location. Only ``config`` and
+    ``data`` are snapshotted, keeping both the copy source and destination inside the
+    owner-only root.
+    """
+    ensure_lark_cli_credential_tree(user_id)
+    with _private_lark_temp_dir(prefix=".switching-lark-app-", dir=root) as temp_root:
+        snapshot = temp_root / "credentials"
+        _mkdir_under_private_boundary(snapshot)
+        _establish_private_directory_boundary(snapshot)
+        for name in ("config", "data"):
+            shutil.copytree(root / name, snapshot / name, dirs_exist_ok=True, symlinks=False)
         try:
             yield snapshot
         except Exception:
@@ -1532,6 +3274,8 @@ def _revoke_lark_auth_from_snapshot(snapshot: Path) -> None:
             check=False,
             capture_output=True,
             text=True,
+            encoding=LARK_CLI_SUBPROCESS_ENCODING,
+            errors="replace",
             timeout=15,
             env=_lark_cli_env_for_directories(config_dir=snapshot / "config", data_dir=data_dir),
         )
@@ -1558,6 +3302,8 @@ def _run_lark_cli_json(
                 check=False,
                 capture_output=True,
                 text=True,
+                encoding=LARK_CLI_SUBPROCESS_ENCODING,
+                errors="replace",
                 timeout=timeout,
                 env=lark_cli_env(user_id),
             )
@@ -1569,14 +3315,18 @@ def _run_lark_cli_json(
         # timeout or CLI failure before returning control to the Gateway.
         ensure_lark_cli_credential_tree(user_id)
 
-    stdout = (result.stdout or "").strip()
-    stderr = (result.stderr or "").strip()
+    return _lark_cli_json_result(result.returncode, result.stdout, result.stderr, allow_empty_success=allow_empty_success)
+
+
+def _lark_cli_json_result(returncode: int, stdout: str | None, stderr: str | None, *, allow_empty_success: bool) -> dict[str, Any]:
+    stdout = (stdout or "").strip()
+    stderr = (stderr or "").strip()
     raw = stdout or stderr
     parsed = _parse_json_object(raw)
 
-    if result.returncode != 0:
+    if returncode != 0:
         message = _auth_error_message(parsed) if parsed else raw
-        raise ValueError(message or f"lark-cli exited with code {result.returncode}")
+        raise ValueError(message or f"lark-cli exited with code {returncode}")
 
     if not raw and allow_empty_success:
         return {}
@@ -1731,10 +3481,10 @@ def _download_lark_archive(version: str) -> Path:
                         raise ValueError("Lark CLI source archive is too large.")
                     out.write(chunk)
     except ValueError:
-        archive_path.unlink(missing_ok=True)
+        cleanup_failed_atomic_write(archive_path)
         raise
     except Exception as exc:  # noqa: BLE001 - network boundary
-        archive_path.unlink(missing_ok=True)
+        cleanup_failed_atomic_write(archive_path)
         raise ValueError(f"Could not download the Lark skill pack ({version}) from GitHub. Check the Gateway's internet access, or pre-stage the archive via {LARK_CLI_SOURCE_ARCHIVE_ENV}.") from exc
     return archive_path
 
@@ -1790,7 +3540,7 @@ def _install_lark_skills_from_archive(user_id: str, archive_path: Path, *, versi
 
 @contextmanager
 def _lark_install_lock(parent: Path):
-    """Serialize the cross-process atomic replacement of the global pack."""
+    """Serialize cross-process installers of the global pack."""
     with _exclusive_install_lock(parent / ".lark-cli.install.lock", _LARK_INSTALL_THREAD_LOCK):
         yield
 
@@ -1801,6 +3551,17 @@ def _install_lark_skills_from_archive_locked(
     *,
     version: str | None = None,
 ) -> tuple[tuple[str, ...], str]:
+    """Prepare a private skill tree and publish its body/manifest pair together.
+
+    The caller holds ``_lark_install_lock``. Extraction, validation, guidance,
+    manifest generation and permission changes all happen in staging; the
+    final ``staging_target.rename(target)`` is the publication boundary. An
+    existing target is moved to a backup first, then restored on an ordinary
+    publication error. Staging is discarded on success or failure.
+
+    Extraction writes and parent directories are not fsynced, so this is not
+    a power-loss durability guarantee for the complete tree.
+    """
     target = parent / INTEGRATION_ID
     staging_parent = Path(tempfile.mkdtemp(prefix=".installing-lark-cli-", dir=str(parent)))
     staging_target = staging_parent / INTEGRATION_ID
@@ -1930,13 +3691,13 @@ def _append_deerflow_lark_shared_guidance(root: Path) -> None:
 在 DeerFlow 中，如果 `lark-cli auth status` 或业务命令提示未配置、未登录、token 过期或缺少用户授权：
 
 1. 不要要求用户在终端执行 `lark-cli config init`、`lark-cli auth login` 或 `lark-cli auth login --device-code`。
-2. 回复用户这个可点击链接：[打开飞书授权设置](?settings=integrations)。
-3. 告诉用户在 **Settings → Integrations → Lark / Feishu CLI** 点击“连接飞书”，在浏览器里完成授权后再回来继续当前任务。
+2. 回复用户这个可点击链接：[打开飞书授权设置](/workspace/capabilities?tab=plugins&plugin=lark)。
+3. 告诉用户在 **Capability Center → Plugins → Lark / Feishu** 点击“连接飞书”，在浏览器里完成授权后再回来继续当前任务。
 4. 如果错误中包含缺失的 `scope`、`permission_violations` 或建议的 `--domain`，告诉用户在该设置页选择对应权限域（例如日历选择 Calendar），或把具体 scope 填入“Exact OAuth scope / 具体 OAuth scope”后重新授权。
 
 只有在用户明确说明已经完成授权后，才继续调用具体的 `lark-cli` 业务命令。
 """
-    skill_file.write_text(content.rstrip() + guidance + "\n", encoding="utf-8")
+    _publish_bytes_atomically(skill_file, (content.rstrip() + guidance + "\n").encode("utf-8"))
 
 
 def _write_manifest(root: Path, installed_skills: set[str], *, version: str | None, content_sha256: str) -> None:
@@ -1949,4 +3710,7 @@ def _write_manifest(root: Path, installed_skills: set[str], *, version: str | No
         "installed_at": datetime.now(UTC).isoformat(),
         "skills": sorted(installed_skills),
     }
-    (root / LARK_CLI_MANIFEST_FILE).write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _publish_bytes_atomically(
+        root / LARK_CLI_MANIFEST_FILE,
+        (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+    )

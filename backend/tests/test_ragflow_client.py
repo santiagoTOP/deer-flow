@@ -12,6 +12,38 @@ from deerflow.community.ragflow.client import (
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("dataset_id", ["", ".", "..", "../other", "a/../../other", "a/b", "a\\b", "%2e%2e", "%252f", "a%2fb", "a?x=y", "a#fragment", "a b", " a", "a\n", "资料"])
+async def test_list_documents_rejects_unsafe_path_ids_without_http_request(dataset_id):
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"code": 0, "data": {"docs": []}})
+
+    client = RAGFlowClient(base_url="http://ragflow.test", api_key="secret", transport=httpx.MockTransport(handler))
+    with pytest.raises(ValueError, match="Invalid RAGFlow dataset ID") as exc:
+        await client.list_documents(dataset_id, params=[])
+    assert str(exc.value) == "Invalid RAGFlow dataset ID."
+    assert requests == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("dataset_id", ["dataset-1", "kb_ABC123", "0123456789abcdef0123456789abcdef"])
+async def test_list_documents_keeps_valid_ids_in_one_path_segment(dataset_id):
+    requests = []
+
+    async def handler(request):
+        requests.append(request)
+        assert request.url.path == f"/api/v1/datasets/{dataset_id}/documents"
+        assert dict(request.url.params) == {"page": "1"}
+        return httpx.Response(200, json={"code": 0, "data": {"docs": []}})
+
+    client = RAGFlowClient(base_url="http://ragflow.test", api_key="secret", transport=httpx.MockTransport(handler))
+    assert await client.list_documents(dataset_id, params=[("page", "1")]) == {"code": 0, "data": {"docs": []}}
+    assert len(requests) == 1
+
+
+@pytest.mark.anyio
 async def test_list_datasets_filters_by_bound_id_in_one_request() -> None:
     requests: list[httpx.Request] = []
 
@@ -164,6 +196,39 @@ async def test_retrieve_rejects_empty_dataset_ids_before_request() -> None:
         await client.retrieve("fallback search", dataset_ids=[])
 
     assert called is False
+
+
+@pytest.mark.anyio
+async def test_retrieve_sends_nonempty_document_filter_and_rejects_empty_filter() -> None:
+    requests: list[dict] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"code": 0, "data": {"chunks": [], "doc_aggs": [], "total": 0}},
+        )
+
+    client = RAGFlowClient(
+        base_url="http://ragflow.test",
+        api_key="ragflow-secret",
+        transport=httpx.MockTransport(handler),
+    )
+
+    await client.retrieve(
+        "annual leave",
+        dataset_ids=["dataset-1"],
+        document_ids=["document-1"],
+    )
+    assert requests[0]["document_ids"] == ["document-1"]
+
+    with pytest.raises(ValueError, match="document_ids must be omitted or non-empty"):
+        await client.retrieve(
+            "annual leave",
+            dataset_ids=["dataset-1"],
+            document_ids=[],
+        )
+    assert len(requests) == 1
 
 
 @pytest.mark.anyio

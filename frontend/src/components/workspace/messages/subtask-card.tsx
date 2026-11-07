@@ -1,3 +1,4 @@
+import type { Message } from "@langchain/langgraph-sdk";
 import {
   CheckCircleIcon,
   ChevronUp,
@@ -17,6 +18,7 @@ import {
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { Button } from "@/components/ui/button";
 import { ShineBorder } from "@/components/ui/shine-border";
+import { readKnowledgeSources } from "@/core/citations/sources";
 import { useI18n } from "@/core/i18n/hooks";
 import { hasToolCalls } from "@/core/messages/utils";
 import { useModels } from "@/core/models/hooks";
@@ -28,6 +30,7 @@ import {
   SafeStreamdown,
   toStreamdownComponents,
 } from "@/core/streamdown/components";
+import type { Subtask } from "@/core/tasks";
 import { fetchSubtaskSteps } from "@/core/tasks/api";
 import { useSubtask, useUpdateSubtask } from "@/core/tasks/context";
 import {
@@ -35,6 +38,7 @@ import {
   resolveSubtaskModelLabel,
 } from "@/core/tasks/presentation";
 import { stepsForDisplay } from "@/core/tasks/steps";
+import { resolveRenderedSubtask } from "@/core/tasks/subtask-render";
 import { explainLastToolCall } from "@/core/tools/utils";
 import { cn } from "@/lib/utils";
 
@@ -42,6 +46,7 @@ import { CitationLink } from "../citations/citation-link";
 import { FlipDisplay } from "../flip-display";
 
 import { MarkdownContent } from "./markdown-content";
+import { createMarkdownLinkComponent } from "./markdown-link";
 
 export function SubtaskCard({
   className,
@@ -49,16 +54,35 @@ export function SubtaskCard({
   threadId,
   runId,
   isLoading,
+  fallbackTask,
+  resultMessage,
 }: {
   className?: string;
   taskId: string;
   threadId?: string;
   runId?: string;
   isLoading: boolean;
+  fallbackTask: Subtask;
+  resultMessage?: Message;
 }) {
   const { t } = useI18n();
+  const reportSources = useMemo(
+    () =>
+      resultMessage?.type === "tool" &&
+      resultMessage.name === "task" &&
+      resultMessage.tool_call_id === taskId
+        ? readKnowledgeSources([resultMessage])
+        : [],
+    [resultMessage, taskId],
+  );
+  const reportComponents = useMemo(
+    () => ({
+      a: createMarkdownLinkComponent(threadId, reportSources),
+    }),
+    [reportSources, threadId],
+  );
   const [collapsed, setCollapsed] = useState(true);
-  const task = useSubtask(taskId)!;
+  const task = resolveRenderedSubtask(useSubtask(taskId), fallbackTask)!;
   const { models, tokenUsageEnabled } = useModels();
   const updateSubtask = useUpdateSubtask();
   const modelLabel = resolveSubtaskModelLabel(task.modelName, models);
@@ -93,7 +117,7 @@ export function SubtaskCard({
     fetchSubtaskSteps(threadId, runId, taskId)
       .then((steps) => {
         if (steps.length > 0) {
-          updateSubtask({ id: taskId, steps });
+          updateSubtask({ id: taskId, steps }, { stepSource: "history" });
         }
       })
       .catch(() => {
@@ -138,23 +162,30 @@ export function SubtaskCard({
           >
             <div className="flex w-full items-center justify-between">
               <ChainOfThoughtStep
-                className="font-normal"
+                className="min-w-24 flex-1 font-normal"
                 label={
-                  task.status === "in_progress" ? (
-                    <Shimmer duration={3} spread={3}>
-                      {task.description}
-                    </Shimmer>
-                  ) : (
-                    task.description
-                  )
+                  <span className="block truncate" title={task.description}>
+                    {task.status === "in_progress" ? (
+                      <Shimmer
+                        as="span"
+                        className="inline"
+                        duration={3}
+                        spread={3}
+                      >
+                        {task.description}
+                      </Shimmer>
+                    ) : (
+                      task.description
+                    )}
+                  </span>
                 }
                 icon={<ClipboardListIcon />}
               ></ChainOfThoughtStep>
-              <div className="flex items-center gap-1">
+              <div className="flex min-w-0 items-center gap-1">
                 {collapsed && (
                   <div
                     className={cn(
-                      "text-muted-foreground flex items-center gap-1 text-xs font-normal",
+                      "text-muted-foreground flex min-w-0 items-center gap-1 text-xs font-normal",
                       task.status === "failed" ? "text-red-500 opacity-67" : "",
                     )}
                   >
@@ -227,7 +258,11 @@ export function SubtaskCard({
                     (step.tool_name ?? t.subtasks[task.status])
                   ) : (
                     <div className="text-muted-foreground line-clamp-3 text-sm">
-                      <MarkdownContent content={step.text} isLoading={false} />
+                      <MarkdownContent
+                        content={step.text}
+                        isLoading={false}
+                        components={reportComponents}
+                      />
                     </div>
                   )
                 }
@@ -244,7 +279,14 @@ export function SubtaskCard({
               <ChainOfThoughtStep
                 label={
                   task.result ? (
-                    <MarkdownContent content={task.result} isLoading={false} />
+                    <MarkdownContent
+                      // Streamdown caches blocks by text. Re-resolve unchanged
+                      // report text when its validated evidence arrives/changes.
+                      key={reportSources.map((source) => source.id).join(",")}
+                      content={task.result}
+                      isLoading={false}
+                      components={reportComponents}
+                    />
                   ) : null
                 }
               ></ChainOfThoughtStep>

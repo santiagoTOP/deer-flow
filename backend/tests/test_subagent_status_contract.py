@@ -112,6 +112,18 @@ def test_format_subagent_result_message_completed_with_stop_reason_notes_the_cap
     assert metadata_error is None
 
 
+def test_format_subagent_result_message_notes_model_length_cap():
+    """A subagent whose final answer was cut at the provider output limit is
+    ``completed`` + ``model_length_capped``; the lead sees the cap in the text
+    and in the structured metadata."""
+    content, metadata_error = format_subagent_result_message("completed", result="## Draft - Section 1 covers the", stop_reason="model_length_capped")
+    assert content.startswith("Task Succeeded (capped: model output length limit)")
+    assert metadata_error is None
+    kwargs = make_subagent_additional_kwargs("completed", result="## Draft", stop_reason="model_length_capped")
+    assert kwargs[SUBAGENT_STOP_REASON_KEY] == "model_length_capped"
+    assert read_subagent_result_metadata(kwargs)["stop_reason"] == "model_length_capped"
+
+
 def test_format_subagent_result_message_failed_with_stop_reason_notes_the_cap():
     """A turn-capped run with no usable output is ``failed`` + ``turn_capped``;
     the cap note distinguishes "out of budget" from a broken subagent."""
@@ -314,3 +326,41 @@ class TestToolReceiptTransport:
         assert structured is not None
         assert "tool_receipts" not in structured
         assert "receipt_verdict" not in structured
+
+    def _acceptance_verdict(self) -> dict:
+        return {
+            "source": "acceptance_checklist",
+            "requirement": "delegation_acceptance_criteria",
+            "leaves": [
+                {"criterion": "file:../outputs/r.md exists", "family": "file_exists", "checked": True, "holds": True, "detail": "exists, 5 bytes"},
+                {"criterion": "open ended", "family": "undecidable", "checked": False, "holds": False, "detail": "not deterministically checkable"},
+            ],
+            "unchecked": ["open ended"],
+            "all_hold": False,
+        }
+
+    def test_round_trip_acceptance_verdict(self):
+        kwargs = make_subagent_additional_kwargs(
+            "completed",
+            result="done",
+            acceptance_verdict=self._acceptance_verdict(),
+        )
+        assert kwargs["subagent_acceptance_verdict"] == self._acceptance_verdict()
+
+        structured = read_subagent_result_metadata(kwargs)
+        assert structured is not None
+        assert structured["acceptance_verdict"] == self._acceptance_verdict()
+
+    def test_malformed_acceptance_verdict_dropped(self):
+        kwargs = make_subagent_additional_kwargs(
+            "completed",
+            result="done",
+            acceptance_verdict={"all_hold": "yes"},
+        )
+        assert "subagent_acceptance_verdict" not in kwargs
+
+    def test_old_payloads_have_no_acceptance_verdict(self):
+        kwargs = make_subagent_additional_kwargs("completed", result="done")
+        structured = read_subagent_result_metadata(kwargs)
+        assert structured is not None
+        assert "acceptance_verdict" not in structured

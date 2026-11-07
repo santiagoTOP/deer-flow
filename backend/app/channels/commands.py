@@ -10,11 +10,13 @@ from __future__ import annotations
 
 KNOWN_CHANNEL_COMMANDS: frozenset[str] = frozenset(
     {
+        "/agent",
         "/bootstrap",
         "/goal",
         "/new",
         "/status",
         "/models",
+        "/model",
         "/memory",
         "/help",
     }

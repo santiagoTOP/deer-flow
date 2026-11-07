@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import re
-import secrets
+import socket
 import time
 import urllib.parse
 from ipaddress import ip_address, ip_network
@@ -17,6 +17,7 @@ from starlette.responses import RedirectResponse
 from app.gateway.auth import (
     UserResponse,
     create_access_token,
+    login_throttle,
 )
 from app.gateway.auth.config import get_auth_config
 from app.gateway.auth.errors import AuthErrorCode, AuthErrorResponse
@@ -37,7 +38,9 @@ from app.gateway.auth.session_cookie_state import SKIP_AUTH_CSRF_COOKIE_STATE_AT
 from app.gateway.auth.user_provisioning import get_or_provision_oidc_user
 from app.gateway.csrf_middleware import CSRF_COOKIE_NAME, _request_origin, auth_csrf_cookie_settings, generate_csrf_token, is_secure_request
 from app.gateway.deps import get_current_user_from_request, get_local_provider
-from deerflow.config.auth_config import OIDCProviderConfig
+from app.gateway.utils import constant_time_equals
+from deerflow.config.auth_config import OIDCAuthConfig, OIDCProviderConfig
+from deerflow.persistence.login_throttle import LoginThrottleStore
 
 logger = logging.getLogger(__name__)
 
@@ -160,33 +163,102 @@ def _set_session_cookie(response: Response, token: str, request: Request, *, rem
 
 
 # ── Rate Limiting ────────────────────────────────────────────────────────
-# In-process dict — not shared across workers.
+# Failed logins are counted per client IP in a ``LoginThrottleStore``
+# (``deerflow.persistence.login_throttle``). The store is resolved once per
+# process by ``app.gateway.auth.login_throttle`` — the Gateway lifespan
+# installs it from the startup config and the persistence engine, a bare app
+# resolves it lazily on the first throttle call — and ``auth.local.
+# throttle_storage`` picks the implementation: the shared ``login_throttle``
+# table whenever an application database exists (every replica sharing that
+# database enforces one lockout per IP), otherwise the historical in-process
+# counter (per process: N replicas give an attacker N × max_login_attempts
+# guesses; ``deps._validate_login_throttle_storage`` warns about that).
 #
-# **Limitation**: with multi-worker deployments (e.g., gunicorn -w N), each
-# worker maintains its own lockout table, so an attacker effectively gets
-# N × _MAX_LOGIN_ATTEMPTS guesses before being locked out everywhere. For
-# production multi-worker setups, replace this with a shared store (Redis,
-# database-backed counter) to enforce a true per-IP limit.
+# The policy values are operator-configurable via auth.local.max_login_attempts /
+# auth.local.lockout_seconds (read live per call, matching _local_registration_enabled,
+# so a config reload applies to the next login without a Gateway restart). The
+# no-config.yaml fallback is the LocalAuthConfig model defaults — a single source
+# of truth, not a second copy of the numbers.
+#
+# A lock's stored duration always matches the policy the lock was last
+# evaluated under (its creation counts as an evaluation, and every check that
+# leaves the lock active commits the then-current duration, decreases
+# included): a lowered lockout_seconds releases an active lock early, a raised
+# one extends it — and a sentence that already served the last-evaluated
+# duration is never resurrected. The stores implement that contract
+# (``deerflow/persistence/login_throttle/base.py``); this module only sequences
+# the calls and keeps the config read off the event loop.
 
-_MAX_LOGIN_ATTEMPTS = 5
-_LOCKOUT_SECONDS = 300  # 5 minutes
 
-# ip → (fail_count, lock_until_timestamp)
-_login_attempts: dict[str, tuple[int, float]] = {}
+async def _login_throttle_store() -> LoginThrottleStore:
+    """The process-wide store, resolving it off the loop on first use in a bare app."""
+    store = login_throttle.installed_login_throttle_store()
+    if store is None:
+        # Resolution reads config.yaml (stat + hash); never on the loop.
+        store = await asyncio.to_thread(login_throttle.resolve_and_install_from_live_config)
+    return store
 
 
-def _trusted_proxies() -> list:
-    """Parse ``AUTH_TRUSTED_PROXIES`` env var into a list of ip_network objects.
+def _login_throttle_policy() -> tuple[int, float]:
+    """(max_login_attempts, lockout_seconds) from auth.local config, read live.
 
-    Comma-separated CIDR or single-IP entries. Empty / unset = no proxy is
-    trusted (direct mode). Invalid entries are skipped with a logger warning.
-    Read live so env-var overrides take effect immediately and tests can
-    ``monkeypatch.setenv`` without poking a module-level cache.
+    Only ``FileNotFoundError`` falls back to the model defaults, matching
+    ``_local_registration_enabled``: ``config.yaml`` is absent in bare-app
+    contexts that never load it (tests build the gateway without one), and the
+    throttle must keep its pre-config-era behavior there. A malformed config
+    propagates instead — like every other config consumer, and so an operator
+    who tightened the policy never silently gets the more permissive defaults.
+
+    Callers on request paths resolve this at most once per helper invocation;
+    ``get_app_config`` re-hashes the config file on every call, and the login
+    endpoint is unauthenticated.
+    """
+    from deerflow.config.app_config import get_app_config
+    from deerflow.config.auth_config import LocalAuthConfig
+
+    try:
+        local = get_app_config().auth.local
+    except FileNotFoundError:
+        local = LocalAuthConfig()
+    return local.max_login_attempts, local.lockout_seconds
+
+
+# Hostname entries (e.g. the compose service ``nginx``) are re-resolved at most
+# this often: a restarted proxy container comes back on a new address, and
+# nginx's own resolver uses the same validity (docker/nginx/nginx.conf).
+_TRUSTED_PROXY_HOST_TTL_SECONDS = 10.0
+_HOSTNAME_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+# hostname -> (monotonic expiry, resolved addresses). Failed lookups are cached
+# as an empty set too, so unauthenticated requests cannot drive a lookup storm.
+_trusted_proxy_host_cache: dict[str, tuple[float, frozenset]] = {}
+# hostname -> the lookup in progress. Concurrent cache misses (a burst of
+# setup-status / login requests when the entry expires) join it, so a refresh
+# costs one resolver call however many requests arrive while DNS is slow.
+_trusted_proxy_host_inflight: dict[str, asyncio.Task[frozenset]] = {}
+
+
+def _is_hostname(entry: str) -> bool:
+    """RFC 1123 hostname whose last label is not numeric (so ``10.0.0`` is not one)."""
+    labels = entry.split(".")
+    return len(entry) <= 253 and all(_HOSTNAME_LABEL.fullmatch(label) for label in labels) and not labels[-1].isdigit()
+
+
+def _trusted_proxies() -> tuple[list, list[str]]:
+    """Parse ``AUTH_TRUSTED_PROXIES`` into (ip_network objects, hostnames).
+
+    Comma-separated CIDR, single-IP or hostname entries. Empty / unset = no
+    proxy is trusted (direct mode). A hostname stands for every address it
+    resolves to, so a proxy without a fixed address (the compose ``nginx``
+    service) can still be named. Invalid entries are skipped with a logger
+    warning. The variable is read live so env-var overrides take effect
+    immediately and tests can ``monkeypatch.setenv``; only the addresses a
+    hostname resolves to are cached (``_trusted_proxy_host_addresses``).
     """
     raw = os.getenv("AUTH_TRUSTED_PROXIES", "").strip()
     if not raw:
-        return []
+        return [], []
     nets = []
+    hostnames = []
     for entry in raw.split(","):
         entry = entry.strip()
         if not entry:
@@ -194,11 +266,64 @@ def _trusted_proxies() -> list:
         try:
             nets.append(ip_network(entry, strict=False))
         except ValueError:
-            logger.warning("AUTH_TRUSTED_PROXIES: ignoring invalid entry %r", entry)
-    return nets
+            if _is_hostname(entry):
+                hostnames.append(entry)
+            else:
+                logger.warning("AUTH_TRUSTED_PROXIES: ignoring invalid entry %r", entry)
+    return nets, hostnames
 
 
-def _get_client_ip(request: Request) -> str:
+async def _resolve_trusted_proxy_host(hostname: str) -> frozenset:
+    """Resolve ``hostname`` in the loop's executor and cache the result (or the failure)."""
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+        addresses = frozenset(ip_address(info[4][0]) for info in infos)
+    except (OSError, ValueError) as exc:
+        logger.warning("AUTH_TRUSTED_PROXIES: could not resolve %r (%s); not trusting it for %.0fs", hostname, exc, _TRUSTED_PROXY_HOST_TTL_SECONDS)
+        addresses = frozenset()
+    _trusted_proxy_host_cache[hostname] = (time.monotonic() + _TRUSTED_PROXY_HOST_TTL_SECONDS, addresses)
+    return addresses
+
+
+async def _trusted_proxy_host_addresses(hostname: str) -> frozenset:
+    """Addresses ``hostname`` resolves to, cached for ``_TRUSTED_PROXY_HOST_TTL_SECONDS``.
+
+    The lookup runs in the loop's executor (``getaddrinfo`` blocks). A failed
+    lookup trusts nothing until the entry expires, which is the direct-mode
+    behavior, not an error for the request. One lookup per hostname runs at a
+    time: the cache check and the in-flight registration happen without a
+    yield in between, and later callers join that task. Callers wait through
+    ``asyncio.shield``, so one cancelled request (a client disconnect) cannot
+    cancel the lookup the others joined; the task caches its own result, so
+    it is kept even if every caller went away.
+    """
+    cached = _trusted_proxy_host_cache.get(hostname)
+    if cached is not None and time.monotonic() < cached[0]:
+        return cached[1]
+    task = _trusted_proxy_host_inflight.get(hostname)
+    if task is None:
+        task = asyncio.get_running_loop().create_task(_resolve_trusted_proxy_host(hostname))
+        _trusted_proxy_host_inflight[hostname] = task
+
+        def _release(done: asyncio.Task[frozenset]) -> None:
+            if _trusted_proxy_host_inflight.get(hostname) is done:
+                del _trusted_proxy_host_inflight[hostname]
+
+        task.add_done_callback(_release)
+    return await asyncio.shield(task)
+
+
+async def _is_trusted_proxy(peer_ip) -> bool:
+    nets, hostnames = _trusted_proxies()
+    if any(peer_ip in net for net in nets):
+        return True
+    for hostname in hostnames:
+        if peer_ip in await _trusted_proxy_host_addresses(hostname):
+            return True
+    return False
+
+
+async def _get_client_ip(request: Request) -> str:
     """Extract the real client IP for rate limiting.
 
     Trust model:
@@ -208,79 +333,96 @@ def _get_client_ip(request: Request) -> str:
       by the client itself.
     - ``X-Real-IP`` is **only** honored if the TCP peer is in the
       ``AUTH_TRUSTED_PROXIES`` allowlist (set via env var, comma-separated
-      CIDR or single IPs). When set, the gateway is assumed to be behind a
-      reverse proxy (nginx, Cloudflare, ALB, …) that overwrites
-      ``X-Real-IP`` with the original client address.
+      CIDR, single IPs or hostnames). When set, the gateway is assumed to be
+      behind a reverse proxy (nginx, Cloudflare, ALB, …) that overwrites
+      ``X-Real-IP`` with the original client address. The compose files
+      name their bundled ``nginx`` service here by default.
     - With no ``AUTH_TRUSTED_PROXIES`` set, ``X-Real-IP`` is silently
       ignored — closing the bypass where any client could rotate the
       header to dodge per-IP rate limits in dev / direct-gateway mode.
 
     ``X-Forwarded-For`` is intentionally NOT used because it is naturally
     client-controlled at the *first* hop and the trust chain is harder to
-    audit per-request.
+    audit per-request. A request without ``X-Real-IP`` never resolves a
+    hostname entry.
     """
     peer_host = request.client.host if request.client else None
+    real_ip = request.headers.get("x-real-ip", "").strip()
 
-    trusted = _trusted_proxies()
-    if trusted and peer_host:
+    if peer_host and real_ip:
         try:
             peer_ip = ip_address(peer_host)
-            if any(peer_ip in net for net in trusted):
-                real_ip = request.headers.get("x-real-ip", "").strip()
-                if real_ip:
-                    return real_ip
         except ValueError:
             # peer_host wasn't a parseable IP (e.g. "unknown") — fall through
-            pass
+            peer_ip = None
+        if peer_ip is not None and await _is_trusted_proxy(peer_ip):
+            return real_ip
 
     return peer_host or "unknown"
 
 
-def _check_rate_limit(ip: str) -> None:
-    """Raise 429 if the IP is currently locked out."""
-    record = _login_attempts.get(ip)
-    if record is None:
-        return
-    fail_count, lock_until = record
-    if fail_count >= _MAX_LOGIN_ATTEMPTS:
-        if time.time() < lock_until:
-            raise HTTPException(
-                status_code=429,
-                detail="Too many login attempts. Try again later.",
-            )
-        del _login_attempts[ip]
+async def _check_rate_limit(ip: str) -> None:
+    """Raise 429 if the IP is currently locked out.
+
+    The policy is handed to the store as an async callable and resolved
+    lazily, inside the store's single session: a clean IP (no failed attempts
+    recorded — the overwhelming majority of logins) never pays the config
+    read, and ``get_app_config`` re-hashes config.yaml on every call while
+    this endpoint is unauthenticated. A recorded IP — including an
+    already-locked attacker flooding the endpoint — resolves it exactly once,
+    off the event loop via ``asyncio.to_thread`` (the stat + hash must not
+    block the loop), and the SQL store serves the probe, the resolution and
+    the decision from one connection-pool checkout instead of two.
+
+    The policy read is a yield point: another request for the same IP may
+    delete or replace the record meanwhile, so the store decides on a fresh
+    read taken after it and guards its own mutations against that snapshot —
+    a record replaced mid-flight (e.g. a successful login followed by a new
+    failure) is never clobbered by a stale decision.
+    """
+    store = await _login_throttle_store()
+
+    async def policy() -> tuple[int, float]:
+        return await asyncio.to_thread(_login_throttle_policy)
+
+    remaining = await store.check(ip, policy=policy, now=time.time())
+    if remaining > 0.0:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many login attempts. Try again later.",
+        )
 
 
-_MAX_TRACKED_IPS = 10000
+async def _record_login_failure(ip: str) -> None:
+    """Record a failed login attempt for the given IP.
+
+    Policy resolution runs off the event loop (see ``_check_rate_limit``):
+    this is the first config read for a previously clean IP, and the login
+    endpoint is unauthenticated.
+    """
+    store = await _login_throttle_store()
+    try:
+        max_attempts, lockout_seconds = await asyncio.to_thread(_login_throttle_policy)
+    except Exception:
+        # A malformed config keeps failing loudly, but dropping the failure
+        # here would leave the IP clean — and a clean IP skips the config
+        # read in _check_rate_limit, so every subsequent wrong password would
+        # reach authenticate() again: unlimited password verification for as
+        # long as the file stays broken. Count under the model defaults so
+        # the throttle fails closed (the next check reads the broken config
+        # before authenticate), then re-raise.
+        from deerflow.config.auth_config import LocalAuthConfig
+
+        fallback = LocalAuthConfig()
+        await store.record_failure(ip, max_attempts=fallback.max_login_attempts, lockout_seconds=fallback.lockout_seconds, now=time.time())
+        raise
+    await store.record_failure(ip, max_attempts=max_attempts, lockout_seconds=lockout_seconds, now=time.time())
 
 
-def _record_login_failure(ip: str) -> None:
-    """Record a failed login attempt for the given IP."""
-    # Evict expired lockouts when dict grows too large
-    if len(_login_attempts) >= _MAX_TRACKED_IPS:
-        now = time.time()
-        expired = [k for k, (c, t) in _login_attempts.items() if c >= _MAX_LOGIN_ATTEMPTS and now >= t]
-        for k in expired:
-            del _login_attempts[k]
-        # If still too large, evict cheapest-to-lose half: below-threshold
-        # IPs (lock_until=0.0) sort first, then earliest-expiring lockouts.
-        if len(_login_attempts) >= _MAX_TRACKED_IPS:
-            by_time = sorted(_login_attempts.items(), key=lambda kv: kv[1][1])
-            for k, _ in by_time[: len(by_time) // 2]:
-                del _login_attempts[k]
-
-    record = _login_attempts.get(ip)
-    if record is None:
-        _login_attempts[ip] = (1, 0.0)
-    else:
-        new_count = record[0] + 1
-        lock_until = time.time() + _LOCKOUT_SECONDS if new_count >= _MAX_LOGIN_ATTEMPTS else 0.0
-        _login_attempts[ip] = (new_count, lock_until)
-
-
-def _record_login_success(ip: str) -> None:
-    """Clear failure counter for the given IP on successful login."""
-    _login_attempts.pop(ip, None)
+async def _record_login_success(ip: str) -> None:
+    """Clear the failure counter for the given IP on successful login."""
+    store = await _login_throttle_store()
+    await store.reset(ip)
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────
@@ -294,19 +436,19 @@ async def login_local(
     remember_me: bool = Form(default=True),
 ):
     """Local email/password login."""
-    client_ip = _get_client_ip(request)
-    _check_rate_limit(client_ip)
+    client_ip = await _get_client_ip(request)
+    await _check_rate_limit(client_ip)
 
     user = await get_local_provider().authenticate({"email": form_data.username, "password": form_data.password})
 
     if user is None:
-        _record_login_failure(client_ip)
+        await _record_login_failure(client_ip)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=AuthErrorResponse(code=AuthErrorCode.INVALID_CREDENTIALS, message="Incorrect email or password").model_dump(),
         )
 
-    _record_login_success(client_ip)
+    await _record_login_success(client_ip)
     token = create_access_token(str(user.id), token_version=user.token_version)
     _set_session_cookie(response, token, request, remember_me=remember_me)
 
@@ -332,6 +474,8 @@ def _local_registration_enabled() -> bool:
 
     ``/register`` reads this fresh on every request (``get_app_config`` reloads on file
     change); ``/setup-status`` may serve it up to 60s stale via its per-IP result cache.
+    Both are unauthenticated and ``get_app_config`` stats and re-hashes the config
+    files on every call, so they run this through ``asyncio.to_thread``.
     """
     from deerflow.config.app_config import get_app_config
 
@@ -350,7 +494,7 @@ async def register(request: Request, response: Response, body: RegisterRequest):
 
     Returns 403 when ``auth.local.allow_registration`` is false.
     """
-    if not _local_registration_enabled():
+    if not await asyncio.to_thread(_local_registration_enabled):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=AuthErrorResponse(code=AuthErrorCode.REGISTRATION_DISABLED, message="Self-registration is disabled on this deployment").model_dump(),
@@ -447,14 +591,26 @@ async def change_password(request: Request, response: Response, body: ChangePass
 
 @router.get("/me", response_model=UserResponse)
 async def get_me(request: Request):
-    """Get current authenticated user info."""
+    """Get current authenticated user info, including effective permissions."""
     user = await get_current_user_from_request(request)
+    auth = getattr(getattr(request, "state", None), "auth", None)
+    if auth is not None:
+        # AuthMiddleware already resolved the per-request permission set (with
+        # PAT-scope intersection and internal-caller semantics applied) — reuse
+        # it instead of evaluating the provider a second time.
+        permissions: list[str] = list(auth.permissions)
+    else:
+        # Middleware-less composition: resolve exactly as _authenticate does.
+        from app.gateway.authz import resolve_route_permissions_for_request
+
+        permissions = await resolve_route_permissions_for_request(request, user)
     return UserResponse(
         id=str(user.id),
         email=user.email,
         system_role=user.system_role,
         needs_setup=user.needs_setup,
         oauth_provider=user.oauth_provider,
+        permissions=permissions,
     )
 
 
@@ -596,7 +752,7 @@ _SETUP_STATUS_INFLIGHT_GUARD = asyncio.Lock()
 @router.get("/setup-status")
 async def setup_status(request: Request):
     """Check if an admin account exists. Returns needs_setup=True when no admin exists."""
-    client_ip = _get_client_ip(request)
+    client_ip = await _get_client_ip(request)
     now = time.time()
 
     # Return cached result when within TTL — avoids 429 on multi-tab reconnection.
@@ -630,7 +786,8 @@ async def setup_status(request: Request):
 
             async def _compute_setup_status() -> dict:
                 admin_count = await get_local_provider().count_admin_users()
-                return {"needs_setup": admin_count == 0, "registration_enabled": _local_registration_enabled()}
+                registration_enabled = await asyncio.to_thread(_local_registration_enabled)
+                return {"needs_setup": admin_count == 0, "registration_enabled": registration_enabled}
 
             task = asyncio.create_task(_compute_setup_status())
             _SETUP_STATUS_INFLIGHT[client_ip] = task
@@ -665,31 +822,34 @@ async def initialize_admin(request: Request, response: Response, body: Initializ
     """Create the first admin account on initial system setup.
 
     Only callable when no admin exists. Returns 409 Conflict if an admin
-    already exists.
+    already exists, including when a concurrent first-boot request won the
+    claim: the account is created through an atomic check-and-insert rather
+    than a count followed by a create.
 
     On success, the admin account is created with ``needs_setup=False`` and
     the session cookie is set.
     """
-    admin_count = await get_local_provider().count_admin_users()
-    if admin_count > 0:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=AuthErrorResponse(code=AuthErrorCode.SYSTEM_ALREADY_INITIALIZED, message="System already initialized").model_dump(),
-        )
+    already_initialized = HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=AuthErrorResponse(code=AuthErrorCode.SYSTEM_ALREADY_INITIALIZED, message="System already initialized").model_dump(),
+    )
+
+    # Fast path only: an initialized system answers without hashing a
+    # password. The claim below is what actually decides, because a count
+    # read here cannot exclude a request already in flight.
+    if await get_local_provider().count_admin_users() > 0:
+        raise already_initialized
 
     try:
-        user = await get_local_provider().create_user(email=body.email, password=body.password, system_role="admin", needs_setup=False)
+        user = await get_local_provider().create_first_admin(email=body.email, password=body.password)
     except ValueError:
-        admin_count = await get_local_provider().count_admin_users()
-        if admin_count == 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=AuthErrorResponse(code=AuthErrorCode.EMAIL_ALREADY_EXISTS, message="Email already registered").model_dump(),
-            )
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=AuthErrorResponse(code=AuthErrorCode.SYSTEM_ALREADY_INITIALIZED, message="System already initialized").model_dump(),
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=AuthErrorResponse(code=AuthErrorCode.EMAIL_ALREADY_EXISTS, message="Email already registered").model_dump(),
         )
+
+    if user is None:
+        raise already_initialized
 
     token = create_access_token(str(user.id), token_version=user.token_version)
     _set_session_cookie(response, token, request, remember_me=body.remember_me)
@@ -733,6 +893,21 @@ def _set_csrf_cookie(response: Response, request: Request) -> None:
     )
 
 
+def _live_oidc_config() -> OIDCAuthConfig:
+    from deerflow.config.app_config import get_app_config
+
+    return get_app_config().auth.oidc
+
+
+async def _oidc_config() -> OIDCAuthConfig:
+    """The live ``auth.oidc`` config, read off the event loop.
+
+    The SSO routes are unauthenticated, and ``get_app_config`` stats and
+    re-hashes the config files on every call.
+    """
+    return await asyncio.to_thread(_live_oidc_config)
+
+
 def _resolve_oidc_redirect_uri(request: Request, provider_id: str, provider_config: OIDCProviderConfig) -> str:
     """Resolve the redirect URI for an OIDC provider.
 
@@ -759,10 +934,7 @@ async def list_auth_providers():
     Returns only safe frontend metadata — no secrets, endpoints, or
     internal configuration.
     """
-    from deerflow.config.app_config import get_app_config
-
-    app_config = get_app_config()
-    oidc_config = app_config.auth.oidc
+    oidc_config = await _oidc_config()
 
     if not oidc_config.enabled:
         return {"providers": []}
@@ -792,10 +964,7 @@ async def oauth_login(
     and PKCE parameters. The ``next`` query parameter specifies where to
     redirect after successful login (default: /workspace).
     """
-    from deerflow.config.app_config import get_app_config
-
-    app_config = get_app_config()
-    oidc_config = app_config.auth.oidc
+    oidc_config = await _oidc_config()
 
     if not oidc_config.enabled:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="SSO authentication is not enabled")
@@ -874,10 +1043,7 @@ async def oauth_callback(
     the ID token, provisions/links the DeerFlow user, and sets the
     session cookie.
     """
-    from deerflow.config.app_config import get_app_config
-
-    app_config = get_app_config()
-    oidc_config = app_config.auth.oidc
+    oidc_config = await _oidc_config()
 
     # ── Provider error ───────────────────────────────────────────────
     if error:
@@ -903,7 +1069,7 @@ async def oauth_callback(
     if not state_payload:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Missing or expired OIDC state cookie")
 
-    if not secrets.compare_digest(state_payload.state, state):
+    if not constant_time_equals(state_payload.state, state):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="OIDC state mismatch")
 
     # ── Resolve redirect URI ─────────────────────────────────────────
@@ -988,8 +1154,10 @@ def validate_next_param(next_param: str | None) -> str | None:
     """Validate and sanitize the ``next`` redirect parameter.
 
     Only allows relative paths starting with ``/``. Rejects protocol-relative
-    URLs (``//``), absolute URLs, URLs with embedded protocols, and backslashes
-    that URL parsers may reinterpret as forward slashes.
+    URLs (``//``), absolute URLs, URLs with embedded protocols, backslashes
+    that URL parsers may reinterpret as forward slashes, and control
+    characters: browsers delete tab, LF and CR before parsing a URL, so
+    ``/\\n//evil.example`` would otherwise reach the frontend as ``//evil.example``.
     """
     if not next_param:
         return None
@@ -1000,5 +1168,7 @@ def validate_next_param(next_param: str | None) -> str | None:
     if "\\" in next_param:
         return None
     if ":" in next_param:
+        return None
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in next_param):
         return None
     return next_param

@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import and_, case, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from deerflow.mcp.tasks import ATTENTION_TASK_STATUSES, POLLABLE_TASK_STATUSES, TERMINAL_TASK_STATUSES
+from deerflow.mcp.tasks.models import TaskStatus
 from deerflow.persistence.mcp_tasks.model import McpTaskRow
+from deerflow.persistence.thread_meta.model import ThreadMetaRow
 from deerflow.utils.time import coerce_iso
 
 _POLLABLE_STATUS_VALUES = tuple(status.value for status in POLLABLE_TASK_STATUSES)
@@ -29,7 +32,12 @@ _TIMESTAMP_FIELDS = (
     "updated_at",
 )
 
-_INFLIGHT_NOTIFICATION_STATUSES = frozenset({"claimed", "dispatched", "retry"})
+_INFLIGHT_NOTIFICATION_STATUSES = frozenset({"claimed", "launching", "dispatched", "retry"})
+
+
+def _new_claim_token() -> str:
+    """Return a fresh per-claim token used to fence releases against reclaims."""
+    return uuid.uuid4().hex
 
 
 def _notification_event(row: McpTaskRow, *, tracking_degraded: bool) -> dict[str, Any] | None:
@@ -80,6 +88,10 @@ class DuplicateMcpRemoteTaskError(RuntimeError):
     """The current user already tracks this server's remote task handle."""
 
 
+class McpTaskThreadMismatchError(RuntimeError):
+    """The submitting run no longer owns the current thread incarnation."""
+
+
 def _is_remote_task_unique_conflict(exc: IntegrityError) -> bool:
     original = exc.orig
     diagnostic = getattr(original, "diag", None)
@@ -89,6 +101,64 @@ def _is_remote_task_unique_conflict(exc: IntegrityError) -> bool:
     return "uq_mcp_tasks_user_server_remote" in message or "mcp_tasks.user_id, mcp_tasks.server_name, mcp_tasks.remote_task_id" in message
 
 
+def _matches_current_thread_incarnation(
+    *,
+    user_id: str,
+    thread_id: str,
+    thread_incarnation: str | None,
+):
+    """Atomically match task, current thread, and caller-captured incarnation."""
+    return (
+        select(ThreadMetaRow.thread_id)
+        .where(
+            McpTaskRow.thread_id == thread_id,
+            McpTaskRow.thread_incarnation.is_not_distinct_from(thread_incarnation),
+            ThreadMetaRow.thread_id == thread_id,
+            ThreadMetaRow.incarnation.is_not_distinct_from(thread_incarnation),
+            or_(ThreadMetaRow.user_id == user_id, ThreadMetaRow.user_id.is_(None)),
+        )
+        .exists()
+    )
+
+
+async def _lock_current_thread_incarnation(
+    session: AsyncSession,
+    *,
+    user_id: str,
+    thread_id: str,
+    thread_incarnation: str | None,
+) -> bool:
+    """Lock the expected thread incarnation until the transaction ends."""
+    conditions = (
+        ThreadMetaRow.thread_id == thread_id,
+        ThreadMetaRow.incarnation.is_not_distinct_from(thread_incarnation),
+        or_(ThreadMetaRow.user_id == user_id, ThreadMetaRow.user_id.is_(None)),
+    )
+    if session.get_bind().dialect.name == "sqlite":
+        # SQLite has no row-level SELECT lock. A no-op UPDATE acquires its
+        # database writer lock before we inspect or mutate an MCP task row.
+        # Raw SQL avoids firing ThreadMetaRow.updated_at's ORM onupdate hook.
+        result = await session.execute(
+            text(
+                """
+                UPDATE threads_meta
+                SET incarnation = incarnation
+                WHERE thread_id = :thread_id
+                  AND incarnation IS :thread_incarnation
+                  AND (user_id = :user_id OR user_id IS NULL)
+                """
+            ),
+            {
+                "thread_id": thread_id,
+                "thread_incarnation": thread_incarnation,
+                "user_id": user_id,
+            },
+        )
+        return result.rowcount == 1
+    result = await session.execute(select(ThreadMetaRow.thread_id).where(*conditions).with_for_update(read=True))
+    return result.one_or_none() is not None
+
+
 class McpTaskRepository:
     """Durable source of truth for long-running MCP task lifecycle state."""
 
@@ -96,8 +166,11 @@ class McpTaskRepository:
         self._sf = session_factory
 
     @staticmethod
-    def _row_to_dict(row: McpTaskRow) -> dict[str, Any]:
+    def _row_to_dict(row: McpTaskRow, *, include_internal: bool = False) -> dict[str, Any]:
         data = row.to_dict()
+        thread_incarnation = data.pop("thread_incarnation", None)
+        if include_internal:
+            data["_thread_incarnation"] = thread_incarnation
         for key in _TIMESTAMP_FIELDS:
             if data.get(key) is not None:
                 data[key] = coerce_iso(data[key])
@@ -109,6 +182,7 @@ class McpTaskRepository:
         task_id: str,
         user_id: str,
         thread_id: str,
+        expected_thread_incarnation: str | None,
         run_id: str | None,
         tool_call_id: str | None,
         server_name: str,
@@ -152,6 +226,14 @@ class McpTaskRepository:
         )
         _record_event_if_changed(row, tracking_degraded=False, now=now)
         async with self._sf() as session:
+            if not await _lock_current_thread_incarnation(
+                session,
+                user_id=user_id,
+                thread_id=thread_id,
+                thread_incarnation=expected_thread_incarnation,
+            ):
+                raise McpTaskThreadMismatchError("MCP task submission crossed a thread lifecycle boundary")
+            row.thread_incarnation = expected_thread_incarnation
             session.add(row)
             try:
                 await session.commit()
@@ -163,27 +245,53 @@ class McpTaskRepository:
             await session.refresh(row)
             return self._row_to_dict(row)
 
-    async def get(self, task_id: str, *, user_id: str) -> dict[str, Any] | None:
+    async def get(
+        self,
+        task_id: str,
+        *,
+        user_id: str,
+        thread_id: str,
+        thread_incarnation: str | None,
+    ) -> dict[str, Any] | None:
         async with self._sf() as session:
-            row = await session.get(McpTaskRow, task_id)
-            if row is None or row.user_id != user_id:
-                return None
-            return self._row_to_dict(row)
+            stmt = select(McpTaskRow).where(
+                McpTaskRow.id == task_id,
+                McpTaskRow.user_id == user_id,
+                McpTaskRow.thread_id == thread_id,
+                McpTaskRow.thread_incarnation.is_not_distinct_from(thread_incarnation),
+                _matches_current_thread_incarnation(
+                    user_id=user_id,
+                    thread_id=thread_id,
+                    thread_incarnation=thread_incarnation,
+                ),
+            )
+            row = (await session.execute(stmt)).scalar_one_or_none()
+            return self._row_to_dict(row) if row is not None else None
 
     async def list_by_thread(
         self,
         thread_id: str,
         *,
         user_id: str,
+        thread_incarnation: str | None,
         limit: int = 50,
         active_only: bool = False,
+        status: TaskStatus | None = None,
     ) -> list[dict[str, Any]]:
         stmt = select(McpTaskRow).where(
             McpTaskRow.thread_id == thread_id,
             McpTaskRow.user_id == user_id,
+            McpTaskRow.thread_incarnation.is_not_distinct_from(thread_incarnation),
+            _matches_current_thread_incarnation(
+                user_id=user_id,
+                thread_id=thread_id,
+                thread_incarnation=thread_incarnation,
+            ),
         )
         if active_only:
             stmt = stmt.where(McpTaskRow.status.in_(_POLLABLE_STATUS_VALUES))
+        if status is not None:
+            stmt = stmt.where(McpTaskRow.status == TaskStatus(status).value)
         stmt = stmt.order_by(McpTaskRow.created_at.desc(), McpTaskRow.id.desc()).limit(limit)
         async with self._sf() as session:
             result = await session.execute(stmt)
@@ -196,40 +304,95 @@ class McpTaskRepository:
         lease_owner: str,
         lease_seconds: int,
         limit: int,
+        exclude_task_ids: tuple[str, ...] = (),
     ) -> list[dict[str, Any]]:
         lease_expires_at = now + timedelta(seconds=lease_seconds)
-        stmt = (
-            select(McpTaskRow)
-            .where(
-                McpTaskRow.status.in_(_POLLABLE_STATUS_VALUES),
-                McpTaskRow.cancel_requested_at.is_(None),
-                McpTaskRow.next_poll_at.is_not(None),
-                McpTaskRow.next_poll_at <= now,
-                or_(
-                    McpTaskRow.lease_expires_at.is_(None),
-                    McpTaskRow.lease_expires_at < now,
-                ),
-            )
-            .order_by(McpTaskRow.next_poll_at.asc(), McpTaskRow.id.asc())
-            .limit(limit)
-            .with_for_update(skip_locked=True)
+        claimable = (
+            McpTaskRow.status.in_(_POLLABLE_STATUS_VALUES),
+            McpTaskRow.cancel_requested_at.is_(None),
+            McpTaskRow.next_poll_at.is_not(None),
+            McpTaskRow.next_poll_at <= now,
+            or_(
+                McpTaskRow.lease_expires_at.is_(None),
+                McpTaskRow.lease_expires_at < now,
+            ),
         )
+        stmt = select(McpTaskRow.id).where(*claimable).order_by(McpTaskRow.next_poll_at.asc(), McpTaskRow.id.asc()).limit(limit).with_for_update(skip_locked=True)
+        if exclude_task_ids:
+            stmt = stmt.where(McpTaskRow.id.not_in(exclude_task_ids))
         async with self._sf() as session:
-            result = await session.execute(stmt)
-            rows = list(result.scalars())
-            for row in rows:
-                row.lease_owner = lease_owner
-                row.lease_expires_at = lease_expires_at
-                row.poll_attempt_count += 1
-                row.updated_at = now
+            candidate_ids = list((await session.execute(stmt)).scalars())
+            # Atomic fence: ``with_for_update()`` is a no-op on SQLite, so a
+            # cancel request can commit between the SELECT and the claim. It
+            # clears the poll lease for the cancellation worker; writing the
+            # lease back would hold off the remote cancel until it expires.
+            # Each conditional UPDATE re-checks the claim predicates, and a
+            # row that stopped being claimable is skipped. It is not replaced
+            # from beyond the LIMIT: such a batch comes back short (SQLite
+            # only; Postgres row locks keep candidates claimable) and the
+            # remaining due rows are claimed on the next poll cycle.
+            claimed_ids: list[str] = []
+            for task_id in candidate_ids:
+                update_result = await session.execute(
+                    update(McpTaskRow)
+                    .where(McpTaskRow.id == task_id, *claimable)
+                    .values(
+                        lease_owner=lease_owner,
+                        lease_expires_at=lease_expires_at,
+                        lease_token=_new_claim_token(),
+                        poll_attempt_count=McpTaskRow.poll_attempt_count + 1,
+                        updated_at=now,
+                    )
+                )
+                if update_result.rowcount:
+                    claimed_ids.append(task_id)
+            claimed: list[dict[str, Any]] = []
+            if claimed_ids:
+                rows = {row.id: row for row in (await session.execute(select(McpTaskRow).where(McpTaskRow.id.in_(claimed_ids)))).scalars()}
+                claimed = [self._row_to_dict(rows[task_id], include_internal=True) for task_id in claimed_ids]
             await session.commit()
-            return [self._row_to_dict(row) for row in rows]
+            return claimed
+
+    async def renew_control_claim(
+        self,
+        task_id: str,
+        *,
+        phase: Literal["poll", "cancel"],
+        lease_owner: str,
+        lease_token: str,
+        now: datetime,
+        lease_seconds: int,
+    ) -> bool:
+        """Extend only the still-live control claim; never resurrect a lease."""
+        if phase not in ("poll", "cancel"):
+            raise ValueError("Unknown MCP control claim phase")
+        expires_at = now + timedelta(seconds=lease_seconds)
+        async with self._sf() as session:
+            result = await session.execute(
+                update(McpTaskRow)
+                .where(
+                    McpTaskRow.id == task_id,
+                    McpTaskRow.lease_owner == lease_owner,
+                    McpTaskRow.lease_token == lease_token,
+                    McpTaskRow.lease_expires_at >= now,
+                    McpTaskRow.status.not_in(_TERMINAL_STATUS_VALUES),
+                    McpTaskRow.cancel_requested_at.is_(None) if phase == "poll" else McpTaskRow.cancel_requested_at.is_not(None),
+                )
+                .values(
+                    # A backward wall-clock correction must not shorten a lease.
+                    lease_expires_at=case((McpTaskRow.lease_expires_at > expires_at, McpTaskRow.lease_expires_at), else_=expires_at),
+                    updated_at=McpTaskRow.updated_at,
+                )
+            )
+            await session.commit()
+            return bool(result.rowcount)
 
     async def apply_snapshot(
         self,
         task_id: str,
         *,
         lease_owner: str,
+        lease_token: str,
         status: str,
         result: Any | None,
         result_preview: str | None,
@@ -241,37 +404,44 @@ class McpTaskRepository:
         polled_at: datetime,
     ) -> bool:
         async with self._sf() as session:
-            stmt = (
-                select(McpTaskRow)
+            # Atomic fence: a poll result from an older generation must not
+            # overwrite a claim a newer generation reclaimed after lease expiry.
+            values: dict[str, Any] = {
+                "status": status,
+                "result": result,
+                "result_preview": result_preview,
+                "result_truncated": result_truncated,
+                "result_artifact": result_artifact,
+                "error": error,
+                "input_required": input_required,
+                "next_poll_at": next_poll_at,
+                "last_polled_at": polled_at,
+                "last_poll_error": None,
+                "consecutive_poll_error_count": 0,
+                "lease_owner": None,
+                "lease_expires_at": None,
+                "lease_token": None,
+                "updated_at": polled_at,
+            }
+            if status in _TERMINAL_STATUS_VALUES:
+                values["completed_at"] = polled_at
+            update_result = await session.execute(
+                update(McpTaskRow)
                 .where(
                     McpTaskRow.id == task_id,
                     McpTaskRow.lease_owner == lease_owner,
+                    McpTaskRow.lease_token == lease_token,
                     McpTaskRow.lease_expires_at >= polled_at,
                     McpTaskRow.status.not_in(_TERMINAL_STATUS_VALUES),
                     McpTaskRow.cancel_requested_at.is_(None),
                 )
-                .with_for_update()
+                .values(**values)
             )
-            row = (await session.execute(stmt)).scalar_one_or_none()
-            if row is None:
+            if not update_result.rowcount:
                 return False
-            row.status = status
-            row.result = result
-            row.result_preview = result_preview
-            row.result_truncated = result_truncated
-            row.result_artifact = result_artifact
-            row.error = error
-            row.input_required = input_required
-            row.next_poll_at = next_poll_at
-            row.last_polled_at = polled_at
-            row.last_poll_error = None
-            row.consecutive_poll_error_count = 0
-            row.lease_owner = None
-            row.lease_expires_at = None
-            row.updated_at = polled_at
-            if status in _TERMINAL_STATUS_VALUES:
-                row.completed_at = polled_at
-            _record_event_if_changed(row, tracking_degraded=False, now=polled_at)
+            row = (await session.execute(select(McpTaskRow).where(McpTaskRow.id == task_id))).scalar_one_or_none()
+            if row is not None:
+                _record_event_if_changed(row, tracking_degraded=False, now=polled_at)
             await session.commit()
             return True
 
@@ -280,29 +450,76 @@ class McpTaskRepository:
         task_id: str,
         *,
         lease_owner: str,
+        lease_token: str,
         next_poll_at: datetime,
         error: str,
         tracking_degraded_after_errors: int = 3,
     ) -> bool:
         async with self._sf() as session:
-            stmt = select(McpTaskRow).where(McpTaskRow.id == task_id, McpTaskRow.lease_owner == lease_owner).with_for_update()
-            row = (await session.execute(stmt)).scalar_one_or_none()
-            if row is None:
-                return False
             now = datetime.now(UTC)
-            row.next_poll_at = next_poll_at
-            row.last_poll_error = error
-            row.consecutive_poll_error_count = int(row.consecutive_poll_error_count or 0) + 1
-            row.lease_owner = None
-            row.lease_expires_at = None
-            row.updated_at = now
-            _record_event_if_changed(
-                row,
-                tracking_degraded=row.consecutive_poll_error_count >= tracking_degraded_after_errors,
-                now=now,
+            # Atomic fence: only clear the claim if the owner AND per-claim token
+            # still match. ``with_for_update()`` is a no-op on SQLite, so the old
+            # select-then-write could clear a claim that a newer generation had
+            # reclaimed after lease expiry. A conditional UPDATE makes the fence
+            # atomic: a stale release (rowcount 0) is a no-op and never mutates a
+            # newer claim.
+            update_result = await session.execute(
+                update(McpTaskRow)
+                .where(
+                    McpTaskRow.id == task_id,
+                    McpTaskRow.lease_owner == lease_owner,
+                    McpTaskRow.lease_token == lease_token,
+                )
+                .values(
+                    next_poll_at=next_poll_at,
+                    last_poll_error=error,
+                    consecutive_poll_error_count=McpTaskRow.consecutive_poll_error_count + 1,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    lease_token=None,
+                    updated_at=now,
+                )
             )
+            if not update_result.rowcount:
+                return False
+            # The fence won and we hold the write lock, so read the released row
+            # consistently and record the poll-failure tracking event.
+            row = (await session.execute(select(McpTaskRow).where(McpTaskRow.id == task_id))).scalar_one_or_none()
+            if row is not None:
+                _record_event_if_changed(
+                    row,
+                    tracking_degraded=int(row.consecutive_poll_error_count or 0) >= tracking_degraded_after_errors,
+                    now=now,
+                )
             await session.commit()
             return True
+
+    async def release_poll_claim_after_cancellation(
+        self,
+        task_id: str,
+        *,
+        lease_owner: str,
+        lease_token: str,
+    ) -> bool:
+        """Release a cancelled poll's lease without recording a poll failure."""
+        stmt = (
+            update(McpTaskRow)
+            .where(
+                McpTaskRow.id == task_id,
+                McpTaskRow.lease_owner == lease_owner,
+                McpTaskRow.lease_token == lease_token,
+            )
+            .values(
+                lease_owner=None,
+                lease_expires_at=None,
+                lease_token=None,
+                updated_at=datetime.now(UTC),
+            )
+        )
+        async with self._sf() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+            return bool(result.rowcount)
 
     async def request_cancel(
         self,
@@ -310,16 +527,31 @@ class McpTaskRepository:
         *,
         user_id: str,
         thread_id: str,
+        thread_incarnation: str | None,
         requested_at: datetime,
     ) -> dict[str, Any] | None:
         """Persist a user-scoped cancellation request without exposing the remote id."""
         async with self._sf() as session:
+            if not await _lock_current_thread_incarnation(
+                session,
+                user_id=user_id,
+                thread_id=thread_id,
+                thread_incarnation=thread_incarnation,
+            ):
+                await session.rollback()
+                return None
             stmt = (
                 select(McpTaskRow)
                 .where(
                     McpTaskRow.id == task_id,
                     McpTaskRow.user_id == user_id,
                     McpTaskRow.thread_id == thread_id,
+                    McpTaskRow.thread_incarnation.is_not_distinct_from(thread_incarnation),
+                    _matches_current_thread_incarnation(
+                        user_id=user_id,
+                        thread_id=thread_id,
+                        thread_incarnation=thread_incarnation,
+                    ),
                 )
                 .with_for_update()
             )
@@ -336,6 +568,7 @@ class McpTaskRepository:
                 # lease so it cannot trigger a concurrent remote cancellation.
                 row.lease_owner = None
                 row.lease_expires_at = None
+                row.lease_token = None
                 row.updated_at = requested_at
                 await session.commit()
             return self._row_to_dict(row)
@@ -347,6 +580,7 @@ class McpTaskRepository:
         lease_owner: str,
         lease_seconds: int,
         limit: int,
+        exclude_task_ids: tuple[str, ...] = (),
         task_id: str | None = None,
     ) -> list[dict[str, Any]]:
         stmt = select(McpTaskRow).where(
@@ -359,22 +593,30 @@ class McpTaskRepository:
         if task_id is not None:
             stmt = stmt.where(McpTaskRow.id == task_id)
         stmt = stmt.order_by(McpTaskRow.next_cancel_at.asc(), McpTaskRow.id.asc()).limit(limit).with_for_update(skip_locked=True)
+        if exclude_task_ids:
+            stmt = stmt.where(McpTaskRow.id.not_in(exclude_task_ids))
         async with self._sf() as session:
+            if session.get_bind().dialect.name == "sqlite":
+                # SQLite ignores FOR UPDATE. Reserve its writer before reading
+                # candidates so two workers cannot return the same claim.
+                await session.execute(text("BEGIN IMMEDIATE"))
             rows = list((await session.execute(stmt)).scalars())
             expires_at = now + timedelta(seconds=lease_seconds)
             for row in rows:
                 row.lease_owner = lease_owner
                 row.lease_expires_at = expires_at
+                row.lease_token = _new_claim_token()
                 row.cancel_attempt_count = int(row.cancel_attempt_count or 0) + 1
                 row.updated_at = now
             await session.commit()
-            return [self._row_to_dict(row) for row in rows]
+            return [self._row_to_dict(row, include_internal=True) for row in rows]
 
     async def apply_cancel_snapshot(
         self,
         task_id: str,
         *,
         lease_owner: str,
+        lease_token: str,
         status: str,
         result: Any | None,
         result_preview: str | None,
@@ -387,34 +629,38 @@ class McpTaskRepository:
         if status not in _TERMINAL_STATUS_VALUES:
             raise ValueError("A cancellation response must report a terminal task status")
         async with self._sf() as session:
-            stmt = (
-                select(McpTaskRow)
+            update_result = await session.execute(
+                update(McpTaskRow)
                 .where(
                     McpTaskRow.id == task_id,
                     McpTaskRow.lease_owner == lease_owner,
+                    McpTaskRow.lease_token == lease_token,
                     McpTaskRow.lease_expires_at >= completed_at,
                     McpTaskRow.status.not_in(_TERMINAL_STATUS_VALUES),
                 )
-                .with_for_update()
+                .values(
+                    status=status,
+                    result=result,
+                    result_preview=result_preview,
+                    result_truncated=result_truncated,
+                    result_artifact=result_artifact,
+                    error=error,
+                    input_required=input_required,
+                    next_poll_at=None,
+                    next_cancel_at=None,
+                    last_cancel_error=None,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    lease_token=None,
+                    completed_at=completed_at,
+                    updated_at=completed_at,
+                )
             )
-            row = (await session.execute(stmt)).scalar_one_or_none()
-            if row is None:
+            if not update_result.rowcount:
                 return False
-            row.status = status
-            row.result = result
-            row.result_preview = result_preview
-            row.result_truncated = result_truncated
-            row.result_artifact = result_artifact
-            row.error = error
-            row.input_required = input_required
-            row.next_poll_at = None
-            row.next_cancel_at = None
-            row.last_cancel_error = None
-            row.lease_owner = None
-            row.lease_expires_at = None
-            row.completed_at = completed_at
-            row.updated_at = completed_at
-            _record_event_if_changed(row, tracking_degraded=False, now=completed_at)
+            row = (await session.execute(select(McpTaskRow).where(McpTaskRow.id == task_id))).scalar_one_or_none()
+            if row is not None:
+                _record_event_if_changed(row, tracking_degraded=False, now=completed_at)
             await session.commit()
             return True
 
@@ -423,17 +669,23 @@ class McpTaskRepository:
         task_id: str,
         *,
         lease_owner: str,
+        lease_token: str,
         next_cancel_at: datetime,
-        error: str,
+        error: str | None,
     ) -> bool:
         stmt = (
             update(McpTaskRow)
-            .where(McpTaskRow.id == task_id, McpTaskRow.lease_owner == lease_owner)
+            .where(
+                McpTaskRow.id == task_id,
+                McpTaskRow.lease_owner == lease_owner,
+                McpTaskRow.lease_token == lease_token,
+            )
             .values(
                 next_cancel_at=next_cancel_at,
                 last_cancel_error=error,
                 lease_owner=None,
                 lease_expires_at=None,
+                lease_token=None,
                 updated_at=datetime.now(UTC),
             )
         )
@@ -451,7 +703,7 @@ class McpTaskRepository:
         limit: int,
         tracking_degraded_after_errors: int,
     ) -> list[dict[str, Any]]:
-        statuses = ("pending", "claimed", "retry", "dispatched")
+        statuses = ("pending", "claimed", "launching", "retry", "dispatched")
         stmt = (
             select(McpTaskRow)
             .where(
@@ -467,30 +719,164 @@ class McpTaskRepository:
         async with self._sf() as session:
             rows = list((await session.execute(stmt)).scalars())
             expires_at = now + timedelta(seconds=lease_seconds)
+            # SQLite ignores ``FOR UPDATE``, so a claim is also fenced on the
+            # state this read saw. A peer claim (future lease, changed phase), a
+            # release/defer moving the next attempt, or a newer recorded event
+            # changes one of those columns, the conditional UPDATE matches no
+            # row, and the paused claim has no side effects instead of
+            # overwriting the winning worker or bypassing its backoff.
+            sqlite = session.get_bind().dialect.name == "sqlite"
+            claimed: list[McpTaskRow] = []
             for row in rows:
-                row.notification_lease_owner = lease_owner
-                row.notification_lease_expires_at = expires_at
                 rebuild_snapshot = row.notification_status in ("pending", "claimed") or (row.notification_status == "retry" and row.dispatch_version != row.event_version)
-                if rebuild_snapshot:
-                    if row.dispatch_version != row.event_version:
-                        row.dispatch_attempt = 0
-                        row.notification_attempt_count = 0
-                    row.dispatch_version = row.event_version
-                    row.dispatch_event = _notification_event(
+                if not rebuild_snapshot and row.dispatch_event is None and row.dispatch_version != row.event_version:
+                    # A legacy in-flight phase whose dispatch payload is gone, with
+                    # a newer event already recorded: claim that newer event instead
+                    # of consuming it. Terminal tasks stop polling, so a consumed
+                    # completion would be lost permanently.
+                    rebuild_snapshot = True
+                event = (
+                    _notification_event(
                         row,
                         tracking_degraded=int(row.consecutive_poll_error_count or 0) >= tracking_degraded_after_errors,
                     )
-                    row.notification_run_id = None
-                    row.notification_status = "claimed"
-                row.updated_at = now
+                    if rebuild_snapshot
+                    else row.dispatch_event
+                )
+                dispatch_version_fence = McpTaskRow.dispatch_version.is_(None) if row.dispatch_version is None else McpTaskRow.dispatch_version == row.dispatch_version
+                next_notification_fence = McpTaskRow.next_notification_at.is_(None) if row.next_notification_at is None else McpTaskRow.next_notification_at == row.next_notification_at
+                if event is None:
+                    # The condition behind this snapshot resolved before delivery
+                    # (for example tracking recovered, or an input_required prompt
+                    # was answered), or the row carries an empty generation left by
+                    # a pre-fix claim. Consume only what was proven empty — the
+                    # current event version for a rebuild, the empty dispatch
+                    # generation otherwise — through a conditional UPDATE fenced on
+                    # the event version, phase and dispatch version this read saw.
+                    # SQLite has no ``SELECT FOR UPDATE``, so a newer event recorded
+                    # after the read must win: the fence then matches no row, this
+                    # consume is a no-op, and the newer event stays claimable.
+                    # Clearing the content fingerprint keeps an identical later
+                    # event from being suppressed by a snapshot that was never
+                    # delivered.
+                    consumed_version = row.event_version if rebuild_snapshot else (row.dispatch_version if row.dispatch_version is not None else row.event_version)
+                    status_at_read = row.notification_status
+                    session.expunge(row)
+                    await session.execute(
+                        update(McpTaskRow)
+                        .where(
+                            McpTaskRow.id == row.id,
+                            McpTaskRow.event_version == consumed_version,
+                            McpTaskRow.notification_status == status_at_read,
+                            dispatch_version_fence,
+                        )
+                        .values(
+                            notified_version=consumed_version,
+                            event_fingerprint=None,
+                            notification_status="none",
+                            notification_error=None,
+                            notification_attempt_count=0,
+                            dispatch_version=None,
+                            dispatch_attempt=0,
+                            dispatch_event=None,
+                            notification_run_id=None,
+                            notification_lease_owner=None,
+                            notification_lease_expires_at=None,
+                            notification_lease_token=None,
+                            updated_at=now,
+                        )
+                    )
+                    continue
+                claim_token = _new_claim_token()
+                claim_values: dict[str, Any] = {
+                    "notification_lease_owner": lease_owner,
+                    "notification_lease_expires_at": expires_at,
+                    "notification_lease_token": claim_token,
+                    "updated_at": now,
+                }
+                if rebuild_snapshot:
+                    claim_values.update(
+                        dispatch_version=row.event_version,
+                        dispatch_event=event,
+                        notification_run_id=None,
+                        notification_status="claimed",
+                    )
+                    if row.dispatch_version != row.event_version:
+                        claim_values.update(dispatch_attempt=0, notification_attempt_count=0)
+                if sqlite:
+                    claim_result = await session.execute(
+                        update(McpTaskRow)
+                        .where(
+                            McpTaskRow.id == row.id,
+                            McpTaskRow.event_version == row.event_version,
+                            McpTaskRow.notification_status == row.notification_status,
+                            dispatch_version_fence,
+                            next_notification_fence,
+                            or_(
+                                McpTaskRow.notification_lease_expires_at.is_(None),
+                                McpTaskRow.notification_lease_expires_at < now,
+                            ),
+                        )
+                        .values(**claim_values)
+                        .execution_options(synchronize_session=False)
+                    )
+                    if not claim_result.rowcount:
+                        # A peer claimed the row or a newer event was recorded
+                        # after this read; leave it to the next claim cycle.
+                        session.expunge(row)
+                        continue
+                    session.expunge(row)
+                for field, value in claim_values.items():
+                    setattr(row, field, value)
+                claimed.append(row)
             await session.commit()
-            return [self._row_to_dict(row) for row in rows]
+            return [self._row_to_dict(row) for row in claimed]
+
+    async def begin_notification_launch(
+        self,
+        task_id: str,
+        *,
+        lease_owner: str,
+        notification_lease_token: str,
+        dispatch_version: int,
+        lease_seconds: int,
+        now: datetime,
+    ) -> bool:
+        """Reserve one idempotent Agent launch before starting the side effect."""
+        launchable = or_(
+            McpTaskRow.notification_status == "launching",
+            and_(
+                McpTaskRow.notification_status.in_(("claimed", "retry")),
+                McpTaskRow.event_version == dispatch_version,
+            ),
+        )
+        stmt = (
+            update(McpTaskRow)
+            .where(
+                McpTaskRow.id == task_id,
+                McpTaskRow.notification_lease_owner == lease_owner,
+                McpTaskRow.notification_lease_token == notification_lease_token,
+                McpTaskRow.notification_lease_expires_at >= now,
+                McpTaskRow.dispatch_version == dispatch_version,
+                launchable,
+            )
+            .values(
+                notification_status="launching",
+                notification_lease_expires_at=now + timedelta(seconds=lease_seconds),
+                updated_at=now,
+            )
+        )
+        async with self._sf() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+            return bool(result.rowcount)
 
     async def mark_notification_dispatched(
         self,
         task_id: str,
         *,
         lease_owner: str,
+        notification_lease_token: str,
         dispatch_version: int,
         run_id: str,
         now: datetime,
@@ -500,9 +886,10 @@ class McpTaskRepository:
             .where(
                 McpTaskRow.id == task_id,
                 McpTaskRow.notification_lease_owner == lease_owner,
+                McpTaskRow.notification_lease_token == notification_lease_token,
                 McpTaskRow.notification_lease_expires_at >= now,
                 McpTaskRow.dispatch_version == dispatch_version,
-                McpTaskRow.notification_status.in_(("claimed", "retry")),
+                McpTaskRow.notification_status.in_(("claimed", "launching", "retry")),
             )
             .values(
                 notification_status="dispatched",
@@ -511,6 +898,7 @@ class McpTaskRepository:
                 next_notification_at=now,
                 notification_lease_owner=None,
                 notification_lease_expires_at=None,
+                notification_lease_token=None,
                 updated_at=now,
             )
         )
@@ -524,8 +912,9 @@ class McpTaskRepository:
         task_id: str,
         *,
         lease_owner: str,
+        notification_lease_token: str,
         next_notification_at: datetime,
-        error: str,
+        error: str | None,
         replace_with_latest: bool,
         count_failure: bool = False,
     ) -> bool:
@@ -535,6 +924,7 @@ class McpTaskRepository:
             "next_notification_at": next_notification_at,
             "notification_lease_owner": None,
             "notification_lease_expires_at": None,
+            "notification_lease_token": None,
             "updated_at": datetime.now(UTC),
         }
         if replace_with_latest:
@@ -544,7 +934,15 @@ class McpTaskRepository:
             )
         if count_failure:
             values["notification_attempt_count"] = McpTaskRow.notification_attempt_count + 1
-        stmt = update(McpTaskRow).where(McpTaskRow.id == task_id, McpTaskRow.notification_lease_owner == lease_owner).values(**values)
+        stmt = (
+            update(McpTaskRow)
+            .where(
+                McpTaskRow.id == task_id,
+                McpTaskRow.notification_lease_owner == lease_owner,
+                McpTaskRow.notification_lease_token == notification_lease_token,
+            )
+            .values(**values)
+        )
         async with self._sf() as session:
             result = await session.execute(stmt)
             await session.commit()
@@ -555,57 +953,67 @@ class McpTaskRepository:
         task_id: str,
         *,
         lease_owner: str,
+        notification_lease_token: str,
         dispatch_version: int,
         delivered: bool,
         next_notification_at: datetime | None,
         error: str | None,
         now: datetime,
     ) -> bool:
+        if delivered:
+            # A newer event may have arrived after this dispatch was queued; keep
+            # it pending for redelivery instead of swallowing it as delivered.
+            newer = McpTaskRow.event_version > dispatch_version
+            values: dict[str, Any] = {
+                "notified_version": dispatch_version,
+                "notification_status": case((newer, "pending"), else_="delivered"),
+                "dispatch_version": None,
+                "dispatch_attempt": 0,
+                "dispatch_event": None,
+                "notification_run_id": None,
+                "notification_error": None,
+                "notification_attempt_count": 0,
+                "next_notification_at": case((newer, now), else_=None),
+            }
+        else:
+            values = {
+                "notification_status": "retry",
+                "dispatch_attempt": McpTaskRow.dispatch_attempt + 1,
+                "notification_attempt_count": McpTaskRow.notification_attempt_count + 1,
+                "notification_run_id": None,
+                "notification_error": error,
+                "next_notification_at": next_notification_at,
+            }
+        values.update(
+            notification_lease_owner=None,
+            notification_lease_expires_at=None,
+            notification_lease_token=None,
+            updated_at=now,
+        )
         async with self._sf() as session:
-            stmt = (
-                select(McpTaskRow)
+            result = await session.execute(
+                update(McpTaskRow)
                 .where(
                     McpTaskRow.id == task_id,
                     McpTaskRow.notification_lease_owner == lease_owner,
+                    McpTaskRow.notification_lease_token == notification_lease_token,
                     McpTaskRow.notification_lease_expires_at >= now,
                     McpTaskRow.dispatch_version == dispatch_version,
                     McpTaskRow.notification_status == "dispatched",
                 )
-                .with_for_update()
+                .values(**values)
             )
-            row = (await session.execute(stmt)).scalar_one_or_none()
-            if row is None:
-                return False
-            if delivered:
-                row.notified_version = dispatch_version
-                row.notification_status = "pending" if row.event_version > dispatch_version else "delivered"
-                row.dispatch_version = None
-                row.dispatch_attempt = 0
-                row.dispatch_event = None
-                row.notification_run_id = None
-                row.notification_error = None
-                row.notification_attempt_count = 0
-                row.next_notification_at = now if row.event_version > dispatch_version else None
-            else:
-                row.notification_status = "retry"
-                row.dispatch_attempt = int(row.dispatch_attempt or 0) + 1
-                row.notification_attempt_count = int(row.notification_attempt_count or 0) + 1
-                row.notification_run_id = None
-                row.notification_error = error
-                row.next_notification_at = next_notification_at
-            row.notification_lease_owner = None
-            row.notification_lease_expires_at = None
-            row.updated_at = now
             await session.commit()
-            return True
+            return bool(result.rowcount)
 
     async def release_notification_lease(
         self,
         task_id: str,
         *,
         lease_owner: str,
+        notification_lease_token: str,
         next_notification_at: datetime,
-        error: str,
+        error: str | None,
         count_failure: bool = False,
     ) -> bool:
         """Release unexpected notification work without changing its phase."""
@@ -614,6 +1022,7 @@ class McpTaskRepository:
             "next_notification_at": next_notification_at,
             "notification_lease_owner": None,
             "notification_lease_expires_at": None,
+            "notification_lease_token": None,
             "updated_at": datetime.now(UTC),
         }
         if count_failure:
@@ -623,6 +1032,7 @@ class McpTaskRepository:
             .where(
                 McpTaskRow.id == task_id,
                 McpTaskRow.notification_lease_owner == lease_owner,
+                McpTaskRow.notification_lease_token == notification_lease_token,
             )
             .values(**values)
         )
@@ -636,6 +1046,7 @@ class McpTaskRepository:
         task_id: str,
         *,
         lease_owner: str,
+        notification_lease_token: str,
         dispatch_version: int,
         error: str,
         count_failure: bool,
@@ -645,9 +1056,10 @@ class McpTaskRepository:
         base_filters = (
             McpTaskRow.id == task_id,
             McpTaskRow.notification_lease_owner == lease_owner,
+            McpTaskRow.notification_lease_token == notification_lease_token,
             McpTaskRow.notification_lease_expires_at >= now,
             McpTaskRow.dispatch_version == dispatch_version,
-            McpTaskRow.notification_status.in_(("claimed", "retry", "dispatched")),
+            McpTaskRow.notification_status.in_(("claimed", "launching", "retry", "dispatched")),
         )
         dead_letter_values: dict[str, Any] = {
             "notification_status": "dead_letter",
@@ -655,6 +1067,7 @@ class McpTaskRepository:
             "next_notification_at": None,
             "notification_lease_owner": None,
             "notification_lease_expires_at": None,
+            "notification_lease_token": None,
             "dispatch_version": None,
             "dispatch_attempt": 0,
             "dispatch_event": None,
@@ -680,6 +1093,7 @@ class McpTaskRepository:
                     next_notification_at=now,
                     notification_lease_owner=None,
                     notification_lease_expires_at=None,
+                    notification_lease_token=None,
                     dispatch_version=None,
                     dispatch_attempt=0,
                     dispatch_event=None,
@@ -695,6 +1109,7 @@ class McpTaskRepository:
         task_id: str,
         *,
         lease_owner: str,
+        notification_lease_token: str,
         dispatch_version: int,
         next_notification_at: datetime,
         now: datetime,
@@ -705,6 +1120,7 @@ class McpTaskRepository:
             .where(
                 McpTaskRow.id == task_id,
                 McpTaskRow.notification_lease_owner == lease_owner,
+                McpTaskRow.notification_lease_token == notification_lease_token,
                 McpTaskRow.notification_lease_expires_at >= now,
                 McpTaskRow.dispatch_version == dispatch_version,
                 McpTaskRow.notification_status == "dispatched",
@@ -713,6 +1129,7 @@ class McpTaskRepository:
                 next_notification_at=next_notification_at,
                 notification_lease_owner=None,
                 notification_lease_expires_at=None,
+                notification_lease_token=None,
                 updated_at=now,
             )
         )

@@ -25,8 +25,18 @@ import {
   type ConversationProps,
 } from "@/components/ai-elements/conversation";
 import { Button } from "@/components/ui/button";
-import { extractArtifactsFromThread } from "@/core/artifacts/utils";
+import { KnowledgeSourcesProvider } from "@/components/workspace/citations/knowledge-source";
+import {
+  areStringArraysEqual,
+  collectThreadArtifactPaths,
+  extractArtifactsFromThread,
+} from "@/core/artifacts/utils";
+import {
+  createKnowledgeSourceReader,
+  type RetrievalSource,
+} from "@/core/citations/sources";
 import { useI18n } from "@/core/i18n/hooks";
+import { getArtifactArchiveCandidatesByGroupIndex } from "@/core/messages/artifact-archive";
 import {
   buildConversationChapters,
   CONVERSATION_OUTLINE_MIN_TURNS,
@@ -43,7 +53,11 @@ import {
   type HumanInputRequest,
   type HumanInputResponse,
 } from "@/core/messages/human-input";
-import { getRunDurationDisplaysByGroupIndex } from "@/core/messages/run-duration";
+import {
+  getMessageRunId,
+  getRunDurationDisplaysByGroupIndex,
+  type RunDurationDisplay,
+} from "@/core/messages/run-duration";
 import {
   buildTokenDebugSteps,
   type TokenDebugStep,
@@ -53,7 +67,7 @@ import {
   areStreamMetadataSnapshotsEqual,
   extractContentFromMessage,
   extractPresentFilesFromMessage,
-  extractTextFromMessage,
+  extractReasoningContentFromMessage,
   getAssistantTurnCopyData,
   getBranchableAssistantGroupIds,
   getLatestEditableTurn,
@@ -69,15 +83,23 @@ import {
 } from "@/core/messages/utils";
 import { getWorkspaceChangeAnchorGroupIndices } from "@/core/messages/workspace-change-anchor";
 import {
+  placeTaskEvents,
+  type ScheduledTaskEvent,
+} from "@/core/scheduled-tasks/events";
+import {
   buildMessageSidecarContext,
   type SidecarContext,
 } from "@/core/sidecar";
+import {
+  getSkillUsageByGroupIndex,
+  type SkillUsage,
+} from "@/core/skills/usage";
 import type { Subtask } from "@/core/tasks";
 import { useUpdateSubtask } from "@/core/tasks/context";
 import {
-  derivePendingSubtaskStatus,
-  parseSubtaskResult,
-} from "@/core/tasks/subtask-result";
+  collectRenderedSubtasks,
+  findSubtaskResultMessage,
+} from "@/core/tasks/subtask-render";
 import type { AgentThreadState } from "@/core/threads";
 import { cn } from "@/lib/utils";
 
@@ -85,6 +107,7 @@ import { ArtifactFileList } from "../artifacts/artifact-file-list";
 import { useMaybeBrowserView } from "../browser-view";
 import { CopyButton } from "../copy-button";
 import { useMaybeSidecar } from "../sidecar/context";
+import { SkillUsageMenu } from "../skill-usage/skill-usage-menu";
 import { Tooltip } from "../tooltip";
 
 import { ConversationOutline } from "./conversation-outline";
@@ -93,13 +116,20 @@ import {
   type HumanInputSubmitResult,
 } from "./human-input-card";
 import { MarkdownContent } from "./markdown-content";
-import { MessageGroup } from "./message-group";
+import {
+  createMarkdownLinkComponent,
+  MessageArtifactPathsContext,
+} from "./markdown-link";
+import { MessageGroup, getMessageGroupReasoningMessage } from "./message-group";
 import { MessageListItem } from "./message-list-item";
 import {
   MessageTokenUsageDebugList,
   MessageTokenUsageList,
 } from "./message-token-usage";
 import { RunActivity, RunDuration } from "./run-duration";
+import { ScheduledRunPrompt } from "./scheduled-run-prompt";
+import { ScheduledTaskCard } from "./scheduled-task-card";
+import { ScheduledTaskEventLine } from "./scheduled-task-event-line";
 import { MessageListSkeleton } from "./skeleton";
 import { SubtaskCard } from "./subtask-card";
 import {
@@ -115,19 +145,12 @@ type SettledStreamMetadataState = {
   snapshot: StreamMetadataSnapshot;
 };
 
-function sameStrings(previous: readonly string[], next: readonly string[]) {
-  return (
-    previous.length === next.length &&
-    previous.every((value, index) => value === next[index])
-  );
-}
-
 function useStableArtifactPaths(paths: readonly string[] | undefined) {
   const previousPathsRef = useRef<readonly string[]>(EMPTY_ARTIFACT_PATHS);
   return useMemo(() => {
     const nextPaths = paths ?? EMPTY_ARTIFACT_PATHS;
     const previousPaths = previousPathsRef.current;
-    if (sameStrings(previousPaths, nextPaths)) {
+    if (areStringArraysEqual(previousPaths, nextPaths)) {
       return previousPaths;
     }
     previousPathsRef.current = nextPaths;
@@ -156,6 +179,26 @@ function useStableMessageGroups(
 }
 
 export const MESSAGE_LIST_DEFAULT_PADDING_BOTTOM = 24;
+
+function getRenderedReasoningMessages(group: ThreadMessageGroup): Message[] {
+  if (group.type === "assistant") {
+    return group.messages.filter((message) =>
+      extractReasoningContentFromMessage(message),
+    );
+  }
+  if (group.type === "assistant:subagent") {
+    return group.messages.filter(
+      (message) =>
+        hasReasoning(message) &&
+        getMessageGroupReasoningMessage([message]) === message,
+    );
+  }
+  if (group.type === "assistant:processing") {
+    const message = getMessageGroupReasoningMessage(group.messages);
+    return message ? [message] : [];
+  }
+  return [];
+}
 
 const LOAD_MORE_HISTORY_THROTTLE_MS = 1200;
 
@@ -278,6 +321,7 @@ function LoadMoreHistoryIndicator({
 }
 
 export function MessageList({
+  archiveDownloadsEnabled = true,
   className,
   testId,
   threadId,
@@ -292,14 +336,19 @@ export function MessageList({
   onSubmitHumanInput,
   onBranchTurn,
   canRegenerate = false,
+  activeRunId,
+  activeRunStartedAt = null,
   canEdit = false,
+  editLockedByGoal = false,
   canBranch = false,
   enableSidecarActions = true,
   enableConversationOutline = false,
   sidecarSurface = false,
   initialScroll = "smooth",
   resizeScroll = "smooth",
+  scheduledTaskEvents,
 }: {
+  archiveDownloadsEnabled?: boolean;
   className?: string;
   testId?: string;
   threadId: string;
@@ -326,20 +375,78 @@ export function MessageList({
     messageIds: string[],
   ) => void | Promise<void>;
   canRegenerate?: boolean;
+  activeRunId?: string;
+  /** Server start (epoch ms) of the active run, when known. */
+  activeRunStartedAt?: number | null;
   canEdit?: boolean;
+  /** Edit would be allowed but for an active goal: show the pencil locked. */
+  editLockedByGoal?: boolean;
   canBranch?: boolean;
   enableSidecarActions?: boolean;
   enableConversationOutline?: boolean;
   sidecarSurface?: boolean;
   initialScroll?: ConversationProps["initial"];
   resizeScroll?: ConversationProps["resize"];
+  /** Lifecycle events of schedules created in this chat, one line each. */
+  scheduledTaskEvents?: readonly ScheduledTaskEvent[];
 }) {
   const { t } = useI18n();
   const sidecar = useMaybeSidecar();
   const [selectionToolbar, setSelectionToolbar] =
     useState<SelectionToolbarState | null>(null);
   const messages = thread.messages;
+  const previousKnowledgeSnapshotsRef = useRef(
+    new Map<string | Message, RetrievalSource[]>(),
+  );
+  const readMessageKnowledgeSources = useMemo(createKnowledgeSourceReader, []);
+  const knowledgeSourcesByMessage = useMemo(() => {
+    const byMessage = new Map<Message, RetrievalSource[]>();
+    const nextSnapshots = new Map<string | Message, RetrievalSource[]>();
+    const evidence = new Map<string, RetrievalSource>();
+    for (const message of messages) {
+      for (const source of readMessageKnowledgeSources(message))
+        evidence.set(source.id, source);
+      if (message.type === "ai") {
+        const key = message.id ?? message;
+        const next = [...evidence.values()];
+        const previous = previousKnowledgeSnapshotsRef.current.get(key);
+        const snapshot =
+          previous?.length === next.length &&
+          previous.every((source, index) => source.id === next[index]?.id)
+            ? previous
+            : next;
+        byMessage.set(message, snapshot);
+        nextSnapshots.set(key, snapshot);
+      }
+    }
+    previousKnowledgeSnapshotsRef.current = nextSnapshots;
+    return byMessage;
+  }, [messages, readMessageKnowledgeSources]);
   const groupedMessages = useStableMessageGroups(messages, thread.isLoading);
+  const isSteeredRun = useCallback(
+    (message: Message) => {
+      const runId =
+        getMessageRunId(message) ?? message.additional_kwargs?.run_id;
+      const progress = thread.values.applied_run_inputs;
+      return !!progress?.ids.length && runId === progress.run_id;
+    },
+    [thread.values.applied_run_inputs],
+  );
+  // Schedule event lines sit at the end of the turn they followed.
+  const placedTaskEvents = useMemo(
+    () =>
+      scheduledTaskEvents && scheduledTaskEvents.length > 0
+        ? placeTaskEvents(groupedMessages, scheduledTaskEvents, {
+            hasMoreHistory: Boolean(hasMoreHistory),
+          })
+        : null,
+    [groupedMessages, scheduledTaskEvents, hasMoreHistory],
+  );
+  // Stable historical groups survive streaming updates. Weak keys also release
+  // cached targets when pagination or a thread change removes those groups.
+  const reasoningTargetsCache = useRef(
+    new WeakMap<ThreadMessageGroup, Message[]>(),
+  );
   const chapters = useMemo(
     () =>
       buildConversationChapters(
@@ -397,8 +504,8 @@ export function MessageList({
   const browserView = useMaybeBrowserView();
   const pushBrowserFrame = browserView?.pushFrame;
   const messageCount = messages.length;
-  // The backend exposes no live start timestamp, so a mid-run mount measures
-  // from mount until authoritative persisted turn_duration replaces it.
+  // Start from mount or the loading edge, then move back to the active run's
+  // server start once known: a run observed mid-flight began before this view.
   const [turnStartTime, setTurnStartTime] = useState<number | null>(() =>
     thread.isLoading ? Date.now() : null,
   );
@@ -435,6 +542,20 @@ export function MessageList({
     }
     prevIsLoading.current = thread.isLoading;
   }, [groupedMessages, thread.error, thread.isLoading, threadId]);
+
+  useEffect(() => {
+    const startTime = turnStartTimeRef.current;
+    if (
+      !thread.isLoading ||
+      startTime === null ||
+      activeRunStartedAt === null ||
+      activeRunStartedAt >= startTime
+    ) {
+      return;
+    }
+    turnStartTimeRef.current = activeRunStartedAt;
+    setTurnStartTime(activeRunStartedAt);
+  }, [activeRunStartedAt, thread.isLoading]);
 
   useEffect(() => {
     // Only the primary chat surface drives the shared browser panel. The
@@ -498,6 +619,41 @@ export function MessageList({
   }, [groupedMessages]);
   const updateSubtask = useUpdateSubtask();
   const lastGroupIndex = groupedMessages.length - 1;
+  const renderedSubtasks = useMemo(
+    () =>
+      collectRenderedSubtasks(
+        groupedMessages,
+        (groupIndex) =>
+          thread.isLoading &&
+          (groupIndex === lastGroupIndex ||
+            (!!activeRunId &&
+              Boolean(
+                groupedMessages[groupIndex]?.messages.some(
+                  (m) =>
+                    (getMessageRunId(m) ?? m.additional_kwargs?.run_id) ===
+                    activeRunId,
+                ),
+              ))),
+        t.subtasks.failed,
+        t.subtasks.subtask,
+      ),
+    [
+      groupedMessages,
+      activeRunId,
+      lastGroupIndex,
+      t.subtasks.failed,
+      t.subtasks.subtask,
+      thread.isLoading,
+    ],
+  );
+
+  useEffect(() => {
+    // Synchronize message-derived snapshots after render. The task context
+    // ignores identical updates, so streamed re-renders remain idempotent.
+    for (const task of renderedSubtasks.updates) {
+      updateSubtask(task);
+    }
+  }, [renderedSubtasks, updateSubtask]);
   const previousTurnUsageStateRef = useRef<AssistantTurnUsageState | undefined>(
     undefined,
   );
@@ -513,8 +669,16 @@ export function MessageList({
     () => getRunDurationDisplaysByGroupIndex(groupedMessages),
     [groupedMessages],
   );
+  const artifactArchiveCandidatesByGroupIndex = useMemo(
+    () => getArtifactArchiveCandidatesByGroupIndex(groupedMessages),
+    [groupedMessages],
+  );
   const workspaceChangeAnchorGroupIndices = useMemo(
     () => getWorkspaceChangeAnchorGroupIndices(groupedMessages),
+    [groupedMessages],
+  );
+  const skillUsageByGroupIndex = useMemo(
+    () => getSkillUsageByGroupIndex(groupedMessages),
     [groupedMessages],
   );
   useEffect(() => {
@@ -863,6 +1027,7 @@ export function MessageList({
       isStreaming: boolean,
       enableBranchForTurn: boolean,
       enableRegenerateForTurn: boolean,
+      skills?: SkillUsage[],
     ) => {
       const clipboardData = getAssistantTurnCopyData(messages, { isStreaming });
       const actionTarget = [...messages]
@@ -877,8 +1042,9 @@ export function MessageList({
       }
 
       return (
-        <div className="mt-2 flex justify-start gap-1 opacity-0 transition-opacity delay-200 duration-300 group-hover/assistant-turn:opacity-100">
+        <div className="mt-2 flex justify-start gap-1 opacity-100 transition-opacity delay-200 duration-300 focus-within:opacity-100 has-[[data-state=open]]:opacity-100 sm:opacity-0 sm:group-hover/assistant-turn:opacity-100">
           {clipboardData && <CopyButton clipboardData={clipboardData} />}
+          {!isStreaming && skills && <SkillUsageMenu skills={skills} />}
           {enableBranchForTurn &&
             !isStreaming &&
             actionTarget?.id &&
@@ -919,7 +1085,13 @@ export function MessageList({
           {enableRegenerateForTurn &&
             actionTarget?.id &&
             onRegenerateMessage && (
-              <Tooltip content={t.common.regenerate}>
+              <Tooltip
+                content={
+                  isSteeredRun(actionTarget)
+                    ? t.inputBox.runInputReplayUnavailable
+                    : t.common.regenerate
+                }
+              >
                 <Button
                   aria-label={t.common.regenerate}
                   size="icon-sm"
@@ -927,6 +1099,7 @@ export function MessageList({
                   variant="ghost"
                   disabled={
                     !canRegenerate ||
+                    isSteeredRun(actionTarget) ||
                     replayActionBusy ||
                     regeneratingMessageId === actionTarget.id
                   }
@@ -945,7 +1118,7 @@ export function MessageList({
                 >
                   <RefreshCcwIcon
                     className={cn(
-                      "size-3",
+                      "size-4",
                       regeneratingMessageId === actionTarget.id &&
                         "animate-spin",
                     )}
@@ -960,12 +1133,14 @@ export function MessageList({
       branchingMessageId,
       canBranch,
       canRegenerate,
+      isSteeredRun,
       onBranchTurn,
       onRegenerateMessage,
       regeneratingMessageId,
       replayActionBusy,
       t.common.branch,
       t.common.regenerate,
+      t.inputBox.runInputReplayUnavailable,
     ],
   );
 
@@ -1020,36 +1195,52 @@ export function MessageList({
     ],
   );
 
-  const artifactPaths = useStableArtifactPaths(
-    extractArtifactsFromThread(thread),
+  const stateArtifactPaths = extractArtifactsFromThread(thread);
+  const threadArtifactPaths = useMemo(
+    () => collectThreadArtifactPaths(stateArtifactPaths, messages),
+    [stateArtifactPaths, messages],
+  );
+  const artifactPaths = useStableArtifactPaths(threadArtifactPaths);
+  // Message text rendered outside MessageListItem resolves artifact links too.
+  const threadLinkComponents = useMemo(
+    () => ({ a: createMarkdownLinkComponent(threadId) }),
+    [threadId],
   );
 
   if (thread.isThreadLoading && messages.length === 0) {
     return <MessageListSkeleton />;
   }
 
-  const withRunDuration = (
+  const getGroupRunDurations = (
     group: (typeof groupedMessages)[number],
     groupIndex: number,
-    content: ReactNode,
-  ) => {
+  ): RunDurationDisplay[] => {
     const persistedDisplays = runDurationDisplaysByGroupIndex[groupIndex] ?? [];
     const clientDuration =
       !thread.error && group.id
         ? clientDurationsByGroupId.get(`${threadId}:${group.id}`)
         : undefined;
-    const displays =
-      persistedDisplays.length > 0
-        ? persistedDisplays
-        : clientDuration !== undefined
-          ? [
-              {
-                runId: `client:${group.id}`,
-                durationSeconds: clientDuration,
-              },
-            ]
-          : [];
+    return persistedDisplays.length > 0
+      ? persistedDisplays
+      : clientDuration !== undefined
+        ? [
+            {
+              runId: `client:${group.id}`,
+              durationSeconds: clientDuration,
+            },
+          ]
+        : [];
+  };
 
+  const withRunDuration = (
+    group: (typeof groupedMessages)[number],
+    groupIndex: number,
+    content: ReactNode,
+    inlineDurationRunIds: string[] = [],
+  ) => {
+    const displays = getGroupRunDurations(group, groupIndex).filter(
+      (display) => !inlineDurationRunIds.includes(display.runId),
+    );
     if (!content && displays.length === 0) {
       return null;
     }
@@ -1059,18 +1250,29 @@ export function MessageList({
         key={`duration-group:${group.id ?? groupIndex}`}
         className="flex w-full flex-col gap-2"
       >
-        {content}
         {displays.map((display) => (
           <RunDuration
             key={display.runId}
             durationSeconds={display.durationSeconds}
           />
         ))}
+        {content}
       </div>
     );
   };
+  const renderTaskEventLines = (
+    events: readonly ScheduledTaskEvent[] | undefined,
+    className?: string,
+  ) =>
+    events && events.length > 0 ? (
+      <div className={cn("flex w-full flex-col gap-3", className)}>
+        {events.map((event) => (
+          <ScheduledTaskEventLine key={event.id} event={event} />
+        ))}
+      </div>
+    ) : null;
   return (
-    <>
+    <KnowledgeSourcesProvider messages={thread.messages}>
       <Conversation
         className={cn("flex size-full flex-col justify-center", className)}
         data-testid={testId}
@@ -1090,12 +1292,53 @@ export function MessageList({
             onActiveGroupChange={
               conversationOutlineEnabled ? handleActiveGroupChange : undefined
             }
+            renderAfterGroup={
+              placedTaskEvents
+                ? (groupIndex) =>
+                    renderTaskEventLines(
+                      placedTaskEvents.afterGroup.get(groupIndex),
+                      "mt-8",
+                    )
+                : undefined
+            }
             renderGroup={(group, groupIndex) => {
               const turnUsageMessages =
                 turnUsageMessagesByGroupIndex[groupIndex];
               const groupIsLoading =
                 thread.isLoading && groupIndex === lastGroupIndex;
 
+              const reasoningDurations = new Map<Message, RunDurationDisplay>();
+              const displays = groupIsLoading
+                ? []
+                : getGroupRunDurations(group, groupIndex);
+              if (displays.length > 0) {
+                let reasoningTargets = reasoningTargetsCache.current.get(group);
+                if (!reasoningTargets) {
+                  reasoningTargets = getRenderedReasoningMessages(group);
+                  reasoningTargetsCache.current.set(group, reasoningTargets);
+                }
+                for (const display of displays) {
+                  const target = reasoningTargets.find(
+                    (message) =>
+                      getMessageRunId(message) === display.runId ||
+                      display.runId === `client:${group.id}`,
+                  );
+                  if (target) reasoningDurations.set(target, display);
+                }
+              }
+              const inlineDurationRunIds = [...reasoningDurations.values()].map(
+                (display) => display.runId,
+              );
+
+              if (group.type === "human" && group.scheduledOrigin) {
+                // A scheduled launch: the run block replaces the launched
+                // prompt; it is the task's, so it has no edit or copy actions.
+                return withRunDuration(
+                  group,
+                  groupIndex,
+                  <ScheduledRunPrompt origin={group.scheduledOrigin} />,
+                );
+              }
               if (group.type === "human" || group.type === "assistant") {
                 return withRunDuration(
                   group,
@@ -1110,9 +1353,19 @@ export function MessageList({
                     )}
                   >
                     {group.messages.map((msg) => {
+                      const isLatestEditableHumanMessage =
+                        group.type === "human" &&
+                        !group.scheduledOrigin &&
+                        !msg.additional_kwargs?.run_input_id &&
+                        !isSteeredRun(msg) &&
+                        Boolean(msg.id) &&
+                        msg.id === latestEditableHumanMessageId &&
+                        !replayActionBusy &&
+                        Boolean(onEditAndRegenerateMessage);
                       const item = (
                         <MessageListItem
                           message={msg}
+                          knowledgeSources={knowledgeSourcesByMessage.get(msg)}
                           isLoading={
                             thread.isLoading &&
                             groupIndex === groupedMessages.length - 1
@@ -1124,21 +1377,21 @@ export function MessageList({
                               ? (msg as { run_id?: string }).run_id
                               : undefined
                           }
+                          durationSeconds={
+                            reasoningDurations.get(msg)?.durationSeconds
+                          }
                           showCopyButton={group.type !== "assistant"}
                           showWorkspaceChanges={workspaceChangeAnchorGroupIndices.has(
                             groupIndex,
                           )}
-                          canEdit={
-                            group.type === "human" &&
-                            Boolean(msg.id) &&
-                            msg.id === latestEditableHumanMessageId &&
-                            canEdit &&
-                            !replayActionBusy &&
-                            Boolean(onEditAndRegenerateMessage)
+                          canEdit={isLatestEditableHumanMessage && canEdit}
+                          editLockedByGoal={
+                            isLatestEditableHumanMessage && editLockedByGoal
                           }
                           isEditPending={editingMessageId === msg.id}
                           onEditAndRegenerate={
                             group.type === "human" &&
+                            !group.scheduledOrigin &&
                             msg.id &&
                             onEditAndRegenerateMessage
                               ? async (replacementText) => {
@@ -1198,8 +1451,12 @@ export function MessageList({
                         group.id !== undefined &&
                           branchableAssistantGroupIds.has(group.id),
                         group.id === latestAssistantGroupId,
+                        sidecarSurface
+                          ? undefined
+                          : skillUsageByGroupIndex.get(groupIndex),
                       )}
                   </div>,
+                  inlineDurationRunIds,
                 );
               } else if (group.type === "assistant:clarification") {
                 const message = group.messages[0];
@@ -1220,28 +1477,33 @@ export function MessageList({
                     group,
                     groupIndex,
                     <div className="w-full">
-                      <HumanInputCard
-                        answeredResponse={answeredResponse}
-                        disabled={
-                          thread.isLoading ||
-                          pending ||
-                          Boolean(answeredResponse) ||
-                          humanInputState.latestOpenRequestId !==
-                            humanInputRequest.request_id ||
-                          !onSubmitHumanInput
-                        }
-                        pending={pending}
-                        request={humanInputRequest}
-                        onSubmit={
-                          onSubmitHumanInput
-                            ? (response) =>
-                                handleSubmitHumanInput(
-                                  humanInputRequest,
-                                  response,
-                                )
-                            : undefined
-                        }
-                      />
+                      <MessageArtifactPathsContext.Provider
+                        value={artifactPaths}
+                      >
+                        <HumanInputCard
+                          answeredResponse={answeredResponse}
+                          disabled={
+                            thread.isLoading ||
+                            pending ||
+                            Boolean(answeredResponse) ||
+                            humanInputState.latestOpenRequestId !==
+                              humanInputRequest.request_id ||
+                            !onSubmitHumanInput
+                          }
+                          pending={pending}
+                          request={humanInputRequest}
+                          threadId={threadId}
+                          onSubmit={
+                            onSubmitHumanInput
+                              ? (response) =>
+                                  handleSubmitHumanInput(
+                                    humanInputRequest,
+                                    response,
+                                  )
+                              : undefined
+                          }
+                        />
+                      </MessageArtifactPathsContext.Provider>
                       {renderTokenUsage({
                         messages: group.messages,
                         turnUsageMessages,
@@ -1255,10 +1517,15 @@ export function MessageList({
                     group,
                     groupIndex,
                     <div className="w-full">
-                      <MarkdownContent
-                        content={extractContentFromMessage(message)}
-                        isLoading={thread.isLoading}
-                      />
+                      <MessageArtifactPathsContext.Provider
+                        value={artifactPaths}
+                      >
+                        <MarkdownContent
+                          content={extractContentFromMessage(message)}
+                          isLoading={thread.isLoading}
+                          components={threadLinkComponents}
+                        />
+                      </MessageArtifactPathsContext.Provider>
                       {renderTokenUsage({
                         messages: group.messages,
                         turnUsageMessages,
@@ -1267,27 +1534,54 @@ export function MessageList({
                   );
                 }
                 return withRunDuration(group, groupIndex, null);
+              } else if (group.type === "assistant:scheduled-task") {
+                return withRunDuration(
+                  group,
+                  groupIndex,
+                  <div className="w-full">
+                    <ScheduledTaskCard result={group.scheduleResult} />
+                    {renderTokenUsage({
+                      messages: group.messages,
+                      turnUsageMessages,
+                    })}
+                  </div>,
+                );
               } else if (group.type === "assistant:present-files") {
-                const files: string[] = [];
+                const files = new Set<string>();
                 for (const message of group.messages) {
                   if (hasPresentFiles(message)) {
                     const presentFiles =
                       extractPresentFilesFromMessage(message);
-                    files.push(...presentFiles);
+                    for (const file of presentFiles) files.add(file);
                   }
                 }
+                const presentedFiles = [...files];
+                const archiveCandidate =
+                  artifactArchiveCandidatesByGroupIndex[groupIndex];
                 return withRunDuration(
                   group,
                   groupIndex,
                   <div className="w-full">
                     {group.messages[0] && hasContent(group.messages[0]) && (
-                      <MarkdownContent
-                        content={extractContentFromMessage(group.messages[0])}
-                        isLoading={thread.isLoading}
-                        className="mb-4"
-                      />
+                      <MessageArtifactPathsContext.Provider
+                        value={artifactPaths}
+                      >
+                        <MarkdownContent
+                          content={extractContentFromMessage(group.messages[0])}
+                          isLoading={thread.isLoading}
+                          className="mb-4"
+                          components={threadLinkComponents}
+                        />
+                      </MessageArtifactPathsContext.Provider>
                     )}
-                    <ArtifactFileList files={files} threadId={threadId} />
+                    <ArtifactFileList
+                      archiveDownloadsEnabled={
+                        archiveDownloadsEnabled && !thread.isLoading
+                      }
+                      files={presentedFiles}
+                      runId={archiveCandidate?.runId}
+                      threadId={threadId}
+                    />
                     {renderTokenUsage({
                       messages: group.messages,
                       turnUsageMessages,
@@ -1297,40 +1591,15 @@ export function MessageList({
               } else if (group.type === "assistant:subagent") {
                 const tasks = new Set<Subtask>();
                 for (const message of group.messages) {
-                  if (message.type === "ai") {
-                    for (const toolCall of message.tool_calls ?? []) {
-                      if (toolCall.name === "task") {
-                        const taskId = toolCall.id;
-                        if (!taskId) {
-                          continue;
-                        }
-                        const status = derivePendingSubtaskStatus(
-                          taskId,
-                          group.messages,
-                          groupIsLoading,
-                        );
-                        const task: Subtask = {
-                          id: taskId,
-                          subagent_type: toolCall.args.subagent_type,
-                          description: toolCall.args.description,
-                          prompt: toolCall.args.prompt,
-                          status,
-                          ...(status === "failed"
-                            ? { error: t.subtasks.failed }
-                            : {}),
-                        };
-                        updateSubtask(task);
-                        tasks.add(task);
-                      }
-                    }
-                  } else if (message.type === "tool") {
-                    const taskId = message.tool_call_id;
-                    if (taskId) {
-                      const parsed = parseSubtaskResult(
-                        extractTextFromMessage(message),
-                        message.additional_kwargs,
-                      );
-                      updateSubtask({ id: taskId, ...parsed });
+                  if (message.type !== "ai") {
+                    continue;
+                  }
+                  for (const toolCall of message.tool_calls ?? []) {
+                    const task = toolCall.id
+                      ? renderedSubtasks.tasks.get(toolCall.id)
+                      : undefined;
+                    if (toolCall.name === "task" && task) {
+                      tasks.add(task);
                     }
                   }
                 }
@@ -1352,16 +1621,25 @@ export function MessageList({
                 )) {
                   if (hasReasoning(message)) {
                     results.push(
-                      <MessageGroup
+                      <MessageArtifactPathsContext.Provider
                         key={"thinking-group-" + message.id}
-                        messages={[message]}
-                        isLoading={groupIsLoading}
-                        deferBrowserPreviews={thread.isLoading}
-                        tokenDebugSteps={getTokenDebugStepsForMessages([
-                          message,
-                        ])}
-                        showTokenDebugSummaries={showTokenDebugSummaries}
-                      />,
+                        value={artifactPaths}
+                      >
+                        <MessageGroup
+                          messages={[message]}
+                          durationSeconds={
+                            reasoningDurations.get(message)?.durationSeconds
+                          }
+                          isLoading={groupIsLoading}
+                          deferBrowserPreviews={thread.isLoading}
+                          tokenDebugSteps={getTokenDebugStepsForMessages([
+                            message,
+                          ])}
+                          showTokenDebugSummaries={showTokenDebugSummaries}
+                          threadId={threadId}
+                          toolArtifacts={thread.values?.tool_artifacts}
+                        />
+                      </MessageArtifactPathsContext.Provider>,
                     );
                   } else if (message.id) {
                     subagentDebugMessageIds.push(message.id);
@@ -1372,14 +1650,27 @@ export function MessageList({
                       : [],
                   );
                   for (const taskId of taskIds ?? []) {
+                    const fallbackTask = renderedSubtasks.tasks.get(taskId);
+                    if (!fallbackTask) {
+                      continue;
+                    }
                     results.push(
-                      <SubtaskCard
+                      <MessageArtifactPathsContext.Provider
                         key={"task-group-" + taskId}
-                        taskId={taskId}
-                        threadId={threadId}
-                        runId={(message as { run_id?: string }).run_id}
-                        isLoading={groupIsLoading}
-                      />,
+                        value={artifactPaths}
+                      >
+                        <SubtaskCard
+                          taskId={taskId}
+                          threadId={threadId}
+                          runId={(message as { run_id?: string }).run_id}
+                          isLoading={groupIsLoading}
+                          fallbackTask={fallbackTask}
+                          resultMessage={findSubtaskResultMessage(
+                            group,
+                            taskId,
+                          )}
+                        />
+                      </MessageArtifactPathsContext.Provider>,
                     );
                   }
                 }
@@ -1394,31 +1685,41 @@ export function MessageList({
                       debugMessageIds: subagentDebugMessageIds,
                     })}
                   </div>,
+                  inlineDurationRunIds,
                 );
               }
               return withRunDuration(
                 group,
                 groupIndex,
                 <div className="w-full">
-                  <MessageGroup
-                    messages={group.messages}
-                    isLoading={groupIsLoading}
-                    deferBrowserPreviews={thread.isLoading}
-                    threadId={threadId}
-                    tokenDebugSteps={getTokenDebugStepsForMessages(
-                      group.messages,
-                    )}
-                    showTokenDebugSummaries={showTokenDebugSummaries}
-                  />
+                  <MessageArtifactPathsContext.Provider value={artifactPaths}>
+                    <MessageGroup
+                      messages={group.messages}
+                      durationSeconds={
+                        reasoningDurations.values().next().value
+                          ?.durationSeconds
+                      }
+                      isLoading={groupIsLoading}
+                      deferBrowserPreviews={thread.isLoading}
+                      threadId={threadId}
+                      tokenDebugSteps={getTokenDebugStepsForMessages(
+                        group.messages,
+                      )}
+                      showTokenDebugSummaries={showTokenDebugSummaries}
+                      toolArtifacts={thread.values?.tool_artifacts}
+                    />
+                  </MessageArtifactPathsContext.Provider>
                   {renderTokenUsage({
                     messages: group.messages,
                     turnUsageMessages,
                     inlineDebug: false,
                   })}
                 </div>,
+                inlineDurationRunIds,
               );
             }}
           />
+          {renderTaskEventLines(placedTaskEvents?.tail)}
           {thread.isLoading && !hasActiveAssistantText && (
             <div className="w-full">
               <RunActivity startTime={turnStartTime} />
@@ -1482,6 +1783,6 @@ export function MessageList({
           </Button>
         </div>
       )}
-    </>
+    </KnowledgeSourcesProvider>
   );
 }

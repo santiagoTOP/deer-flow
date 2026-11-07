@@ -13,7 +13,7 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-_UPLOAD_BLOCK_RE = re.compile(r"<(?P<tag>uploaded_files|current_uploads)>[\s\S]*?</(?P=tag)>\n*", re.IGNORECASE)
+_UPLOAD_BLOCK_RE = re.compile(r"<current_uploads>[\s\S]*?</current_uploads>\n*", re.IGNORECASE)
 
 _PATTERN_CACHE: dict[tuple[str, str | None], list[re.Pattern[str]]] = {}
 
@@ -97,6 +97,13 @@ def load_patterns(name: str, *, patterns_dir: str | None = None) -> list[re.Patt
 def extract_message_text(message: Any) -> str:
     """Extract plain text from message content for filtering and signal detection."""
     content = getattr(message, "content", "")
+    if content is None:
+        # ``str(None)`` is the truthy literal ``"None"``, so a content-less
+        # message would survive every downstream ``text if text else ...``
+        # fallback and be reported as real user text. Keep this in step with
+        # ``deerflow/utils/messages.py:message_content_to_text`` and the mem0
+        # copy of this helper, which both return "" here.
+        return ""
     if isinstance(content, list):
         text_parts: list[str] = []
         for part in content:
@@ -186,7 +193,7 @@ def filter_messages_for_memory(messages: list[Any], *, should_keep_hidden_messag
                 if not keep:
                     continue
             content_str = extract_message_text(msg)
-            if "<uploaded_files>" in content_str.lower() or "<current_uploads>" in content_str.lower():
+            if "<current_uploads>" in content_str.lower():
                 stripped = _UPLOAD_BLOCK_RE.sub("", content_str).strip()
                 if not stripped:
                     skip_next_ai = True
@@ -199,12 +206,14 @@ def filter_messages_for_memory(messages: list[Any], *, should_keep_hidden_messag
                 filtered.append(msg)
                 skip_next_ai = False
         elif msg_type == "ai":
-            tool_calls = getattr(msg, "tool_calls", None)
-            if not tool_calls:
-                if skip_next_ai:
-                    skip_next_ai = False
-                    continue
-                filtered.append(msg)
+            # Invalid/provider-raw calls are still tool turns, not final replies.
+            additional_kwargs = getattr(msg, "additional_kwargs", {}) or {}
+            if getattr(msg, "tool_calls", None) or getattr(msg, "invalid_tool_calls", None) or additional_kwargs.get("tool_calls") or additional_kwargs.get("function_call"):
+                continue
+            if skip_next_ai:
+                skip_next_ai = False
+                continue
+            filtered.append(msg)
 
     return filtered
 
@@ -262,20 +271,32 @@ SIGNAL_NAMES: tuple[str, ...] = (
     "decision",
 )
 
+#: Trailing messages :func:`detect_signals` scans by default. This is the "recent
+#: turns" window the extraction hints and the reinforcement gate are about; a caller
+#: with a different question -- the pre-screen's L3 veto, which has to answer for a
+#: whole batch -- passes ``window=None``.
+_SIGNAL_WINDOW = 6
+
 
 def detect_signals(
     messages: list[Any],
     *,
     patterns_dir: str | None = None,
+    window: int | None = _SIGNAL_WINDOW,
 ) -> set[str]:
     """Detect signal classes in the recent conversation turns.
 
-    Returns the set of signal names whose patterns match a human message among
-    the last 6 filtered messages. This generalizes :func:`detect_correction` /
-    :func:`detect_reinforcement` (which remain for backward compatibility) to
-    the full signal set. The window stays ``messages[-6:]``.
+    Returns the set of signal names whose patterns match a human message among the
+    last ``window`` messages (the default 6, the "recent turns" window the
+    extraction hints and the reinforcement gate are about). ``window=None`` scans
+    every message instead: the pre-screen's L3 veto needs that, because a skip
+    consumes the whole post-watermark batch, so an explicit signal anywhere in that
+    batch must keep it out of judging -- not only one inside the trailing window.
+    This generalizes :func:`detect_correction` / :func:`detect_reinforcement` (which
+    remain for backward compatibility) to the full signal set.
     """
-    recent_user_msgs = [msg for msg in messages[-6:] if getattr(msg, "type", None) == "human"]
+    candidates = messages if window is None else messages[-window:]
+    recent_user_msgs = [msg for msg in candidates if getattr(msg, "type", None) == "human"]
     if not recent_user_msgs:
         return set()
 

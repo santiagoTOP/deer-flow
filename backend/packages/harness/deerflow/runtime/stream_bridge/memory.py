@@ -7,13 +7,14 @@ import logging
 import re
 import time
 from collections.abc import AsyncIterator
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
-from .base import END_SENTINEL, HEARTBEAT_SENTINEL, StreamBridge, StreamEvent, StreamGap, StreamItem
+from .base import DEFAULT_HEARTBEAT_INTERVAL_SECONDS, END_SENTINEL, HEARTBEAT_SENTINEL, StreamBridge, StreamEvent, StreamGap, StreamItem
 
 logger = logging.getLogger(__name__)
-_MEMORY_STREAM_ID_RE = re.compile(r"\d+-(\d+)")
+_MEMORY_STREAM_ID_RE = re.compile(r"[0-9]+-([0-9]+)")
 
 
 @dataclass
@@ -24,6 +25,8 @@ class _RunStream:
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     ended: bool = False
     start_offset: int = 0  # 表示当前events 中第一个事件的索引位置，可能不为 0，因为会删除旧的事件
+    last_evicted_event_id: str | None = None
+    retired: bool = False
 
 
 class MemoryStreamBridge(StreamBridge):
@@ -33,7 +36,8 @@ class MemoryStreamBridge(StreamBridge):
     and reconnecting clients can replay buffered events from ``Last-Event-ID``.
     """
 
-    def __init__(self, *, queue_maxsize: int = 256) -> None:
+    def __init__(self, *, queue_maxsize: int = 256, heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS) -> None:
+        super().__init__(heartbeat_interval=heartbeat_interval)
         self._maxsize = max(1, queue_maxsize)
         self._streams: dict[str, _RunStream] = {}  # 表示每个run 的事件流
         self._counters: dict[str, int] = {}  # 表示每个run 的事件计数器，用于生成事件id
@@ -64,7 +68,11 @@ class MemoryStreamBridge(StreamBridge):
         match = _MEMORY_STREAM_ID_RE.fullmatch(event_id)
         if match is None:
             return None
-        return int(match.group(1))
+        try:
+            return int(match.group(1))
+        except ValueError:
+            # Numeric-looking reconnect ids can exceed Python's digit limit.
+            return None
 
     @staticmethod
     def _make_gap(stream: _RunStream, requested_event_id: str | None) -> StreamGap:
@@ -76,16 +84,20 @@ class MemoryStreamBridge(StreamBridge):
 
     def _resolve_start_offset(self, stream: _RunStream, last_event_id: str | None) -> int | StreamGap:
         """断开连接时，根据last_event_id 解析出最新的start_offset（找不到时返回 StreamGap）"""
+        # Cleanup can win the Condition after a new reader captures this generation.
+        if stream.retired:
+            return StreamGap(last_event_id, None, None)
         if last_event_id is None:
+            return stream.start_offset
+        if last_event_id == stream.last_evicted_event_id:
             return stream.start_offset
 
         # Event ids embed a per-run, monotonically increasing ``seq`` that equals
         # the event's absolute offset, so locate the event by arithmetic in O(1)
         # rather than scanning the retained buffer. Retained ids are verified at
-        # the computed index. Once an id is below the retained watermark there is
-        # nothing left to verify its timestamp against, so even a numeric foreign
-        # id takes the conservative gap path; reloading durable state is safer
-        # than silently claiming a complete replay. Unknown ids at or above the
+        # the computed index. The exact last evicted id is a known predecessor
+        # whose successors are all retained. Other ids below the watermark cannot
+        # be verified and take the conservative gap path. Unknown ids at or above the
         # watermark keep the legacy replay-from-earliest behavior.
         seq = self._parse_event_seq(last_event_id)
         if seq is not None:
@@ -112,12 +124,14 @@ class MemoryStreamBridge(StreamBridge):
 
     async def publish(self, run_id: str, event: str, data: Any) -> None:
         """发布事件：将事件添加到events 中，更新ts 和seq 列表，通知所有订阅者，生产者调用"""
+        data = deepcopy(data)
         stream = self._get_or_create_stream(run_id)
         entry = StreamEvent(id=self._next_id(run_id), event=event, data=data)  # 定义新的事件
         async with stream.condition:  # 加锁，确保线程安全
             stream.events.append(entry)
             if len(stream.events) > self._maxsize:  # 如果events 中事件数量超过最大容量，删除旧的事件
                 overflow = len(stream.events) - self._maxsize
+                stream.last_evicted_event_id = stream.events[overflow - 1].id
                 del stream.events[:overflow]
                 stream.start_offset += overflow
             stream.condition.notify_all()  # 通知所有订阅者，更新事件列表
@@ -134,8 +148,9 @@ class MemoryStreamBridge(StreamBridge):
         run_id: str,
         *,
         last_event_id: str | None = None,
-        heartbeat_interval: float = 15.0,
+        heartbeat_interval: float | None = None,
     ) -> AsyncIterator[StreamItem]:
+        heartbeat_interval = self._resolve_heartbeat_interval(heartbeat_interval)
         stream = self._get_or_create_stream(run_id)
         async with stream.condition:
             start = self._resolve_start_offset(stream, last_event_id)  # 解析出下一个事件的索引位置（或 StreamGap）
@@ -154,13 +169,16 @@ class MemoryStreamBridge(StreamBridge):
 
         while True:
             async with stream.condition:
-                if next_offset < stream.start_offset:
+                if stream.retired:
+                    entry: StreamItem = END_SENTINEL if stream.ended and next_offset >= stream.start_offset else StreamGap(cursor_event_id, None, None)
+                    should_stop = True
+                elif next_offset < stream.start_offset:
                     logger.warning(
                         "subscriber for run %s fell behind retained buffer at offset %s",
                         run_id,
                         next_offset,
                     )
-                    entry: StreamItem = self._make_gap(stream, cursor_event_id)
+                    entry = self._make_gap(stream, cursor_event_id)
                     should_stop = True
                 else:
                     should_stop = False
@@ -186,16 +204,30 @@ class MemoryStreamBridge(StreamBridge):
             if entry is END_SENTINEL:  # 如果是结束事件，说明没有更多事件了，返回结束事件，结束订阅
                 yield END_SENTINEL
                 return
-            yield entry  # 否则，返回当前事件
+            # Consumers identify sentinels with `is`; never deep-copy them.
+            # 否则，返回当前事件
+            yield deepcopy(entry) if isinstance(entry, StreamEvent) and entry is not HEARTBEAT_SENTINEL else entry
             if should_stop:
                 return
 
     async def cleanup(self, run_id: str, *, delay: float = 0) -> None:
         if delay > 0:
             await asyncio.sleep(delay)
-        self._streams.pop(run_id, None)
-        self._counters.pop(run_id, None)
+        stream = self._streams.get(run_id)
+        if stream is None:
+            return
+        async with stream.condition:
+            # Established generators retain this object after registry removal.
+            # Retire that generation, release its payloads, and wake readers so
+            # they can reload durable state rather than waiting on an orphan.
+            stream.retired = True
+            stream.start_offset += len(stream.events)
+            stream.events.clear()
+            if self._streams.get(run_id) is stream:
+                self._streams.pop(run_id, None)
+                self._counters.pop(run_id, None)
+            stream.condition.notify_all()
 
     async def close(self) -> None:
-        self._streams.clear()
-        self._counters.clear()
+        for run_id in tuple(self._streams):
+            await self.cleanup(run_id)

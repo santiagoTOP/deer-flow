@@ -79,6 +79,49 @@ class _CustomRunStoreWithoutProgress(RunStore):
         return False
 
 
+class _LegacyExplicitPutRunStore(_CustomRunStoreWithoutProgress):
+    async def put(
+        self,
+        run_id,
+        *,
+        thread_id,
+        assistant_id=None,
+        user_id=None,
+        model_name=None,
+        status="pending",
+        operation_kind="run",
+        multitask_strategy="reject",
+        metadata=None,
+        kwargs=None,
+        error=None,
+        stop_reason=None,
+        created_at=None,
+        goal_verdict=None,
+        owner_worker_id=None,
+        lease_expires_at=None,
+        idempotency_key=None,
+    ):
+        del (
+            run_id,
+            thread_id,
+            assistant_id,
+            user_id,
+            model_name,
+            status,
+            operation_kind,
+            multitask_strategy,
+            metadata,
+            kwargs,
+            error,
+            stop_reason,
+            created_at,
+            goal_verdict,
+            owner_worker_id,
+            lease_expires_at,
+            idempotency_key,
+        )
+
+
 @pytest.mark.anyio
 async def test_update_run_progress_defaults_to_noop_for_custom_store():
     store = _CustomRunStoreWithoutProgress()
@@ -108,6 +151,33 @@ async def test_legacy_create_run_atomic_store_remains_compatible():
         )
 
 
+@pytest.mark.anyio
+async def test_non_idempotent_run_remains_compatible_with_legacy_explicit_put_signature():
+    manager = RunManager(store=_LegacyExplicitPutRunStore())
+
+    record = await manager.create("t1")
+
+    assert record.thread_id == "t1"
+
+
+@pytest.mark.anyio
+async def test_keyed_resume_rejects_legacy_create_run_atomic_adapter_before_admission():
+    from deerflow.runtime import RunIdempotencyUnsupported
+
+    manager = RunManager(store=_CustomRunStoreWithoutProgress())
+
+    with pytest.raises(RunIdempotencyUnsupported, match="does not support keyed resume"):
+        await manager.create_or_reject(
+            "t1",
+            idempotency_key="http-run:resume",
+            idempotency_request={
+                "version": 1,
+                "kind": "resume",
+                "sha256": "a" * 64,
+            },
+        )
+
+
 class TestRunRepository:
     @pytest.mark.anyio
     async def test_put_and_get(self, tmp_path):
@@ -131,6 +201,30 @@ class TestRunRepository:
         assert row["assistant_id"] == "new-agent"
         assert row["status"] == "running"
         assert row["error"] == "retry"
+        await _cleanup()
+
+    @pytest.mark.anyio
+    async def test_manager_snapshot_put_preserves_private_idempotency_request(self, tmp_path):
+        repo = await _make_repo(tmp_path)
+        manager = RunManager(store=repo, worker_id="worker-a")
+        identity = {
+            "version": 1,
+            "kind": "resume",
+            "sha256": "a" * 64,
+        }
+        record = await manager.create_or_reject(
+            "t1",
+            idempotency_key="http-run:key",
+            idempotency_request=identity,
+        )
+
+        record.error = "snapshot retry"
+        assert await manager._persist_to_store(record) is True
+
+        row = await repo.get(record.run_id)
+        assert row is not None
+        assert row["idempotency_request"] == identity
+        assert row["error"] == "snapshot retry"
         await _cleanup()
 
     @pytest.mark.anyio
@@ -508,6 +602,41 @@ class TestRunRepository:
         await _cleanup()
 
     @pytest.mark.anyio
+    async def test_list_by_thread_keyset_cursor(self, tmp_path):
+        repo = await _make_repo(tmp_path)
+        await repo.put("r1", thread_id="t1", status="success", created_at="2024-01-01T00:00:00+00:00")
+        await repo.put("r2", thread_id="t1", status="success", created_at="2024-01-02T00:00:00+00:00")
+        await repo.put("r3", thread_id="t1", status="success", created_at="2024-01-03T00:00:00+00:00")
+        first = await repo.list_by_thread("t1", limit=2)
+        assert [row["run_id"] for row in first] == ["r3", "r2"]
+        second = await repo.list_by_thread(
+            "t1",
+            limit=2,
+            before_created_at=first[-1]["created_at"],
+            before_run_id=first[-1]["run_id"],
+        )
+        assert [row["run_id"] for row in second] == ["r1"]
+        await _cleanup()
+
+    @pytest.mark.anyio
+    async def test_list_by_thread_keyset_breaks_timestamp_ties(self, tmp_path):
+        repo = await _make_repo(tmp_path)
+        tied = "2024-01-01T00:00:00+00:00"
+        await repo.put("a", thread_id="t1", status="success", created_at=tied)
+        await repo.put("b", thread_id="t1", status="success", created_at=tied)
+        await repo.put("c", thread_id="t1", status="success", created_at=tied)
+        first = await repo.list_by_thread("t1", limit=2)
+        assert [row["run_id"] for row in first] == ["c", "b"]
+        second = await repo.list_by_thread(
+            "t1",
+            limit=2,
+            before_created_at=first[-1]["created_at"],
+            before_run_id=first[-1]["run_id"],
+        )
+        assert [row["run_id"] for row in second] == ["a"]
+        await _cleanup()
+
+    @pytest.mark.anyio
     async def test_owner_none_returns_all(self, tmp_path):
         repo = await _make_repo(tmp_path)
         await repo.put("r1", thread_id="t1", user_id="alice", status="success")
@@ -793,6 +922,110 @@ class TestRunRepository:
         assert reused.run_id == first.run_id
         assert reused.idempotency_reused is True
         assert len(await repo.list_by_thread("thread-T", user_id="user-1")) == 1
+        await _cleanup()
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("strategy", ["interrupt", "rollback"])
+    async def test_peer_interrupt_strategy_reuses_live_idempotency_key_before_foreign_lease_conflict(
+        self,
+        tmp_path,
+        strategy,
+    ):
+        from deerflow.config.run_ownership_config import RunOwnershipConfig
+
+        repo = await _make_repo(tmp_path)
+        ownership = RunOwnershipConfig(
+            lease_seconds=30,
+            grace_seconds=10,
+            heartbeat_enabled=True,
+        )
+        owner = RunManager(
+            store=repo,
+            worker_id="worker-a",
+            run_ownership_config=ownership,
+        )
+        peer = RunManager(
+            store=repo,
+            worker_id="worker-b",
+            run_ownership_config=ownership,
+        )
+        first = await owner.create_or_reject(
+            "thread-T",
+            user_id="user-1",
+            multitask_strategy=strategy,
+            idempotency_key="http-run:same",
+        )
+
+        reused = await peer.create_or_reject(
+            "thread-T",
+            user_id="user-1",
+            multitask_strategy=strategy,
+            idempotency_key="http-run:same",
+        )
+
+        assert reused.run_id == first.run_id
+        assert reused.idempotency_reused is True
+        assert reused.store_only is True
+        stored = await repo.get(first.run_id, user_id="user-1")
+        assert stored is not None
+        assert stored["status"] == "pending"
+        assert stored["owner_worker_id"] == "worker-a"
+        assert len(await repo.list_by_thread("thread-T", user_id="user-1")) == 1
+        await _cleanup()
+
+    @pytest.mark.anyio
+    async def test_peer_idempotent_reuse_releases_thread_after_owner_completes(self, tmp_path):
+        repo = await _make_repo(tmp_path)
+        owner = RunManager(store=repo, worker_id="worker-a")
+        peer = RunManager(store=repo, worker_id="worker-b")
+        first = await owner.create_or_reject("thread-T", user_id="user-1", idempotency_key="mcp-task:task-1:1:0")
+        await peer.create_or_reject("thread-T", user_id="user-1", idempotency_key="mcp-task:task-1:1:0")
+
+        await owner.set_status(first.run_id, RunStatus.success)
+        await owner.cleanup(first.run_id, delay=0)
+
+        # Keyed retries resolve through the terminal row's idempotency conflict,
+        # on the peer and on the owner after its local record is cleaned up.
+        # They run before the follow-up: a key retry does not win over a
+        # different run already active on the same worker.
+        for manager in (peer, owner):
+            retried = await manager.create_or_reject("thread-T", user_id="user-1", idempotency_key="mcp-task:task-1:1:0")
+            assert retried.run_id == first.run_id
+            assert retried.store_only is True
+            assert retried.idempotency_reused is True
+            assert retried.status == RunStatus.success
+        follow_up = await peer.create_or_reject("thread-T", user_id="user-1")
+
+        assert follow_up.run_id != first.run_id
+        await _cleanup()
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("admit", ["create", "create_or_reject"])
+    async def test_run_record_owner_matches_row_stamped_from_context(self, tmp_path, admit):
+        """Both record constructors resolve an omitted owner the way the SQL store does."""
+        repo = await _make_repo(tmp_path)
+        manager = RunManager(store=repo)
+        record = await getattr(manager, admit)("thread-T")
+
+        stored = await repo.get(record.run_id)
+        assert stored is not None
+        assert record.user_id == stored["user_id"] == "test-user-autouse"
+        await _cleanup()
+
+    @pytest.mark.anyio
+    async def test_keyed_retry_without_explicit_user_reuses_row_stamped_from_context(self, tmp_path):
+        """A retry that hydrates the stamped row must not read it as another user's run."""
+        repo = await _make_repo(tmp_path)
+        owner = RunManager(store=repo, worker_id="worker-a")
+        peer = RunManager(store=repo, worker_id="worker-b")
+        first = await owner.create_or_reject("thread-T", idempotency_key="http-run:retry")
+
+        await owner.set_status(first.run_id, RunStatus.success)
+        await owner.cleanup(first.run_id, delay=0)
+        for manager in (peer, owner):
+            retried = await manager.create_or_reject("thread-T", idempotency_key="http-run:retry")
+            assert retried.run_id == first.run_id
+            assert retried.idempotency_reused is True
         await _cleanup()
 
     @pytest.mark.anyio
@@ -1093,8 +1326,8 @@ class TestRunRepository:
         await _cleanup()
 
     @pytest.mark.anyio
-    async def test_reconciliation_skips_run_renewed_after_scan(self, tmp_path):
-        """The SQL takeover CAS must reject a candidate renewed after its scan."""
+    async def test_reconciliation_claims_run_whose_expired_owner_attempted_renewal(self, tmp_path):
+        """An expired lease cannot be renewed to evade the SQL takeover CAS."""
         repo = await _make_repo(tmp_path)
         grace = 10
         run_id = "renewed-after-scan"
@@ -1117,7 +1350,7 @@ class TestRunRepository:
                     owner_worker_id=owner_worker_id,
                     lease_expires_at=(datetime.now(UTC) + timedelta(seconds=60)).isoformat(),
                 )
-                assert renewed is True
+                assert renewed is False
                 return rows
 
             repo.list_inflight_with_expired_lease = scan_then_renew
@@ -1126,10 +1359,10 @@ class TestRunRepository:
             recovered = await manager.reconcile_orphaned_inflight_runs(error="orphaned")
 
             row = await repo.get(run_id)
-            assert recovered == []
+            assert [r.run_id for r in recovered] == [run_id]
             assert row is not None
-            assert row["status"] == "running"
-            assert datetime.fromisoformat(row["lease_expires_at"]) > datetime.now(UTC)
+            assert row["status"] == "error"
+            assert datetime.fromisoformat(row["lease_expires_at"]) < datetime.now(UTC)
         finally:
             await _cleanup()
 
@@ -1160,3 +1393,109 @@ class TestRunRepository:
         ok = await repo.claim_for_takeover("no-such-run", grace_seconds=10, error="claimed")
         assert ok is False
         await _cleanup()
+
+
+class TestRunRepositoryDeleteByThread:
+    """Bulk thread cleanup must never delete internal thread-operation rows."""
+
+    @pytest.mark.anyio
+    async def test_preserves_thread_operation_reservation(self, tmp_path):
+        repo = await _make_repo(tmp_path)
+        try:
+            await repo.put("historical-run", thread_id="t1", user_id="alice", status="success", operation_kind="run")
+            await repo.put(
+                "delete-reservation",
+                thread_id="t1",
+                user_id="alice",
+                status="pending",
+                operation_kind=ThreadOperationKind.delete,
+            )
+
+            count = await repo.delete_by_thread("t1", user_id="alice")
+
+            assert count == 1
+            assert await repo.get("historical-run", user_id="alice") is None
+            reservation = await repo.get("delete-reservation", user_id="alice")
+            assert reservation is not None
+            assert reservation["operation_kind"] == "delete"
+        finally:
+            await _cleanup()
+
+    @pytest.mark.anyio
+    async def test_is_owner_and_thread_scoped(self, tmp_path):
+        repo = await _make_repo(tmp_path)
+        try:
+            await repo.put("alice-t1", thread_id="t1", user_id="alice", status="success")
+            await repo.put("bob-t1", thread_id="t1", user_id="bob", status="success")
+            await repo.put("alice-t2", thread_id="t2", user_id="alice", status="success")
+
+            count = await repo.delete_by_thread("t1", user_id="alice")
+
+            assert count == 1
+            assert await repo.get("alice-t1", user_id="alice") is None
+            assert await repo.get("bob-t1", user_id="bob") is not None
+            assert await repo.get("alice-t2", user_id="alice") is not None
+        finally:
+            await _cleanup()
+
+    @pytest.mark.anyio
+    async def test_second_call_returns_zero(self, tmp_path):
+        repo = await _make_repo(tmp_path)
+        try:
+            await repo.put("alice-t1", thread_id="t1", user_id="alice", status="success")
+
+            assert await repo.delete_by_thread("t1", user_id="alice") == 1
+            assert await repo.delete_by_thread("t1", user_id="alice") == 0
+        finally:
+            await _cleanup()
+
+
+class TestMemoryRunStoreDeleteByThread:
+    """MemoryRunStore mirrors the SQL store's cleanup semantics."""
+
+    @pytest.mark.anyio
+    async def test_removes_only_run_operations_for_the_owner(self):
+        from deerflow.runtime.runs.store.memory import MemoryRunStore
+
+        store = MemoryRunStore()
+        await store.put("alice-run", thread_id="t1", user_id="alice", status="success")
+        await store.put(
+            "delete-reservation",
+            thread_id="t1",
+            user_id="alice",
+            status="pending",
+            operation_kind=ThreadOperationKind.delete,
+        )
+        await store.put("bob-run", thread_id="t1", user_id="bob", status="success")
+        await store.put("alice-other-thread", thread_id="t2", user_id="alice", status="success")
+
+        count = await store.delete_by_thread("t1", user_id="alice")
+
+        assert count == 1
+        assert await store.get("alice-run", user_id="alice") is None
+        assert await store.get("delete-reservation", user_id="alice") is not None
+        assert await store.get("bob-run", user_id="bob") is not None
+        assert await store.get("alice-other-thread", user_id="alice") is not None
+
+    @pytest.mark.anyio
+    async def test_keeps_the_thread_index_consistent(self):
+        from deerflow.runtime.runs.store.memory import MemoryRunStore
+
+        store = MemoryRunStore()
+        await store.put("alice-run", thread_id="t1", user_id="alice", status="success")
+        await store.put(
+            "delete-reservation",
+            thread_id="t1",
+            user_id="alice",
+            status="pending",
+            operation_kind=ThreadOperationKind.delete,
+        )
+
+        await store.delete_by_thread("t1", user_id="alice")
+
+        assert "alice-run" not in store._runs
+        assert "alice-run" not in store._runs_by_thread.get("t1", {})
+        assert "delete-reservation" in store._runs_by_thread.get("t1", {})
+        # list_by_thread is run-scoped, so the surviving reservation is not listed
+        # even though the row is still tracked.
+        assert await store.list_by_thread("t1", user_id="alice") == []

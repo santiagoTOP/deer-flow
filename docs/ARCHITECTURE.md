@@ -44,7 +44,9 @@ This lets standard LangGraph SDK clients talk to DeerFlow without a separate Lan
 server. Both compose files publish nginx as `"${BIND_HOST:-127.0.0.1}:${PORT:-2026}:2026"`
 — **loopback by default**; the Gateway's `8001` is never published. Any new published port
 must carry an explicit bind address (`backend/tests/test_compose_default_bind_host.py`
-pins this for every service in both compose files).
+pins this for every service in both compose files). Local `make dev` / `make start` follow
+the same model: the Gateway and frontend bind `127.0.0.1`, and nginx listens on loopback
+unless `BIND_HOST` is set (`backend/tests/test_local_dev_loopback_bind.py`).
 
 ---
 
@@ -154,13 +156,13 @@ These span both layers and require reading multiple files to understand:
   tasks reuse the *same* Gateway run lifecycle (scheduler decides *when*, not *how*).
 - **Scheduled tasks** — workspace page `/workspace/scheduled-tasks` + a background scheduler
   gated by `config.yaml → scheduler.enabled`; non-interactive runs drop `ask_clarification`
-  and client-supplied `non_interactive`.
+  and client-supplied `non_interactive` (see the run-context trust boundary in §6).
 - **Long-running MCP** — a durable `McpTaskService` (leased rows, DB as source of truth)
   keeps remote task IDs/polling out of the agent loop.
 - **Version sources** — a release version must match in `backend/pyproject.toml`,
-  `frontend/package.json`, and `deploy/helm/deer-flow/Chart.yaml` (`version` + `appVersion`);
-  pushing a `v*` tag triggers CI that runs `scripts/verify_versions.sh` and blocks all
-  publishing on drift. See [`RELEASING.md`](../RELEASING.md).
+  `frontend/package.json`, and `deploy/helm/deer-flow/Chart.yaml` (`version` + `appVersion`),
+  and `backend/uv.lock` must not be stale; pushing a `v*` tag triggers CI that runs
+  `scripts/verify_versions.sh` (including `uv lock --check`) and blocks all publishing on drift. See [`RELEASING.md`](../RELEASING.md).
 
 ---
 
@@ -172,6 +174,12 @@ These span both layers and require reading multiple files to understand:
   sandbox is dev-only direct execution.
 - **MCP isolation**: each MCP server runs in its own process with runtime env-var
   resolution; servers toggle independently.
+- **Run-context trust boundary**: run context reaches the agent from two client-writable
+  surfaces — `body.context` and the free-form `body.config` — so every server-produced key
+  is gated on both. `non_interactive`, `disable_clarification`, and `github_token` are
+  honored only for internally-authenticated callers (the scheduler and IM/webhook channel
+  policies) and scrubbed from a non-internal caller's config; identity and sandbox
+  lifecycle fields are cleared unconditionally and restamped from auth state.
 - **Loopback-by-default ingress**: nginx is the only published surface; the Gateway's `8001`
   is container-internal and never published. A bare `"${PORT}:2026"` bind (0.0.0.0) is
   rejected by convention and CI. See the Security Notice in [`README.md`](../README.md) before

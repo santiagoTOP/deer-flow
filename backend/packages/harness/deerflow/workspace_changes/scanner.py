@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import os
+import tempfile
 from codecs import BOM_UTF16_BE, BOM_UTF16_LE, getincrementaldecoder
 from pathlib import Path
 
@@ -136,7 +137,7 @@ def scan_workspace_roots(
             continue
 
         for dirpath, dirnames, filenames in os.walk(root.host_path, followlinks=False):
-            dirnames[:] = [dirname for dirname in dirnames if dirname not in excluded_dir_names and not (Path(dirpath) / dirname).is_symlink()]
+            dirnames[:] = [dirname for dirname in sorted(dirnames) if dirname not in excluded_dir_names and not (Path(dirpath) / dirname).is_symlink()]
             for filename in sorted(filenames):
                 if scanned >= resolved_limits.max_scanned_files:
                     truncated = True
@@ -218,7 +219,10 @@ def _snapshot_file(
         return None
 
     binary = host_file.suffix.lower() in BINARY_EXTENSIONS or _looks_binary(sample)
-    sha256 = _sha256_file(host_file) if size <= limits.max_file_bytes_for_diff else None
+    try:
+        sha256 = _sha256_file(host_file) if size <= limits.max_file_bytes_for_diff else None
+    except FileNotFoundError:
+        return None
     text: str | None = None
     text_path: str | None = None
     reason: DiffUnavailableReason | None = None
@@ -259,6 +263,33 @@ def _snapshot_file(
     )
 
 
+def _normalize_symlink_target(target: str) -> str:
+    """Strip the Windows extended-length prefix from a symlink target.
+
+    ``os.readlink`` on Windows reports absolute targets in extended-length
+    form (``\\\\?\\C:\\...`` or ``\\\\?\\UNC\\server\\share``). Recorded targets
+    are surfaced in workspace-change events and compared against ordinary
+    paths, so keep the plain spelling.
+
+    On POSIX this is a provable identity: the strip only applies on Windows
+    hosts. ``readlink(2)`` returns the literal string the link was created
+    with, and backslash is a valid filename byte on Linux — a target string
+    that merely starts with ``\\\\?\\`` there must be recorded verbatim.
+
+    On Windows, only extended *drive-letter* paths are stripped. Other
+    ``\\\\?\\`` namespace forms (volume-GUID paths, device paths) are kept
+    verbatim: stripping them would leave a relative-looking remainder that
+    no longer names the target's namespace.
+    """
+    if os.name != "nt":
+        return target
+    if target.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + target[len("\\\\?\\UNC\\") :]
+    if target.startswith("\\\\?\\") and len(target) >= 7 and target[4].isascii() and target[4].isalpha() and target[5] == ":" and target[6] in "\\/":
+        return target[4:]
+    return target
+
+
 def _snapshot_symlink(root: WorkspaceRoot, host_file: Path) -> FileSnapshot | None:
     # Deliberately never follows the link (no read_bytes()/open() on the target):
     # the target may point anywhere on the host, including outside the scanned
@@ -278,6 +309,8 @@ def _snapshot_symlink(root: WorkspaceRoot, host_file: Path) -> FileSnapshot | No
         target = os.readlink(host_file)
     except OSError:
         target = None
+    else:
+        target = _normalize_symlink_target(target)
 
     return FileSnapshot(
         path=virtual_path,
@@ -294,10 +327,35 @@ def _snapshot_symlink(root: WorkspaceRoot, host_file: Path) -> FileSnapshot | No
     )
 
 
+def _publish_text_atomically(path: Path, content: str) -> None:
+    """Publish text through a temporary file so a partial write cannot survive.
+
+    ``newline="\\n"`` keeps the publication byte-exact on every host: the
+    default text-mode translation would rewrite a decoded CRLF snapshot's
+    ``\\n`` characters into ``os.linesep`` on Windows, turning ``\\r\\n``
+    content into ``\\r\\r\\n`` bytes that every later reader serves verbatim
+    as the file's text.
+    """
+    fd, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            Path(temporary).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def _cache_text_file(text: str, virtual_path: str, cache_dir: Path) -> Path:
+    """Cache decoded text atomically; the caller serves this path as file content."""
     cache_name = hashlib.sha256(virtual_path.encode("utf-8")).hexdigest()
     target = cache_dir / cache_name
-    target.write_text(text, encoding="utf-8")
+    _publish_text_atomically(target, text)
     return target
 
 

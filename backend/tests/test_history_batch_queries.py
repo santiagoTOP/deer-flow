@@ -74,7 +74,7 @@ async def test_memory_event_store_defensively_rechecks_message_category():
         content={"type": "ai", "content": "visible"},
         metadata={"caller": "lead_agent"},
     )
-    mutated = await store.put(
+    await store.put(
         thread_id="t1",
         run_id="r1",
         event_type="llm.ai.response",
@@ -82,10 +82,9 @@ async def test_memory_event_store_defensively_rechecks_message_category():
         content={"type": "ai", "content": "no longer a message"},
         metadata={"caller": "lead_agent"},
     )
-    # Memory projections intentionally share their row dictionaries. Recheck
-    # category at read time so an accidental mutation cannot violate the same
-    # contract that the DB and JSONL stores enforce explicitly.
-    mutated["category"] = "trace"
+    # Receipts are detached snapshots now. Corrupt the private shared row
+    # deliberately so this test still exercises the defensive category recheck.
+    store._messages_by_run["t1"]["r1"][1]["category"] = "trace"
 
     assert await store.get_last_visible_ai_seq_by_run("t1", {"r1"}) == {"r1": expected["seq"]}
 
@@ -248,6 +247,38 @@ async def test_run_manager_batch_history_methods_default_to_current_user():
 
     assert sources == {"source-alice"}
     assert set(records) == {"regen-alice"}
+
+
+@pytest.mark.anyio
+async def test_run_manager_owner_scoped_history_includes_runs_admitted_without_explicit_user():
+    """A run admitted with the ambient user must count as that user's run."""
+    from types import SimpleNamespace
+
+    from deerflow.runtime.user_context import reset_current_user, set_current_user
+
+    manager = RunManager(store=MemoryRunStore())
+    token = set_current_user(SimpleNamespace(id="alice"))
+    try:
+        record = await manager.create_or_reject("t1", metadata={"regenerate_from_run_id": "source"})
+        await manager.set_status(record.run_id, RunStatus.success)
+        sources = await manager.list_successful_regenerate_sources("t1")
+        records = await manager.get_many_by_thread("t1", {record.run_id})
+    finally:
+        reset_current_user(token)
+
+    assert sources == {"source"}
+    assert set(records) == {record.run_id}
+
+
+@pytest.mark.anyio
+@pytest.mark.no_auto_user
+async def test_run_manager_keeps_omitted_owner_unset_without_user_context():
+    """No ambient user means no owner, never a fallback bucket such as ``default``."""
+    manager = RunManager(store=MemoryRunStore())
+
+    record = await manager.create_or_reject("t1")
+
+    assert record.user_id is None
 
 
 @pytest.mark.anyio
